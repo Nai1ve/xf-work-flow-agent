@@ -322,9 +322,12 @@ class MyAgent:
 
     def _llm_config(self) -> dict[str, Any]:
         llm = dict((self.config.get("llm") or {}))
-        llm["base_url"] = os.getenv("OPENAI_BASE_URL") or llm.get("base_url") or "https://api.openai.com/v1"
-        llm["model"] = os.getenv("OPENAI_MODEL") or llm.get("model") or "gpt-4o"
-        llm["api_key"] = os.getenv("OPENAI_API_KEY") or llm.get("api_key") or ""
+        # The contest submission sample explicitly asks contestants to put the
+        # model endpoint in submission/config.json. Keep that file authoritative
+        # so platform-level placeholder OPENAI_* variables cannot shadow it.
+        llm["base_url"] = llm.get("base_url") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        llm["model"] = llm.get("model") or os.getenv("OPENAI_MODEL") or "gpt-4o"
+        llm["api_key"] = llm.get("api_key") or os.getenv("OPENAI_API_KEY") or ""
         if llm["api_key"] in {"your-api-key", "replace-with-your-api-key", "sk-xxx"}:
             llm["api_key"] = ""
         llm["timeout"] = int(os.getenv("OPENAI_TIMEOUT") or llm.get("timeout") or 45)
@@ -387,8 +390,8 @@ class MyAgent:
 
     def _ask_llm(self, llm_config: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+            {"role": "system", "content": "Return valid json only.\n" + SYSTEM_PROMPT},
+            {"role": "user", "content": "Return valid json only.\n" + json.dumps(payload, ensure_ascii=False, default=str)},
         ]
         content = self._chat_completion(llm_config, messages)
         return self._parse_json_object(content)
@@ -399,9 +402,13 @@ class MyAgent:
         body = {
             "model": llm_config.get("model"),
             "messages": messages,
-            "temperature": llm_config.get("temperature", 0),
             "response_format": {"type": "json_object"},
         }
+        # PackyAPI currently rejects requests with an explicit temperature
+        # field for these gpt-5.x model aliases. Omit it and let the gateway use
+        # its default; JSON shape is still enforced by response_format.
+        if "packyapi.com" not in base_url:
+            body["temperature"] = llm_config.get("temperature", 0)
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             url,
