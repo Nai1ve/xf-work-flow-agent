@@ -1,0 +1,20 @@
+.DS_Store
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Local private configuration. Never commit real API keys.
+submission/config.local.json
+.env
+.env.*
+
+# Local contest data and generated runner trees.
+contest/source_zips/
+contest/train/
+contest/val/
+tmp/
+
+# Generated analysis and evaluation artifacts.
+reports/
