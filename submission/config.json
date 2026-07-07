@@ -1,12 +1,32 @@
 {
-  "llm": {
+  "runtime": {
+    "case_deadline_seconds": 55,
+    "semantic_extraction": "always",
+    "task_graph_log_path": "reports/runtime/task_graph.jsonl",
+    "task_graph_timeout_simple_seconds": 2,
+    "task_graph_timeout_normal_seconds": 3,
+    "task_graph_timeout_complex_seconds": 4
+  },
+  "llm_fast": {
+    "provider": "openai_compatible",
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini",
+    "api_key": "",
+    "timeout": 3,
+    "temperature": 0,
+    "max_calls": 1,
+    "max_history_items": 16,
+    "max_tokens": 256
+  },
+  "llm_strong": {
     "provider": "openai_compatible",
     "base_url": "https://api.openai.com/v1",
     "model": "gpt-4o",
     "api_key": "",
-    "timeout": 90,
+    "timeout": 15,
     "temperature": 0,
-    "max_llm_rounds": 8,
-    "max_history_items": 16
+    "max_calls": 2,
+    "max_history_items": 16,
+    "max_tokens": 1200
   }
 }
