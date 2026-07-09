@@ -14,11 +14,23 @@
 
 ## LLM 与程序职责
 
-- LLM 应负责自然语言理解、任务图抽取、候选排序、schema/options 下的字段草案、错误后重规划。
+- LLM 应负责自然语言理解、能力路由纠偏、复杂题规划补丁、候选排序、schema/options 下的字段草案、错误后重规划。
 - 程序应负责工具白名单、参数 schema 校验、step budget、缓存、上下文 ledger、写操作 preflight、枚举合法性、金额守恒、final_answer 归一化。
 - 不要让 LLM 自由编造工具结果、候选 id、workflow_id、project_code、wbs_code、user_id、material value。
 - 不要让程序用大量业务词表替代模型理解。业务词表只能作为候选生成或召回辅助，最终必须通过真实工具结果验证。
-- Fast LLM task graph 是执行 domain 逻辑前的必经阶段；即使超时或失败，也必须生成 heuristic fallback task graph，并记录耗时、剩余时间、来源、任务数、域、意图、最低置信度、缺槽数、禁止猜测字段数和 fallback 原因，方便后续动态调整 60 秒预算。
+- 项目名、物料名、业务类别、枚举值的语义映射能力应由 LLM 在压缩上下文中给出候选解释，再由程序用 `workflow.project_search` / `workflow.browser_search` / schema options 校验；不要在 `my_agent.py` 里逐个补充 `if/elif` 业务短语映射。
+- V3 默认采用轻量能力路由与风险分流：简单题允许直接走确定性执行；复杂题可以在规则执行可逆读工具的同时启动 LLM planner，并在写操作前做证据仲裁。无论是否调用 LLM，都必须生成可审计 task/capability route，并记录耗时、剩余时间、来源、任务数、域、意图、capability、routing risk、最低置信度、缺槽数、禁止猜测字段数和 fallback 原因，方便后续动态调整 60 秒预算。
+
+## 静态契约与上下文层
+
+- V3 必须把 `static_contract_context_architecture_20260708.md` 作为架构输入：先从工具、流程、会议室和能力边界构建静态契约，再进入运行时理解与执行。
+- `ToolRegistry` 负责工具白名单、参数 schema、风险分级和 ToolAdapter 前置校验；真实工具兼容逻辑应集中在 adapter，不能散落在各执行分支。
+- `WorkflowSchemaRegistry` 负责动态读取 `workflow.catalog` / `workflow.schema`，维护 required fields、字段类型、枚举来源、人员/项目/物资证据要求，不能把当前公开数据中的流程和选项写死。
+- `MeetingroomIndex` 负责办公区、会议室、容量、屏幕、可预订资源的归一化和候选过滤；最终 room_id/order_id 必须来自真实工具证据。
+- `CapabilityRegistry` 是能力边界入口。规则和 LLM 只能映射到已声明 capability，不能自由生成新 intent、工具名或写操作。
+- `StaticContextPack` 只给当前阶段需要的压缩上下文：轻路由只暴露 capability，复杂规划暴露当前 evidence 和冲突点，表单草稿只暴露当前 schema/options/candidates。
+- `EvidenceLedger` 必须记录读证据、写证据、LLM 建议、规则推断、仲裁结果和耗时；`FinalAnswerBuilder` 只能从 ledger 与 registry 生成最终答案。
+- `PreflightGuard` 是所有写操作的最后入口，至少检查 required fields、枚举合法性、候选 id 来源、金额/明细守恒、会议室冲突和上下文一致性。
 
 ## Workflow 设计约束
 

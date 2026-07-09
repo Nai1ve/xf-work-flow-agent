@@ -1,18 +1,18 @@
 {
   "runtime": {
     "case_deadline_seconds": 55,
-    "semantic_extraction": "always",
+    "semantic_extraction": "auto",
     "task_graph_log_path": "reports/runtime/task_graph.jsonl",
     "task_graph_timeout_simple_seconds": 2,
     "task_graph_timeout_normal_seconds": 3,
-    "task_graph_timeout_complex_seconds": 4
+    "task_graph_timeout_complex_seconds": 6
   },
   "llm_fast": {
     "provider": "openai_compatible",
-    "base_url": "https://api.openai.com/v1",
-    "model": "gpt-4o-mini",
+    "base_url": "https://api-slb.packyapi.com/v1",
+    "model": "gpt-5.4",
     "api_key": "",
-    "timeout": 3,
+    "timeout": 6,
     "temperature": 0,
     "max_calls": 1,
     "max_history_items": 16,
@@ -20,8 +20,8 @@
   },
   "llm_strong": {
     "provider": "openai_compatible",
-    "base_url": "https://api.openai.com/v1",
-    "model": "gpt-4o",
+    "base_url": "https://api-slb.packyapi.com/v1",
+    "model": "gpt-5.4",
     "api_key": "",
     "timeout": 15,
     "temperature": 0,

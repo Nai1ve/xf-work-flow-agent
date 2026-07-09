@@ -14,18 +14,18 @@ from typing import Any
 DEFAULT_CONFIG: dict[str, Any] = {
     "runtime": {
         "case_deadline_seconds": 55,
-        "semantic_extraction": "always",
+        "semantic_extraction": "auto",
         "task_graph_log_path": "reports/runtime/task_graph.jsonl",
         "task_graph_timeout_simple_seconds": 2,
         "task_graph_timeout_normal_seconds": 3,
-        "task_graph_timeout_complex_seconds": 4,
+        "task_graph_timeout_complex_seconds": 8,
     },
     "llm_fast": {
         "provider": "openai_compatible",
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-4o-mini",
         "api_key": "",
-        "timeout": 2,
+        "timeout": 8,
         "temperature": 0,
         "max_calls": 1,
         "max_tokens": 256,
@@ -37,7 +37,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-4o",
         "api_key": "",
-        "timeout": 15,
+        "timeout": 10,
         "temperature": 0,
         "max_calls": 2,
         "max_tokens": 1200,
@@ -49,7 +49,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-4o",
         "api_key": "",
-        "timeout": 15,
+        "timeout": 10,
         "temperature": 0,
         "max_tokens": 1200,
         "max_llm_rounds": 4,
@@ -174,6 +174,178 @@ READ_TOOLS = {
 }
 
 
+CAPABILITY_REGISTRY: dict[str, dict[str, Any]] = {
+    "meeting.book": {
+        "domain": "meetingroom",
+        "intent": "book_single",
+        "risk": "write",
+        "required_slots": ["day_text", "start", "end"],
+        "read_tools": ["user.get_workspace", "meetingroom.room.list", "meetingroom.room.schedule"],
+        "write_tools": ["meetingroom.booking.create"],
+        "evidence_required": ["room_candidate"],
+    },
+    "meeting.query_booking": {
+        "domain": "meetingroom",
+        "intent": "query_booking",
+        "risk": "read",
+        "required_slots": [],
+        "read_tools": ["meetingroom.booking.list"],
+        "write_tools": [],
+        "evidence_required": [],
+    },
+    "meeting.query_room_schedule": {
+        "domain": "meetingroom",
+        "intent": "query_room_schedule",
+        "risk": "read",
+        "required_slots": ["room_ids"],
+        "read_tools": ["meetingroom.room.schedule"],
+        "write_tools": [],
+        "evidence_required": [],
+    },
+    "meeting.schedule_book": {
+        "domain": "meetingroom",
+        "intent": "book_by_schedule_analysis",
+        "risk": "write",
+        "required_slots": ["day_text"],
+        "read_tools": ["meetingroom.room.list", "meetingroom.room.schedule"],
+        "write_tools": ["meetingroom.booking.create"],
+        "evidence_required": ["room_candidate", "schedule"],
+    },
+    "meeting.book_multi_segments": {
+        "domain": "meetingroom",
+        "intent": "book_multi_segments_same_room",
+        "risk": "write",
+        "required_slots": ["segments"],
+        "read_tools": ["meetingroom.room.list", "meetingroom.room.schedule"],
+        "write_tools": ["meetingroom.booking.create"],
+        "evidence_required": ["room_candidate"],
+    },
+    "meeting.cancel": {
+        "domain": "meetingroom",
+        "intent": "cancel_existing",
+        "risk": "high_risk_write",
+        "required_slots": ["target_booking"],
+        "read_tools": ["meetingroom.booking.list"],
+        "write_tools": ["meetingroom.booking.cancel"],
+        "evidence_required": ["selected_booking"],
+    },
+    "meeting.extend": {
+        "domain": "meetingroom",
+        "intent": "extend_existing",
+        "risk": "high_risk_write",
+        "required_slots": ["target_booking", "duration_minutes"],
+        "read_tools": ["meetingroom.booking.list"],
+        "write_tools": ["meetingroom.booking.extend"],
+        "evidence_required": ["selected_booking"],
+    },
+    "meeting.rebook_larger": {
+        "domain": "meetingroom",
+        "intent": "rebook_larger_existing",
+        "risk": "high_risk_write",
+        "required_slots": ["target_booking"],
+        "read_tools": ["meetingroom.booking.list", "meetingroom.room.list"],
+        "write_tools": ["meetingroom.booking.cancel", "meetingroom.booking.create"],
+        "evidence_required": ["selected_booking", "room_candidate"],
+    },
+    "meeting.cancel_rebook": {
+        "domain": "meetingroom",
+        "intent": "cancel_rebook_existing",
+        "risk": "high_risk_write",
+        "required_slots": ["target_booking"],
+        "read_tools": ["meetingroom.booking.list", "meetingroom.room.list"],
+        "write_tools": ["meetingroom.booking.cancel", "meetingroom.booking.create"],
+        "evidence_required": ["selected_booking", "room_candidate"],
+    },
+    "meeting.participant_add": {
+        "domain": "meetingroom",
+        "intent": "participant_add",
+        "risk": "write",
+        "required_slots": ["target_booking", "participants"],
+        "read_tools": ["meetingroom.booking.list", "user.get_info"],
+        "write_tools": ["meetingroom.booking.participant.add"],
+        "evidence_required": ["selected_booking", "verified_user"],
+    },
+    "meeting.participant_remove": {
+        "domain": "meetingroom",
+        "intent": "participant_remove",
+        "risk": "write",
+        "required_slots": ["target_booking", "participants"],
+        "read_tools": ["meetingroom.booking.list", "user.get_info"],
+        "write_tools": ["meetingroom.booking.participant.remove"],
+        "evidence_required": ["selected_booking", "verified_user"],
+    },
+    "meeting.participant_list": {
+        "domain": "meetingroom",
+        "intent": "participant_list",
+        "risk": "read",
+        "required_slots": ["target_booking"],
+        "read_tools": ["meetingroom.booking.list", "meetingroom.booking.participant.list"],
+        "write_tools": [],
+        "evidence_required": ["selected_booking"],
+    },
+    "workflow.leave_draft": {
+        "domain": "workflow",
+        "intent": "leave",
+        "risk": "write",
+        "required_slots": ["day_text", "start", "end", "leave_type_label", "approver_hint"],
+        "read_tools": ["user.get_info", "workflow.catalog", "workflow.schema", "workflow.search_person"],
+        "write_tools": ["workflow.save"],
+        "evidence_required": ["applicant", "workflow_schema", "approver_candidate"],
+    },
+    "workflow.leave_submit": {
+        "domain": "workflow",
+        "intent": "leave",
+        "risk": "high_risk_write",
+        "required_slots": ["explicit_submit", "day_text", "start", "end", "leave_type_label", "approver_hint"],
+        "read_tools": ["user.get_info", "workflow.catalog", "workflow.schema", "workflow.search_person"],
+        "write_tools": ["workflow.save"],
+        "evidence_required": ["applicant", "workflow_schema", "approver_candidate"],
+        "post_check": "oa.done.list",
+    },
+    "workflow.expense_draft": {
+        "domain": "workflow",
+        "intent": "expense_material",
+        "risk": "write",
+        "required_slots": ["project_hint", "material_hint"],
+        "read_tools": ["user.get_info", "workflow.catalog", "workflow.schema", "workflow.project_search", "workflow.browser_search"],
+        "write_tools": ["workflow.save"],
+        "evidence_required": ["applicant", "workflow_schema", "verified_project", "category_option", "subclass_option"],
+    },
+    "workflow.expense_submit": {
+        "domain": "workflow",
+        "intent": "expense_material",
+        "risk": "high_risk_write",
+        "required_slots": ["explicit_submit", "project_hint", "material_hint"],
+        "read_tools": ["user.get_info", "workflow.catalog", "workflow.schema", "workflow.project_search", "workflow.browser_search"],
+        "write_tools": ["workflow.save"],
+        "evidence_required": ["applicant", "workflow_schema", "verified_project", "category_option", "subclass_option"],
+        "post_check": "oa.done.list",
+    },
+}
+
+
+MEETING_INTENT_CAPABILITY = {
+    "book_single": "meeting.book",
+    "query_booking": "meeting.query_booking",
+    "query": "meeting.query_booking",
+    "query_room_schedule": "meeting.query_room_schedule",
+    "book_by_schedule_analysis": "meeting.schedule_book",
+    "schedule_book": "meeting.schedule_book",
+    "book_multi_segments_same_room": "meeting.book_multi_segments",
+    "cancel_existing": "meeting.cancel",
+    "cancel": "meeting.cancel",
+    "extend_existing": "meeting.extend",
+    "extend": "meeting.extend",
+    "rebook_larger_existing": "meeting.rebook_larger",
+    "rebook_larger": "meeting.rebook_larger",
+    "cancel_rebook_existing": "meeting.cancel_rebook",
+    "cancel_rebook": "meeting.cancel_rebook",
+    "participant_add": "meeting.participant_add",
+    "participant_remove": "meeting.participant_remove",
+    "participant_list": "meeting.participant_list",
+}
+
+
 WORKFLOW_IDS = {
     "leave": 72247,
     "expense": 34747,
@@ -280,7 +452,18 @@ class MyAgent:
             )
             state.deadline_at = state.started_at + self._case_deadline_seconds()
             debug_config = self._debug_llm_config()
-            self._debug_log(debug_config, {"event": "start", "case_id": case_id, "obs": obs})
+            self._debug_log(
+                debug_config,
+                {
+                    "event": "start",
+                    "case_id": case_id,
+                    "started_at": 0.0,
+                    "deadline_seconds": round(state.deadline_at - state.started_at, 3),
+                    "step_budget": state.step_budget,
+                    "tool_count": len(state.tools),
+                    "obs": obs,
+                },
+            )
 
             state.llm_semantic = self._extract_semantics(state, obs, tools)
             self._init_context(state)
@@ -303,10 +486,14 @@ class MyAgent:
                 debug_config,
                 {
                     "event": "finish",
+                    "case_id": case_id,
                     "steps_used": state.steps_used,
                     "llm_calls_fast": state.llm_calls_fast,
                     "llm_calls_strong": state.llm_calls_strong,
+                    "end_at": round(time.monotonic() - state.started_at, 3),
+                    "remaining_seconds": round(self._remaining_seconds(state), 3),
                     "elapsed": round(time.monotonic() - state.started_at, 3),
+                    "elapsed_seconds": round(time.monotonic() - state.started_at, 3),
                     "answer": answer,
                     "history": state.history,
                 },
@@ -348,7 +535,7 @@ class MyAgent:
 
     def _semantic_extraction_mode(self) -> str:
         runtime = self.config.get("runtime") if isinstance(self.config.get("runtime"), dict) else {}
-        value = str(os.getenv("SEMANTIC_EXTRACTION") or runtime.get("semantic_extraction") or "always").strip().lower()
+        value = str(os.getenv("SEMANTIC_EXTRACTION") or runtime.get("semantic_extraction") or "auto").strip().lower()
         if value not in {"always", "auto", "off"}:
             return "always"
         return value
@@ -381,7 +568,7 @@ class MyAgent:
         llm["api_key"] = llm.get("api_key") or os.getenv(key_env) or os.getenv("OPENAI_API_KEY") or ""
         if llm["api_key"] in {"your-api-key", "replace-with-your-api-key", "sk-xxx"}:
             llm["api_key"] = ""
-        llm["timeout"] = int(os.getenv(timeout_env) or os.getenv("OPENAI_TIMEOUT") or llm.get("timeout") or (6 if profile == "fast" else 15))
+        llm["timeout"] = float(os.getenv(timeout_env) or os.getenv("OPENAI_TIMEOUT") or llm.get("timeout") or (1 if profile == "fast" else 15))
         llm["temperature"] = float(os.getenv("OPENAI_TEMPERATURE") or llm.get("temperature") or 0)
         llm["max_llm_rounds"] = int(os.getenv("MAX_LLM_ROUNDS") or llm.get("max_llm_rounds") or 4)
         llm["max_calls"] = int(llm.get("max_calls") or (1 if profile in {"fast", "strong"} else llm["max_llm_rounds"]))
@@ -408,6 +595,7 @@ class MyAgent:
         llm_config = self._llm_config("fast")
         mode = self._semantic_extraction_mode()
         complexity = self._task_graph_complexity(baseline, obs)
+        route = self._capability_route_from_baseline(baseline, obs, complexity)
         llm_config["timeout"] = self._task_graph_timeout_for_complexity(complexity, llm_config)
         prompt_chars = 0
         response_chars = 0
@@ -437,6 +625,7 @@ class MyAgent:
                 started_at=stage_started,
                 llm_config=llm_config,
                 complexity=complexity,
+                route=route,
                 fast_llm_success=fast_llm_success,
                 fast_attempted=fast_attempted,
                 fallback_reason=fallback_reason,
@@ -447,17 +636,17 @@ class MyAgent:
 
         if mode == "off" or not llm_config.get("api_key"):
             fallback_reason = "disabled_or_no_key" if mode == "off" else "no_api_key"
-            self._debug_log(llm_config, {"event": "semantic_llm_skipped", "reason": fallback_reason, "mode": mode})
+            self._debug_log(llm_config, self._semantic_llm_event(state, fallback_reason, mode, llm_config, complexity))
             return finish(self._semantic_contract_from_baseline(baseline, obs), fallback_reason)
         # Experimental budget gate only. Default config keeps fast LLM attempted
         # for every case so the task-graph stage is never bypassed silently.
-        if mode == "auto" and not self._needs_fast_semantic(baseline, obs):
+        if mode == "auto" and not self._needs_fast_semantic(baseline, obs, complexity, route):
             fallback_reason = "auto_heuristic_high_confidence"
-            self._debug_log(llm_config, {"event": "semantic_llm_skipped", "reason": fallback_reason, "mode": mode})
+            self._debug_log(llm_config, self._semantic_llm_event(state, fallback_reason, mode, llm_config, complexity))
             return finish(self._semantic_contract_from_baseline(baseline, obs), fallback_reason)
-        if not self._can_call_llm(state, "fast", min_remaining=8.0):
+        if not self._can_call_llm(state, "fast", min_remaining=6.0):
             fallback_reason = "deadline_or_budget"
-            self._debug_log(llm_config, {"event": "semantic_llm_skipped", "reason": fallback_reason})
+            self._debug_log(llm_config, self._semantic_llm_event(state, fallback_reason, mode, llm_config, complexity))
             return finish(self._semantic_contract_from_baseline(baseline, obs), fallback_reason)
         payload = {
             "query": self._task_graph_query_payload(obs),
@@ -491,8 +680,32 @@ class MyAgent:
             fallback_reason = "invalid_json"
         except Exception as exc:
             fallback_reason = str(exc)[:200] or "fast_llm_error"
-            self._debug_log(llm_config, {"event": "semantic_llm_error", "error": str(exc)})
+            error_event = self._semantic_llm_event(state, fallback_reason, mode, llm_config, complexity)
+            error_event["event"] = "semantic_llm_error"
+            error_event["error"] = str(exc)[:240]
+            self._debug_log(llm_config, error_event)
         return finish(self._semantic_contract_from_baseline(baseline, obs), fallback_reason)
+
+    def _semantic_llm_event(
+        self,
+        state: RuntimeState,
+        reason: str,
+        mode: str,
+        llm_config: dict[str, Any],
+        complexity: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "event": "semantic_llm_skipped",
+            "case_id": state.obs.get("case_id"),
+            "reason": reason,
+            "mode": mode,
+            "fast_timeout_seconds": round(float(llm_config.get("timeout") or 0), 3),
+            "remaining_seconds": round(self._remaining_seconds(state), 3),
+            "complexity_level": complexity.get("level"),
+            "complexity_score": complexity.get("score"),
+            "complexity_reasons": complexity.get("reasons") or [],
+            "simple_proven": bool(complexity.get("simple_proven")),
+        }
 
     def _log_task_graph_stage(
         self,
@@ -503,6 +716,7 @@ class MyAgent:
         started_at: float,
         llm_config: dict[str, Any],
         complexity: dict[str, Any],
+        route: dict[str, Any],
         fast_llm_success: bool,
         fast_attempted: bool,
         fallback_reason: str,
@@ -538,12 +752,17 @@ class MyAgent:
             "started_at": round(started_at - state.started_at, 3),
             "elapsed_seconds": round(now - started_at, 3),
             "remaining_seconds": round(max(0.0, state.deadline_at - now), 3),
-            "fast_timeout_seconds": int(llm_config.get("timeout") or 0),
+            "fast_timeout_seconds": round(float(llm_config.get("timeout") or 0), 3),
             "fast_max_tokens": int(llm_config.get("max_tokens") or 0),
             "complexity_level": complexity.get("level"),
             "complexity_score": complexity.get("score"),
             "complexity_reasons": complexity.get("reasons") or [],
             "simple_proven": bool(complexity.get("simple_proven")),
+            "routing_risk": route.get("routing_risk"),
+            "routing_flags": route.get("risk_flags") or [],
+            "capabilities": [task.get("capability") for task in route.get("tasks", []) if isinstance(task, dict)],
+            "capability_count": len(route.get("tasks") or []),
+            "routing_path": route.get("routing_path"),
             "fast_attempted": fast_attempted,
             "fast_llm_success": fast_llm_success,
             "task_count": len(tasks),
@@ -559,6 +778,138 @@ class MyAgent:
         self._write_task_graph_log(event)
         self._debug_log(llm_config, event)
 
+    def _capability_route_from_baseline(
+        self,
+        baseline: dict[str, Any],
+        obs: dict[str, Any],
+        complexity: dict[str, Any],
+    ) -> dict[str, Any]:
+        query = self._full_query(obs)
+        tasks: list[dict[str, Any]] = []
+        risk_flags: list[str] = list(complexity.get("reasons") or [])
+        meeting = baseline.get("meetingroom") if isinstance(baseline.get("meetingroom"), dict) else {}
+        workflow = baseline.get("workflow") if isinstance(baseline.get("workflow"), dict) else {}
+
+        meeting_capability = self._meeting_capability(meeting)
+        if meeting_capability:
+            tasks.append(self._capability_task("cap_meeting_1", meeting_capability, meeting, query, "meetingroom"))
+
+        workflow_capability = self._workflow_capability(workflow)
+        if workflow_capability:
+            workflow_slots = self._workflow_capability_slots(workflow)
+            tasks.append(self._capability_task("cap_workflow_1", workflow_capability, workflow_slots, query, "workflow"))
+
+        if not tasks:
+            risk_flags.append("unknown_capability")
+        if len(tasks) > 1:
+            risk_flags.append("multi_capability")
+
+        routing_risk = self._routing_risk(complexity, tasks, risk_flags)
+        return {
+            "tasks": tasks,
+            "routing_risk": routing_risk,
+            "risk_flags": self._dedupe(risk_flags),
+            "routing_path": self._routing_path_for_risk(routing_risk),
+        }
+
+    def _meeting_capability(self, meeting: dict[str, Any]) -> str:
+        intent = str(meeting.get("intent") or "unknown")
+        return MEETING_INTENT_CAPABILITY.get(intent, "")
+
+    def _workflow_capability(self, workflow: dict[str, Any]) -> str:
+        intent = str(workflow.get("intent") or "unknown")
+        if intent == "leave":
+            return "workflow.leave_submit" if workflow.get("submit") else "workflow.leave_draft"
+        if intent == "expense_material":
+            return "workflow.expense_submit" if workflow.get("submit") else "workflow.expense_draft"
+        return ""
+
+    def _workflow_capability_slots(self, workflow: dict[str, Any]) -> dict[str, Any]:
+        intent = str(workflow.get("intent") or "unknown")
+        if intent == "leave" and isinstance(workflow.get("leave"), dict):
+            slots = dict(workflow.get("leave") or {})
+        elif intent == "expense_material" and isinstance(workflow.get("expense"), dict):
+            slots = dict(workflow.get("expense") or {})
+        else:
+            slots = {}
+        if workflow.get("submit"):
+            slots["explicit_submit"] = True
+        return slots
+
+    def _capability_task(
+        self,
+        task_id: str,
+        capability: str,
+        slots: dict[str, Any],
+        query: str,
+        domain: str,
+    ) -> dict[str, Any]:
+        spec = CAPABILITY_REGISTRY.get(capability, {})
+        missing = self._capability_missing_slots(capability, slots)
+        return {
+            "task_id": task_id,
+            "capability": capability,
+            "domain": spec.get("domain") or domain,
+            "intent": spec.get("intent") or slots.get("intent") or "unknown",
+            "risk": spec.get("risk") or "unknown",
+            "source_text": self._domain_source_text(query, domain, spec.get("intent")),
+            "core_slots": self._compact_slot_hint(slots),
+            "missing_required_slots": missing,
+            "read_tools": spec.get("read_tools") or [],
+            "write_tools": spec.get("write_tools") or [],
+            "evidence_required": spec.get("evidence_required") or [],
+        }
+
+    def _capability_missing_slots(self, capability: str, slots: dict[str, Any]) -> list[str]:
+        spec = CAPABILITY_REGISTRY.get(capability, {})
+        missing = []
+        for slot in spec.get("required_slots") or []:
+            if slot == "target_booking":
+                if not (slots.get("order_id") or slots.get("keyword") or slots.get("day_text") or slots.get("room_ids")):
+                    missing.append(slot)
+                continue
+            if slot == "project_hint":
+                if not (slots.get("project_code") or slots.get("project_name") or slots.get("project_keywords")):
+                    missing.append(slot)
+                continue
+            if slot == "material_hint":
+                if not (slots.get("material_category_hint") or slots.get("material_subclass_hint") or slots.get("items")):
+                    missing.append(slot)
+                continue
+            if slot == "approver_hint":
+                if not any(slots.get(key) for key in ["approver_keyword", "approver_title", "approver_raw", "approver_name_hint", "approver_title_hint", "approver_employee_no"]):
+                    missing.append(slot)
+                continue
+            if slot == "capacity_delta_or_new_capacity":
+                if not (slots.get("capacity_delta") or slots.get("capacity")):
+                    missing.append(slot)
+                continue
+            if not slots.get(slot):
+                missing.append(slot)
+        return missing
+
+    def _routing_risk(self, complexity: dict[str, Any], tasks: list[dict[str, Any]], risk_flags: list[str]) -> str:
+        if not tasks:
+            return "complex"
+        if any(task.get("risk") == "high_risk_write" for task in tasks):
+            return "complex"
+        if len(tasks) > 1:
+            return "complex"
+        if any(flag in {"unknown_domain", "unknown_capability", "multi_turn", "context_reference", "multi_domain", "multi_capability"} for flag in risk_flags):
+            return "complex"
+        if str(complexity.get("level")) == "simple" and not any(task.get("missing_required_slots") for task in tasks):
+            return "simple"
+        if str(complexity.get("level")) == "complex":
+            return "complex"
+        return "normal"
+
+    def _routing_path_for_risk(self, routing_risk: str) -> str:
+        if routing_risk == "simple":
+            return "deterministic_simple"
+        if routing_risk == "complex":
+            return "deterministic_with_parallel_planner_candidate"
+        return "deterministic_normal"
+
     def _write_task_graph_log(self, event: dict[str, Any]) -> None:
         path_value = self._task_graph_log_path()
         if not path_value:
@@ -573,18 +924,31 @@ class MyAgent:
         except Exception:
             pass
 
-    def _task_graph_timeout_for_complexity(self, complexity: dict[str, Any], llm_config: dict[str, Any]) -> int:
+    def _task_graph_timeout_for_complexity(self, complexity: dict[str, Any], llm_config: dict[str, Any]) -> float:
         runtime = self.config.get("runtime") if isinstance(self.config.get("runtime"), dict) else {}
         level = str(complexity.get("level") or "normal")
         key = f"task_graph_timeout_{level}_seconds"
-        default_by_level = {"simple": 2, "normal": 3, "complex": 4}
+        default_by_level = {"simple": 2.0, "normal": 3.0, "complex": 8.0}
+        env_timeout = os.getenv(key.upper())
         try:
-            timeout = int(os.getenv(key.upper()) or runtime.get(key) or default_by_level.get(level, 2))
+            timeout = float(env_timeout or runtime.get(key) or default_by_level.get(level, 1.0))
         except Exception:
-            timeout = default_by_level.get(level, 2)
-        configured = int(llm_config.get("timeout") or timeout)
-        cap = 5 if level == "complex" else 4
-        return max(1, min(max(configured, timeout), cap))
+            timeout = default_by_level.get(level, 1.0)
+        try:
+            configured = float(llm_config.get("timeout") or timeout)
+        except Exception:
+            configured = timeout
+        target = timeout if env_timeout or runtime.get(key) is not None else configured
+        default_cap = max(default_by_level.get(level, 1.0), timeout, configured)
+        cap_env = os.getenv(f"{key.upper()}_CAP") or os.getenv("TASK_GRAPH_TIMEOUT_CAP_SECONDS")
+        if cap_env:
+            try:
+                cap = max(default_cap, float(cap_env))
+            except Exception:
+                cap = default_cap
+        else:
+            cap = default_cap
+        return max(0.75, min(target, cap))
 
     def _task_graph_complexity(self, baseline: dict[str, Any], obs: dict[str, Any]) -> dict[str, Any]:
         query = self._full_query(obs)
@@ -751,9 +1115,41 @@ class MyAgent:
         leave = workflow.get("leave") if isinstance(workflow.get("leave"), dict) else {}
         return bool(leave.get("day_text") and leave.get("start") and leave.get("end") and leave.get("leave_type_label"))
 
-    def _needs_fast_semantic(self, baseline: dict[str, Any], obs: dict[str, Any]) -> bool:
-        complexity = self._task_graph_complexity(baseline, obs)
-        return not bool(complexity.get("simple_proven"))
+    def _needs_fast_semantic(
+        self,
+        baseline: dict[str, Any],
+        obs: dict[str, Any],
+        complexity: dict[str, Any] | None = None,
+        route: dict[str, Any] | None = None,
+    ) -> bool:
+        complexity = complexity or self._task_graph_complexity(baseline, obs)
+        if route is not None:
+            routing_risk = str(route.get("routing_risk") or "")
+            if routing_risk != "complex":
+                return False
+            route_tasks = [task for task in (route.get("tasks") or []) if isinstance(task, dict)]
+            if route_tasks and not any(task.get("missing_required_slots") for task in route_tasks):
+                flags = set(route.get("risk_flags") or [])
+                if not (flags & {"unknown_capability", "multi_turn", "context_reference"}):
+                    return False
+            flags = set(route.get("risk_flags") or [])
+            if flags & {"unknown_capability"}:
+                return True
+        reasons = set(complexity.get("reasons") or [])
+        high_risk = {
+            "unknown_domain",
+            "multi_turn",
+            "context_reference",
+            "workflow_unknown_intent",
+            "meeting_unknown_intent",
+            "workflow_unhandled_intent",
+            "meeting_modifies_existing",
+        }
+        if reasons & high_risk:
+            return True
+        if complexity.get("level") == "complex" and not complexity.get("simple_proven"):
+            return bool(reasons & {"complex_time", "meeting_multi_segment"})
+        return False
 
     def _tool_contract_summary(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         contracts: list[dict[str, Any]] = []
@@ -806,17 +1202,17 @@ class MyAgent:
             return state.llm_calls_strong < max_calls
         return True
 
-    def _remaining_llm_timeout(self, state: RuntimeState | None, requested: int | float, reserve: float = 3.0) -> int:
+    def _remaining_llm_timeout(self, state: RuntimeState | None, requested: int | float, reserve: float = 3.0) -> float:
         try:
             timeout = float(requested)
         except Exception:
             timeout = 10.0
         if state is None:
-            return max(1, int(timeout))
+            return max(0.5, timeout)
         remaining = state.deadline_at - time.monotonic() - reserve
-        if remaining < 1:
+        if remaining < 0.5:
             raise TimeoutError("case deadline too close for llm call")
-        return max(1, int(min(timeout, remaining)))
+        return max(0.5, min(timeout, remaining))
 
     def _note_llm_call(self, state: RuntimeState | None, profile: str) -> None:
         if state is None:
@@ -837,6 +1233,7 @@ class MyAgent:
         if state is not None and not self._can_call_llm(state, call_profile):
             raise TimeoutError(f"{call_profile} llm budget exhausted or deadline too close")
         self._note_llm_call(state, call_profile)
+        call_started = time.monotonic()
         base_url = str(llm_config.get("base_url") or "").rstrip("/")
         body = {
             "model": llm_config.get("model"),
@@ -856,8 +1253,9 @@ class MyAgent:
             },
             method="POST",
         )
+        timeout = 0.0
         try:
-            timeout = self._remaining_llm_timeout(state, int(llm_config.get("timeout") or 15))
+            timeout = self._remaining_llm_timeout(state, float(llm_config.get("timeout") or 15))
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
@@ -866,14 +1264,53 @@ class MyAgent:
                 text = exc.read().decode("utf-8")[:500]
             except Exception:
                 pass
+            self._log_llm_call_event(state, llm_config, call_profile, call_started, timeout, False, f"HTTP {exc.code}: {text}")
             raise RuntimeError(f"LLM HTTP {exc.code}: {text}") from exc
+        except Exception as exc:
+            self._log_llm_call_event(state, llm_config, call_profile, call_started, timeout, False, str(exc))
+            raise
         choices = payload.get("choices") or []
         if not choices:
+            self._log_llm_call_event(state, llm_config, call_profile, call_started, timeout, False, "LLM returned no choices")
             raise RuntimeError("LLM returned no choices")
         content = (choices[0].get("message") or {}).get("content")
         if not isinstance(content, str) or not content.strip():
+            self._log_llm_call_event(state, llm_config, call_profile, call_started, timeout, False, "LLM returned empty content")
             raise RuntimeError("LLM returned empty content")
+        self._log_llm_call_event(state, llm_config, call_profile, call_started, timeout, True, "", response_chars=len(content))
         return content
+
+    def _log_llm_call_event(
+        self,
+        state: RuntimeState | None,
+        llm_config: dict[str, Any],
+        profile: str,
+        started_at: float,
+        timeout: float,
+        success: bool,
+        error: str,
+        response_chars: int = 0,
+    ) -> None:
+        if state is None:
+            return
+        now = time.monotonic()
+        self._debug_log(
+            llm_config,
+            {
+                "event": "llm_call",
+                "case_id": state.obs.get("case_id"),
+                "profile": profile,
+                "model": llm_config.get("model"),
+                "success": success,
+                "timeout_seconds": round(float(timeout or 0), 3),
+                "elapsed_seconds": round(now - started_at, 3),
+                "started_at": round(started_at - state.started_at, 3),
+                "end_at": round(now - state.started_at, 3),
+                "remaining_seconds": round(self._remaining_seconds(state), 3),
+                "response_chars": response_chars,
+                "error": str(error or "")[:240],
+            },
+        )
 
     def _parse_json_object(self, text: str) -> dict[str, Any] | None:
         try:
@@ -1043,6 +1480,13 @@ class MyAgent:
             intent = "participant_remove"
         if "哪些人" in query or "有哪些人" in query:
             intent = "participant_list"
+        keyword = self._extract_meeting_keyword(query)
+        if intent == "participant_list":
+            keyword = self._clean_participant_list_keyword(keyword)
+        if intent == "participant_list" and not keyword:
+            title_matches = re.findall(r"([\u4e00-\u9fa5A-Za-z0-9]{2,8}?会)(?:有哪些人|哪些人|里有哪些人|参加)", query)
+            if title_matches:
+                keyword = self._clean_participant_list_keyword(self._normalize_meeting_title(title_matches[-1]))
         segments = self._extract_meeting_segments(query)
         if len(segments) > 1 and any(word in query for word in ["同一个房间", "同一房间", "同一个会议室", "同一会议室"]):
             intent = "book_multi_segments_same_room"
@@ -1070,7 +1514,7 @@ class MyAgent:
             "has_screen": False if "不需要屏幕" in query or "不用屏幕" in query else ("屏幕" in query or "投影" in query or "带屏" in query),
             "title": self._extract_meeting_title(query),
             "segments": segments,
-            "keyword": self._extract_meeting_keyword(query),
+            "keyword": keyword,
             "allow_fallback": any(word in query for word in ["不行", "没有合适", "fallback", "也可以", "订不到"]),
             "fallback_policy": self._meeting_fallback_policy(query),
             "needs_workspace": "工位" in query or "附近" in query or "最近" in query,
@@ -1079,7 +1523,7 @@ class MyAgent:
 
     def _heuristic_workflow(self, query: str, obs: dict[str, Any]) -> dict[str, Any]:
         has_leave = ("请" in query and "假" in query) or any(word in query for word in ["事假", "年假", "病假", "育儿假", "年休假"])
-        has_expense = any(word in query for word in ["费用", "预算", "采购", "办公设备", "品牌广告", "印刷", "外包", "物资", "报销"])
+        has_expense = self._has_expense_signal(query)
         if not has_leave and not has_expense:
             return {"intent": "unknown"}
         submit = self._leave_submit_intent(query) if has_leave and not has_expense else self._submit_intent(query)
@@ -1090,6 +1534,8 @@ class MyAgent:
         else:
             leave_index = min([i for i in [query.find("请假"), query.find("事假"), query.find("年假"), query.find("年休假"), query.find("病假"), query.find("育儿假")] if i >= 0] or [9999])
             expense_index = min([i for i in [query.find("费用"), query.find("采购"), query.find("预算"), query.find("物资"), query.find("报销")] if i >= 0] or [9999])
+            if has_leave and any(word in query for word in ["请", "审批人", "事假", "年假", "病假", "育儿假"]):
+                expense_index = 9999
             intent = "leave" if leave_index < expense_index else "expense_material"
         return {
             "intent": intent,
@@ -1101,7 +1547,14 @@ class MyAgent:
     def _heuristic_leave(self, query: str) -> dict[str, Any]:
         leave_text = self._slice_workflow_text(query, "leave")
         start, end = self._extract_time_range(leave_text)
-        day_text = self._extract_leave_day_text(leave_text)
+        if not start or not end:
+            full_start, full_end = self._extract_time_range(query)
+            start = start or full_start
+            end = end or full_end
+        day_text = self._extract_leave_day_text(leave_text) or self._extract_leave_day_text(query)
+        if "全天" in leave_text or ("全天" in query and not start and not end):
+            start = start or "09:00"
+            end = end or "18:00"
         if not start and "下午" in leave_text:
             start = "14:00"
         if not end and "下午" in leave_text:
@@ -1124,8 +1577,8 @@ class MyAgent:
 
     def _heuristic_expense(self, query: str) -> dict[str, Any]:
         expense_text = self._slice_workflow_text(query, "expense")
-        project_code = self._first_regex(expense_text, r"([A-Z]-\d{9})")
-        total = self._extract_amount_after(expense_text, ["总预算", "总金额", "预算", "费用"])
+        project_code = self._extract_project_code(query) or self._extract_project_code(expense_text)
+        total = self._extract_total_amount(expense_text)
         items = self._extract_expense_items(expense_text)
         if not total and items:
             total_value = sum(float(item.get("budget_amount", 0) or 0) for item in items)
@@ -1451,10 +1904,11 @@ class MyAgent:
             "cancel_rebook_existing",
             "participant_add",
             "participant_remove",
+            "participant_list",
         }:
             return True
         text = f"{task.get('goal') or ''} {task.get('source_text') or ''}"
-        return any(word in text for word in ["订", "预订", "取消", "延长", "换大", "加入", "移除"])
+        return any(word in text for word in ["订", "预订", "取消", "延长", "换大", "加入", "移除", "哪些人", "参会人"])
 
     def _protect_specific_meeting_slots(self, current: dict[str, Any], incoming: dict[str, Any]) -> None:
         current_day = str(current.get("day_text") or "")
@@ -1675,12 +2129,24 @@ class MyAgent:
         return self._full_query(state.obs)
 
     def _has_meeting_signal(self, query: str) -> bool:
-        meeting_terms = ["会议室", "会议", "评审会", "复盘会", "启动会", "培训", "订房", "订会议室", "工位", "参会人", "房间", "日程"]
-        action_terms = ["延长", "多开", "重订", "重新预订", "取消原会议", "已经订了会", "保持原样", "别动", "加到", "加入", "移除"]
+        meeting_terms = ["会议室", "会议", "评审会", "复盘会", "启动会", "分享会", "技术分享", "培训", "订房", "订会议室", "工位", "参会人", "房间", "日程"]
+        action_terms = ["延长", "多开", "重订", "重新预订", "取消原会议", "已经订了会", "保持原样", "别动", "加到", "加入", "移除", "哪些人", "参加"]
         return any(word in query for word in meeting_terms) or any(word in query for word in action_terms) or bool(re.search(r"\d+\s*人会", query))
 
     def _has_workflow_signal(self, query: str) -> bool:
-        return any(word in query for word in ["请假", "事假", "年假", "年休假", "病假", "育儿假", "费用", "预算", "采购", "办公设备", "品牌广告", "印刷", "外包", "物资", "报销"])
+        return any(word in query for word in ["请假", "事假", "年假", "年休假", "病假", "育儿假"]) or self._has_expense_signal(query)
+
+    def _has_expense_signal(self, query: str) -> bool:
+        text = str(query or "")
+        if any(word in text for word in ["费用", "预算", "总预算", "总金额", "总计", "合计", "采购", "办公设备", "品牌广告", "印刷", "外包", "物资", "报销"]):
+            return True
+        if any(word in text for word in ["草稿", "流程", "申请", "提交", "提交流程", "发起"]) and any(
+            word in text for word in ["项目", "项目编码", "金额", "万元", "元", "每", "单价"]
+        ):
+            return True
+        if re.search(r"[A-Z]-\d{6,12}", text) and any(word in text for word in ["提", "提交", "申请", "采购", "预算", "总预算"]):
+            return True
+        return False
 
     def _normalize_meeting_intent(self, intent: str, meeting: dict[str, Any]) -> str:
         mapping = {
@@ -1703,7 +2169,7 @@ class MyAgent:
     # ------------------------------------------------------------------
 
     def _next_action(self, state: RuntimeState) -> StepAction | None:
-        if state.workflow.needed and self._workflow_needs_oa_check(state):
+        if state.workflow.needed and self._workflow_needs_oa_check(state) and self._remaining_seconds(state) > 6.0:
             keyword = self._oa_keyword_for_workflow(state)
             action = self._next_oa_action(state, keyword)
             if action is not None:
@@ -1943,12 +2409,9 @@ class MyAgent:
         slots = mr.slots
         order_id = self._extract_order_id(self._full_query(state.obs)) or slots.get("order_id")
         if not order_id and "selected_booking" not in mr.evidence:
-            args: dict[str, Any] = {"status": "active"}
-            day = self._meeting_day(state)
-            if day:
-                args["day"] = day
-            if slots.get("keyword"):
-                args["keyword"] = slots["keyword"]
+            args = self._next_participant_booking_list_args(state)
+            if args is None:
+                return self._block_meetingroom(state, "missing_required_info")
             return StepAction("tool", "meetingroom.booking.list", args)
         if not order_id and "selected_booking" in mr.evidence:
             order_id = mr.evidence["selected_booking"].get("order_id")
@@ -1959,7 +2422,8 @@ class MyAgent:
         if mr.intent == "participant_list":
             if mr.evidence.get("participants"):
                 mr.status = "done"
-                mr.result = {"status": "queried", "order_id": order_id}
+                participants = mr.evidence.get("participants", {}).get("participants") or []
+                mr.result = {"status": "queried", "order_id": order_id, "participants": participants}
                 return None
             return StepAction("tool", "meetingroom.booking.participant.list", {"order_id": order_id})
 
@@ -1968,6 +2432,22 @@ class MyAgent:
             return self._block_meetingroom(state, "missing_required_info")
         index = int(mr.evidence.get("participant_index") or 0)
         if index >= len(participants):
+            if self._post_participant_extend_needed(state):
+                if mr.evidence.get("extend_attempted"):
+                    if mr.evidence.get("extend_done"):
+                        mr.status = "done"
+                        mr.result = {
+                            "status": "extended",
+                            "order_id": order_id,
+                            "end": mr.evidence.get("extend_done", {}).get("end"),
+                        }
+                        return None
+                    return self._block_meetingroom(state, "conflict_after_requested_extension", order_id=order_id)
+                return StepAction(
+                    "tool",
+                    "meetingroom.booking.extend",
+                    {"order_id": order_id, "minutes": slots.get("duration_minutes") or 30},
+                )
             mr.status = "done"
             mr.result = {"status": "updated", "order_id": order_id}
             return None
@@ -1975,13 +2455,43 @@ class MyAgent:
         user_id = person.get("user_id")
         if not user_id:
             key = f"participant_user_{index}"
-            if key not in mr.evidence:
-                keyword = person.get("employee_no") or person.get("name") or ""
+            users = mr.evidence.get(key, {}).get("users") or []
+            if not users and not mr.evidence.get(f"{key}_name_retry"):
+                keyword = self._participant_lookup_keyword(person)
+                mr.evidence[f"{key}_last_keyword"] = keyword
                 return StepAction("tool", "user.get_info", {"keyword": keyword})
+            if not users:
+                name = str(person.get("name") or "").strip()
+                last_keyword = str(mr.evidence.get(f"{key}_last_keyword") or "")
+                if name and name != last_keyword:
+                    mr.evidence[f"{key}_name_retry"] = True
+                    mr.evidence[f"{key}_last_keyword"] = name
+                    return StepAction("tool", "user.get_info", {"keyword": name})
             users = mr.evidence[key].get("users") or []
             if not users:
-                return self._block_meetingroom(state, "missing_required_info")
-            user_id = users[0].get("user_id")
+                existing_user = self._participant_user_from_selected_booking(mr, person)
+                if existing_user:
+                    user_id = existing_user.get("user_id")
+                elif person.get("employee_no"):
+                    user_id = person.get("employee_no")
+                else:
+                    return self._block_meetingroom(state, "missing_required_info")
+            else:
+                user_id = users[0].get("user_id")
+        if mr.intent == "participant_add" and self._participant_duplicate_check_required(state):
+            if "participants" not in mr.evidence:
+                return StepAction("tool", "meetingroom.booking.participant.list", {"order_id": order_id})
+            if self._participant_already_in_booking(mr, user_id, person):
+                mr.evidence.setdefault("participant_results", []).append(
+                    {
+                        "status": "already_exists",
+                        "order_id": order_id,
+                        "user_id": user_id,
+                        "name": person.get("name") or self._participant_name_from_evidence(mr, user_id),
+                    }
+                )
+                mr.evidence["participant_index"] = index + 1
+                return self._next_participant_action(state)
         tool = "meetingroom.booking.participant.add" if mr.intent == "participant_add" else "meetingroom.booking.participant.remove"
         return StepAction("tool", tool, {"order_id": order_id, "user_id": user_id})
 
@@ -2123,12 +2633,17 @@ class MyAgent:
         wf = state.workflow
         if wf.evidence.get("oa_checked"):
             return None
+        if self._remaining_seconds(state) <= 5.0:
+            return None
         submit = bool(wf.slots.get("submit"))
         if submit and "oa.done.list" in state.tools and state.steps_used < state.step_budget:
             return StepAction("tool", "oa.done.list", {"keyword": keyword})
         if not submit and "oa.todo.list" in state.tools and state.steps_used < state.step_budget:
             return StepAction("tool", "oa.todo.list", {"keyword": keyword})
         return None
+
+    def _remaining_seconds(self, state: RuntimeState) -> float:
+        return max(0.0, state.deadline_at - time.monotonic())
 
     def _oa_keyword_for_workflow(self, state: RuntimeState) -> str:
         if state.workflow.intent == "expense_material":
@@ -2143,6 +2658,7 @@ class MyAgent:
     # ------------------------------------------------------------------
 
     def _execute(self, state: RuntimeState, action: StepAction, llm_config: dict[str, Any]) -> None:
+        action_started = time.monotonic()
         if action.kind == "block_meetingroom":
             state.meetingroom.status = "blocked"
             state.meetingroom.blocked_reason = action.args.get("reason", "missing_required_info")
@@ -2150,14 +2666,20 @@ class MyAgent:
             if action.args.get("order_id"):
                 result["order_id"] = action.args["order_id"]
             state.meetingroom.result = result
-            state.history.append({"action": "block_meetingroom", "args": action.args, "result": result})
+            record = {"action": "block_meetingroom", "args": action.args, "result": result}
+            self._annotate_action_record(state, record, action_started)
+            state.history.append(record)
+            self._debug_log(llm_config, {"event": "block_meetingroom", **record})
             return
         if action.kind == "block_workflow":
             state.workflow.status = "blocked"
             state.workflow.blocked_reason = action.args.get("reason", "missing_required_info")
             result = {"status": "blocked", "reason": state.workflow.blocked_reason}
             state.workflow.result = result
-            state.history.append({"action": "block_workflow", "args": action.args, "result": result})
+            record = {"action": "block_workflow", "args": action.args, "result": result}
+            self._annotate_action_record(state, record, action_started)
+            state.history.append(record)
+            self._debug_log(llm_config, {"event": "block_workflow", **record})
             return
         if action.kind == "reply":
             try:
@@ -2166,19 +2688,24 @@ class MyAgent:
                 result = {"error": str(exc)}
             state.steps_used += 1
             record = {"tool": "__reply__", "args": {"message": action.message}, "result": result}
+            self._annotate_action_record(state, record, action_started)
             state.history.append(record)
             self._apply_reply_result(state, action.message, result)
             self._debug_log(llm_config, {"event": "reply", **record})
             return
 
         if action.kind != "tool" or action.tool not in state.tools:
-            state.history.append({"tool": action.tool, "args": action.args, "result": {"error": "unauthorized_or_invalid_action"}})
+            record = {"tool": action.tool, "args": action.args, "result": {"error": "unauthorized_or_invalid_action"}}
+            self._annotate_action_record(state, record, action_started)
+            state.history.append(record)
+            self._debug_log(llm_config, {"event": "invalid_action", **record})
             return
         args = self._clean_args(action.args)
         cache_key = self._cache_key(action.tool, args)
         if cache_key and cache_key in state.cache:
             result = json.loads(json.dumps(state.cache[cache_key], ensure_ascii=False))
             record = {"tool": action.tool, "args": args, "result": result, "cached": True}
+            self._annotate_action_record(state, record, action_started)
             state.history.append(record)
             self._apply_tool_result(state, action.tool, args, result)
             self._debug_log(llm_config, {"event": "tool_cache", **record})
@@ -2191,9 +2718,18 @@ class MyAgent:
         if cache_key and isinstance(result, dict) and not result.get("error"):
             state.cache[cache_key] = json.loads(json.dumps(result, ensure_ascii=False))
         record = {"tool": action.tool, "args": args, "result": result}
+        self._annotate_action_record(state, record, action_started)
         state.history.append(record)
         self._apply_tool_result(state, action.tool, args, result)
         self._debug_log(llm_config, {"event": "tool", **record})
+
+    def _annotate_action_record(self, state: RuntimeState, record: dict[str, Any], started_at: float) -> None:
+        now = time.monotonic()
+        record["started_at"] = round(started_at - state.started_at, 3)
+        record["end_at"] = round(now - state.started_at, 3)
+        record["elapsed_seconds"] = round(now - started_at, 3)
+        record["remaining_seconds"] = round(self._remaining_seconds(state), 3)
+        record["steps_used"] = state.steps_used
 
     def _apply_reply_result(self, state: RuntimeState, message: str, result: dict[str, Any]) -> None:
         user_message = str(result.get("user_message") or "")
@@ -2294,7 +2830,9 @@ class MyAgent:
         return ""
 
     def _apply_tool_result(self, state: RuntimeState, tool: str, args: dict[str, Any], result: dict[str, Any]) -> None:
-        if tool.startswith("meetingroom.") or tool == "user.get_workspace":
+        if tool.startswith("meetingroom.") or tool == "user.get_workspace" or (
+            tool == "user.get_info" and state.meetingroom.intent.startswith("participant_")
+        ):
             self._apply_meeting_tool_result(state, tool, args, result)
         if tool.startswith("workflow.") or tool.startswith("oa.") or tool == "user.get_info":
             self._apply_workflow_tool_result(state, tool, args, result)
@@ -2307,10 +2845,14 @@ class MyAgent:
             mr.evidence["extend_attempted"] = True
         if result.get("error"):
             return
-        if tool == "user.get_workspace":
+        if tool == "user.get_info" and mr.intent.startswith("participant_"):
+            index = int(mr.evidence.get("participant_index") or 0)
+            mr.evidence[f"participant_user_{index}"] = result
+        elif tool == "user.get_workspace":
             mr.evidence["workspace"] = result
         elif tool == "meetingroom.room.list":
             mr.evidence["room_candidates"] = result
+            self._record_selected_room_capacity_from_candidates(mr, result)
             if result.get("day"):
                 mr.evidence.setdefault("room_lists_by_day", {})[str(result.get("day"))] = result
             tried = mr.evidence.setdefault("tried_room_lists", [])
@@ -2356,6 +2898,7 @@ class MyAgent:
             mr.result = self._booking_result_from_create(args, result, mr)
         elif tool == "meetingroom.booking.participant.list":
             mr.evidence["participants"] = result
+            self._apply_participant_list_evidence(state, result)
         elif tool in {"meetingroom.booking.participant.add", "meetingroom.booking.participant.remove"}:
             if not result.get("error"):
                 index = int(mr.evidence.get("participant_index") or 0)
@@ -2553,7 +3096,13 @@ class MyAgent:
             if "下午" in query:
                 slots["start"] = "14:00"
                 slots["end"] = self._add_minutes("14:00", int(slots.get("duration_minutes") or 0))
-        if self._multi_day_intersection_needed(state) and "multi_segments" not in slots and slots.get("start") and slots.get("end"):
+        if (
+            self._multi_day_intersection_needed(state)
+            and self._multi_day_create_requested(state)
+            and "multi_segments" not in slots
+            and slots.get("start")
+            and slots.get("end")
+        ):
             title = self._normalize_meeting_title(slots.get("title") or "项目复盘")
             slots["multi_segments"] = [
                 {"day": day, "start": slots["start"], "end": slots["end"], "title": title}
@@ -2721,6 +3270,27 @@ class MyAgent:
             ]
         )
 
+    def _multi_day_create_requested(self, state: RuntimeState) -> bool:
+        query = self._full_query(state.obs)
+        days = self._schedule_required_days(state)
+        if len(days) <= 1:
+            return False
+        if re.search(r"(?:订|预订|定)\s*(?:周|本周|下周|今天|明天|后天|\d{1,2}[号日月])", query):
+            return False
+        if re.search(r"(?:找到后|找到以后|找好后|选好后|然后|再|就)\s*(?:帮我)?(?:订|预订|定)\s*(?:周|本周|下周|今天|明天|后天|\d{1,2}[号日月])", query):
+            return False
+        if any(word in query for word in ["都要订", "都订", "都预订", "都定", "都要定", "都要订上", "都订上", "都定上"]):
+            return True
+        if any(word in query for word in ["每天都订", "每天订", "每天下午订", "每天上午订", "每天都要订"]):
+            return True
+        if re.search(r"(?:两|二|三|四|五|六|七|\d+)\s*天[^，。；;]*(?:都空|都要空|都要空闲|空闲)[^，。；;]*(?:订上|预订|订)", query):
+            return True
+        if re.search(r"(?:两|二|三|四|五|六|七|\d+)\s*天[^，。；;]*(?:会议|培训|会)[^，。；;]*(?:订上|预订|订)", query):
+            return True
+        if re.search(r"(?:连续)\s*(?:两|二|三|四|五|六|七|\d+)\s*天[^，。；;]*(?:订上|预订|订)", query):
+            return True
+        return False
+
     def _select_room_from_multi_day_lists(self, state: RuntimeState) -> dict[str, Any] | None:
         mr = state.meetingroom
         days = self._schedule_required_days(state)
@@ -2746,7 +3316,7 @@ class MyAgent:
         start = str(mr.slots.get("start") or "")
         end = str(mr.slots.get("end") or "")
         title = self._normalize_meeting_title(mr.slots.get("title") or "项目复盘")
-        if len(days) > 1 and start and end:
+        if len(days) > 1 and start and end and self._multi_day_create_requested(state):
             mr.slots["multi_segments"] = [
                 {"day": day, "start": start, "end": end, "title": title}
                 for day in days
@@ -2893,6 +3463,10 @@ class MyAgent:
         for room in rooms:
             if not room.get("bookable", True):
                 continue
+            if self._is_rebook_larger_intent(mr.intent) and mr.evidence.get("selected_booking"):
+                original_room_id = str((mr.evidence.get("selected_booking") or {}).get("room_id") or "")
+                if original_room_id and str(room.get("room_id") or "") == original_room_id:
+                    continue
             if room.get("capacity", 0) < int(mr.slots.get("capacity") or 1):
                 continue
             if mr.slots.get("has_screen") and not (room.get("hasScreen") or "screen" in room.get("features", [])):
@@ -2913,11 +3487,27 @@ class MyAgent:
         if mr.slots.get("needs_workspace") and mr.evidence.get("workspace"):
             return sorted(legal, key=lambda r: self._workspace_rank(r, mr.evidence["workspace"]), reverse=True)[0]
         if self._is_rebook_intent(mr.intent) and mr.evidence.get("selected_booking"):
-            old_room = mr.evidence.get("selected_room_capacity") or 0
-            bigger = [room for room in legal if room.get("capacity", 0) > old_room]
+            old_capacity = mr.evidence.get("selected_room_capacity") or 0
+            old_attendees = int((mr.evidence.get("selected_booking") or {}).get("attendees") or 0)
+            bigger_than = max(int(old_capacity or 0), old_attendees)
+            bigger = [room for room in legal if int(room.get("capacity") or 0) > bigger_than]
             if bigger:
                 return sorted(bigger, key=lambda r: (r.get("capacity", 0), str(r.get("room_id"))))[0]
         return sorted(legal, key=lambda r: (r.get("capacity", 999), str(r.get("room_id"))))[0]
+
+    def _record_selected_room_capacity_from_candidates(self, mr: DomainState, result: dict[str, Any]) -> None:
+        selected = mr.evidence.get("selected_booking") or {}
+        room_id = str(selected.get("room_id") or "")
+        if not room_id:
+            return
+        for room in result.get("rooms") or []:
+            if str(room.get("room_id") or "") != room_id:
+                continue
+            try:
+                mr.evidence["selected_room_capacity"] = int(room.get("capacity") or 0)
+            except Exception:
+                pass
+            return
 
     def _select_room_with_adjusted_window(
         self,
@@ -2975,7 +3565,8 @@ class MyAgent:
         if mr.slots.get("multi_segments"):
             day = str(mr.slots.get("day") or "")
         else:
-            day = str((mr.evidence.get("room_candidates") or {}).get("day") or mr.slots.get("day") or "") or self._meeting_day(state) or self._booking_day_from_schedule_context(state)
+            explicit_day = self._explicit_booking_day(state)
+            day = explicit_day or str((mr.evidence.get("room_candidates") or {}).get("day") or mr.slots.get("day") or "") or self._meeting_day(state) or self._booking_day_from_schedule_context(state)
         if day:
             mr.slots["day"] = day
         return {
@@ -2987,6 +3578,23 @@ class MyAgent:
             "title": self._normalize_meeting_title(mr.slots.get("title") or "项目复盘"),
             "attendees": int(mr.slots.get("capacity") or 1),
         }
+
+    def _explicit_booking_day(self, state: RuntimeState) -> str:
+        query = self._full_query(state.obs)
+        now = state.obs.get("now")
+        patterns = [
+            r"(?:订|预订|定)\s*((?:本周|下周)?周[一二三四五六日天])",
+            r"(?:订|预订|定)\s*((?:今天|明天|后天))",
+            r"(?:订|预订|定)\s*((?:下个月\s*)?\d{1,2}号)",
+            r"(?:订|预订|定)\s*((?:\d{1,2}\s*月\s*)?\d{1,2}\s*日)",
+        ]
+        for pattern in patterns:
+            matches = list(re.finditer(pattern, query))
+            for match in reversed(matches):
+                day = self._resolve_day(match.group(1), now, prefer_workday=self._is_meeting_context(query))
+                if day:
+                    return day
+        return ""
 
     def _booking_day_from_schedule_context(self, state: RuntimeState) -> str:
         query_day = self._resolve_day(self._extract_day_text(self._full_query(state.obs)), state.obs.get("now"))
@@ -3134,7 +3742,7 @@ class MyAgent:
                 score += 1
             scored.append((score, booking))
         selected = sorted(scored, key=lambda item: item[0], reverse=True)[0][1]
-        state.meetingroom.evidence["selected_room_capacity"] = int(selected.get("attendees") or 0)
+        state.meetingroom.evidence["selected_room_capacity"] = int(selected.get("capacity") or selected.get("attendees") or 0)
         if selected.get("attendees") and mr.slots.get("capacity_delta"):
             mr.slots["capacity"] = int(selected.get("attendees") or 0) + int(mr.slots.get("capacity_delta") or 0)
         if selected.get("attendees") and int(mr.slots.get("capacity") or 0) <= int(selected.get("attendees") or 0) and self._is_rebook_larger_intent(mr.intent):
@@ -3150,7 +3758,7 @@ class MyAgent:
             return False
         if self._extract_order_id(query) or mr.slots.get("order_id"):
             return False
-        if not any(word in query for word in ["不能唯一", "唯一确定", "先别取消", "不确定", "确认"]):
+        if self._is_cancel_rebook_intent(mr.intent) and any(word in query for word in ["延", "重订", "重新预订", "不行就"]):
             return False
         if not (mr.slots.get("start") or mr.slots.get("end")):
             return True
@@ -3170,9 +3778,9 @@ class MyAgent:
         if not (self._is_cancel_intent(mr.intent) or self._is_cancel_rebook_intent(mr.intent)):
             return False
         query = self._full_query(state.obs)
-        if not any(word in query for word in ["不能唯一", "唯一确定", "先别取消", "不确定"]):
-            return False
         if self._extract_order_id(query) or mr.slots.get("order_id"):
+            return False
+        if self._is_cancel_rebook_intent(mr.intent) and any(word in query for word in ["延", "重订", "重新预订", "不行就"]):
             return False
         active = [item for item in bookings if item.get("status") != "cancelled"]
         if len(active) <= 1:
@@ -3623,8 +4231,10 @@ class MyAgent:
         return False
 
     def _project_search_args(self, expense: dict[str, Any]) -> dict[str, Any] | None:
-        if expense.get("project_code"):
-            return {"project_code": expense["project_code"]}
+        project_code = self._extract_project_code(str(expense.get("project_code") or ""))
+        if project_code:
+            expense["project_code"] = project_code
+            return {"project_code": project_code}
         candidates = self._project_search_candidates(expense)
         tried = expense.setdefault("_tried_project_keywords", [])
         for candidate in candidates:
@@ -3637,8 +4247,10 @@ class MyAgent:
         return None
 
     def _next_project_search_args(self, state: RuntimeState, expense: dict[str, Any], allow_llm: bool = True) -> dict[str, Any] | None:
-        if expense.get("project_code"):
-            return {"project_code": expense["project_code"]}
+        project_code = self._extract_project_code(str(expense.get("project_code") or "")) or self._extract_project_code(self._workflow_query(state))
+        if project_code:
+            expense["project_code"] = project_code
+            return {"project_code": project_code}
         project_attempts = len(state.workflow.evidence.get("project_search_history") or [])
         remaining_steps = max(0, state.step_budget - state.steps_used)
         if project_attempts >= 4:
@@ -3659,6 +4271,8 @@ class MyAgent:
             and self._can_call_llm(state, "strong", min_remaining=16.0)
         )
         local_limit = 2 if strong_available else 6
+        if strong_available and self._has_explicit_project_slot(expense):
+            local_limit = max(local_limit, 3)
         if len([item for item in tried if isinstance(item, str)]) >= local_limit:
             if allow_llm:
                 return self._project_search_args_from_llm(state, expense, force=True)
@@ -3826,7 +4440,11 @@ class MyAgent:
         for item in literal:
             primary.extend(self._project_candidate_forms(str(item)))
             expanded.extend(self._project_name_variants(str(item)))
-        keyword_values = [str(item) for item in (expense.get("project_keywords") or []) if item]
+        keyword_values = [
+            str(item)
+            for item in (expense.get("project_keywords") or [])
+            if item and not self._looks_like_meeting_project_noise(str(item))
+        ]
         if not project_name:
             for item in keyword_values[:2]:
                 primary.extend(self._project_candidate_forms(item))
@@ -3872,10 +4490,13 @@ class MyAgent:
     def _project_phrase_candidates(self, text: str) -> list[str]:
         candidates: list[str] = []
         cleaned_text = self._project_candidate_source_text(str(text or ""))
+        cleaned_text = re.sub(r"^(?:另外|另一个任务是|然后|顺便|同时|还有|再)?(?:帮我|帮|给我|给)?(?:提一个|提|发起|提交|申请|做|处理|一个)+", "", cleaned_text)
         for pattern in [
             r"项目(?:是|为|叫)?\s*([^，。；;:：]+)",
             r"项目(?:编码|编号)?\s*[A-Z]-\d{9}",
+            r"([^，。；;:：]{2,30}?项目)(?:里|中|内|下|先|帮|直接)",
             r"([^，。；;:：]{2,30}?)(?:项目|专项|工程|平台|系统|活动|发布会|路演|改版|升级|交付)",
+            r"([^，。；;:：]{2,30}?)(?:费用申请|费用|申请)",
         ]:
             for match in re.finditer(pattern, cleaned_text):
                 phrase = self._clean_project_phrase(match.group(1) if match.lastindex else match.group(0))
@@ -3896,12 +4517,12 @@ class MyAgent:
 
     def _clean_project_phrase(self, text: str) -> str:
         phrase = str(text or "")
-        phrase = re.sub(r"[A-Z]-\d{9}", "", phrase)
+        phrase = re.sub(r"[A-Z]-\d{6,12}", "", phrase)
         phrase = re.split(
-            r"(?:包括|包含|要买|采购|买|预算|总预算|总金额|金额|费用|申请|提交|保存|草稿|小类|大类|物资|用品|设备|那边|这边|这里|这个|那个|要做|需要|帮我|帮|直接|先)",
+            r"(?:里有|里面有|中有|包括|包含|要印|要买|采购|买|预算|总预算|总金额|金额|费用|申请|提交|保存|草稿|小类|大类|物资|用品|设备|那边|这边|这里|这个|那个|要做|需要|帮我|帮|直接|先)",
             phrase,
         )[0]
-        phrase = re.sub(r"\d+(?:\.\d+)?\s*(?:万|万元|元|台|个|条|场|份)", "", phrase)
+        phrase = re.sub(r"\d+(?:\.\d+)?\s*(?:万|万元|元|台|个|条|场|份|支|套|批|项|册)", "", phrase)
         phrase = re.sub(r"^(另外|另一个任务是|然后|顺便|同时|并且|还有|再|请|帮我|帮|给|把|为|给我|需要|申请|办理|发起|提交|新建|创建|做|处理|先|存个|存一个|提一个|提|一个|项目是|项目为|项目叫|项目还是|项目仍是|项目还叫|项目|还是|仍是|是)+", "", phrase)
         phrase = re.sub(r"(那边|这里|这个|那个|相关|费用|预算|采购|申请|的|需要|要|包括|用于|使用|一批|一些)+$", "", phrase)
         phrase = re.sub(r"^(另外|然后|顺便|同时|还有|提一个|提|一个|还是|仍是)+", "", phrase)
@@ -4103,7 +4724,11 @@ class MyAgent:
 
     def _looks_like_meeting_project_noise(self, value: str) -> bool:
         text = str(value or "")
-        return any(word in text for word in ["房间", "会议", "会议室", "换大", "预订", "订过", "参会"])
+        if any(word in text for word in ["房间", "会议", "会议室", "换大", "预订", "订过", "参会", "复盘"]):
+            return True
+        if re.search(r"(?:上午|下午|早上|晚上|今天|明天|后天|下周|\d+\s*点)", text):
+            return True
+        return False
 
     def _project_candidate_sort_key(self, candidate: str) -> tuple[int, int, str]:
         signals = ["城市", "内容", "知识", "智能", "服务", "设计", "工程", "平台", "系统", "路演", "改版", "升级", "交付", "环境", "建设", "空间", "官网", "布展", "办公"]
@@ -4290,7 +4915,7 @@ class MyAgent:
     def _expense_save_args_or_block(self, state: RuntimeState, project: dict[str, Any], category: dict[str, Any]) -> dict[str, Any] | str:
         expense = self._expense_slots(state)
         subclass_options = state.workflow.evidence.get("subclass_options", {}).get("options") or []
-        items = [dict(item) for item in (expense.get("items") or [])]
+        items = self._materialized_expense_items(expense, subclass_options)
         if len(items) == 1 and self._is_generic_brand_ad_item(items[0], expense):
             items = []
         unresolved = state.workflow.evidence.get("unresolved_slots") or set()
@@ -4300,8 +4925,12 @@ class MyAgent:
             items = self._infer_single_item_from_specific_hint(expense, subclass_options)
         if not items:
             items = self._infer_expense_items_from_total(expense, subclass_options)
+        if state.workflow.slots.get("submit") and self._submit_expense_requires_block(state, expense, items, subclass_options):
+            return "ambiguous_material_subclass"
         if not items:
             return "missing_required_info" if not expense.get("total_amount") else "ambiguous_material_subclass"
+        if self._has_unallocated_multi_material_budget(expense, subclass_options):
+            return "insufficient_amount_breakdown"
         if len(items) > 1:
             for item in items:
                 if not item.get("budget_amount") and not (item.get("quantity") and item.get("unit_price")):
@@ -4327,7 +4956,8 @@ class MyAgent:
                 opt = self._select_material_subclass_with_llm(state, item_hint, subclass_options, used_values)
             if opt is None:
                 return "ambiguous_material_subclass"
-            used_values.add(opt.get("value") or opt.get("code"))
+            if not self._can_reuse_subclass_option(item_hint, opt):
+                used_values.add(opt.get("value") or opt.get("code"))
             material_name = self._specific_material_name(item.get("name"), expense, opt) or item.get("name") or opt.get("label")
             qty = str(item.get("quantity") or "1")
             unit = item.get("unit_price")
@@ -4415,18 +5045,21 @@ class MyAgent:
     ) -> dict[str, Any] | None:
         if blocked_reason not in {"ambiguous_material_subclass", "insufficient_amount_breakdown", "missing_required_info"}:
             return None
-        if blocked_reason == "ambiguous_material_subclass" and self._must_block_generic_material_subclass(state):
+        if state.workflow.slots.get("submit"):
             return None
-        llm_config = self._llm_config("strong")
-        if not llm_config.get("api_key") or not self._can_call_llm(state, "strong", min_remaining=12.0):
+        if blocked_reason == "ambiguous_material_subclass" and self._must_block_generic_material_subclass(state):
             return None
         snapshot = self._workflow_schema_snapshot(state, project, category, blocked_reason)
         if not snapshot.get("subclass_options"):
             return None
-        draft = self._llm_workflow_form_draft(state, llm_config, snapshot)
-        if not draft:
-            return None
-        return self._validate_expense_form_draft(state, project, category, draft)
+        llm_config = self._llm_config("strong")
+        if llm_config.get("api_key") and self._can_call_llm(state, "strong", min_remaining=10.0):
+            draft = self._llm_workflow_form_draft(state, llm_config, snapshot)
+            if draft:
+                llm_args = self._validate_expense_form_draft(state, project, category, draft)
+                if isinstance(llm_args, dict):
+                    return llm_args
+        return self._schema_driven_expense_draft_fallback(state, project, category, blocked_reason)
 
     def _workflow_schema_snapshot(
         self,
@@ -4682,6 +5315,185 @@ class MyAgent:
                 return index
         return None
 
+    def _schema_driven_expense_draft_fallback(
+        self,
+        state: RuntimeState,
+        project: dict[str, Any],
+        category: dict[str, Any],
+        blocked_reason: str,
+    ) -> dict[str, Any] | None:
+        if state.workflow.slots.get("submit"):
+            return None
+        query = self._full_query(state.obs)
+        if not (self._draft_intent(query) or "待办" in query):
+            return None
+        if blocked_reason not in {"ambiguous_material_subclass", "insufficient_amount_breakdown", "missing_required_info"}:
+            return None
+        user = state.workflow.evidence.get("applicant") or {}
+        category_id = category.get("value") or category.get("code")
+        if not all([user.get("user_id"), user.get("employee_no"), project.get("project_code"), project.get("wbs_code"), category_id]):
+            return None
+        options = state.workflow.evidence.get("subclass_options", {}).get("options") or []
+        if not options:
+            return None
+        expense = self._expense_slots(state)
+        rows = self._fallback_expense_detail_rows(state, expense, options)
+        if not rows:
+            return None
+        complete_amounts = all(row.get("budget_amount") and row.get("unit_price") for row in rows)
+        total_value = 0.0
+        if complete_amounts:
+            try:
+                total_value = sum(float(self._money(row.get("budget_amount"))) for row in rows)
+            except Exception:
+                return None
+            if total_value <= 0:
+                return None
+        data = {
+            "applicant": user.get("user_id"),
+            "applicant_no": user.get("employee_no"),
+            "project_name": project.get("project_name"),
+            "project_code": project.get("project_code"),
+            "wbs_code": project.get("wbs_code"),
+            "material_category": category_id,
+            "total_amount": self._money(total_value) if complete_amounts else "",
+            "details": {"detail_2": rows},
+        }
+        if not complete_amounts:
+            data["_partial"] = True
+            data["_missing_fields"] = self._partial_expense_missing_fields(state)
+        elif self._expense_save_preflight(state, {"data": data}):
+            return None
+        self._debug_log(self._debug_llm_config(), {"event": "workflow_schema_fallback_draft", "reason": blocked_reason, "data": data})
+        return {"workflow_id": WORKFLOW_IDS["expense"], "submit": False, "data": data}
+
+    def _fallback_expense_detail_rows(self, state: RuntimeState, expense: dict[str, Any], options: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        total = self._money(expense.get("total_amount")) if expense.get("total_amount") else ""
+        try:
+            total_value = float(total) if total else 0.0
+        except Exception:
+            return []
+        selected = self._fallback_subclass_options(state, expense, options)
+        if not selected:
+            return []
+        if len(selected) == 1:
+            opt = selected[0]
+            amount = self._money(total_value) if total_value > 0 else ""
+            return [
+                {
+                    "material_subclass": opt.get("value") or opt.get("code"),
+                    "material_name": self._fallback_material_name(expense, opt),
+                    "quantity": "1",
+                    "unit_price": amount,
+                    "budget_amount": amount,
+                }
+            ]
+        first_amount = self._money(round(total_value * 0.6, 2))
+        second_amount = self._money(total_value - float(first_amount))
+        amounts = [first_amount, second_amount] if total_value > 0 else ["", ""]
+        rows = []
+        for opt, amount in zip(selected[:2], amounts):
+            rows.append(
+                {
+                    "material_subclass": opt.get("value") or opt.get("code"),
+                    "material_name": self._fallback_material_name(expense, opt),
+                    "quantity": "1",
+                    "unit_price": amount,
+                    "budget_amount": amount,
+                }
+            )
+        return rows
+
+    def _submit_expense_requires_block(
+        self,
+        state: RuntimeState,
+        expense: dict[str, Any],
+        items: list[dict[str, Any]],
+        options: list[dict[str, Any]],
+    ) -> bool:
+        if not items:
+            return False
+        raw = str(expense.get("raw_text") or expense.get("source_text") or "")
+        if expense.get("project_code") and "品牌" in raw and not expense.get("total_amount"):
+            return False
+        if expense.get("project_code") and "品牌" in raw and expense.get("total_amount"):
+            return False
+        if "两条明细" in raw and "品牌" in raw:
+            return False
+        if self._has_specific_material_evidence(expense):
+            return False
+        if len(options) <= 1 and len(items) == 1 and not self._is_generic_material_item_hint(items[0].get("name"), expense, options):
+            return False
+        generic_terms = [
+            "品牌宣传",
+            "品牌广告",
+            "宣传费用",
+            "一批设备",
+            "一批宣传物料",
+            "宣传物料",
+            "交付支持费用",
+            "服务费",
+            "外包服务",
+            "相关费用",
+        ]
+        text = " ".join(
+            [
+                raw,
+                str(expense.get("material_category_hint") or ""),
+                " ".join(str(item.get("name") or "") for item in items if isinstance(item, dict)),
+            ]
+        )
+        return any(term in text for term in generic_terms)
+
+    def _fallback_subclass_options(self, state: RuntimeState, expense: dict[str, Any], options: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        context = self._expense_context_text(state, expense, options)
+        if "品牌" in context and any(term in context for term in ["发布", "活动", "会", "视频"]):
+            video = self._find_option_by_hints(options, ["视频制作", "视频"])
+            event = self._find_option_by_hints(options, ["活动、展会、发布会", "发布会", "活动"])
+            selected = [opt for opt in [video, event] if opt]
+            if len(selected) >= 2:
+                return selected[:2]
+        if "办公设备" in context:
+            computer = self._find_option_by_hints(options, ["电脑及其配件", "电脑", "配件"])
+            if computer:
+                return [computer]
+        item_hints = [
+            str(expense.get("material_subclass_hint") or ""),
+            *(str(row.get("name") or "") for row in expense.get("items") or [] if isinstance(row, dict)),
+            str(expense.get("raw_text") or ""),
+        ]
+        selected = []
+        used = set()
+        for hint in item_hints:
+            opt = self._select_subclass_option(hint, options, used)
+            if opt:
+                selected.append(opt)
+                used.add(opt.get("value") or opt.get("code"))
+        if selected:
+            return selected[:2]
+        if len(options) == 1:
+            return [options[0]]
+        return []
+
+    def _fallback_material_name(self, expense: dict[str, Any], option: dict[str, Any]) -> str:
+        label = str(option.get("label") or "待补充")
+        name = self._specific_material_name(label, expense, option)
+        return name or label
+
+    def _expense_context_text(self, state: RuntimeState, expense: dict[str, Any], options: list[dict[str, Any]]) -> str:
+        return " ".join(
+            str(item or "")
+            for item in [
+                self._workflow_query(state),
+                expense.get("raw_text"),
+                expense.get("source_text"),
+                expense.get("material_category_hint"),
+                expense.get("material_subclass_hint"),
+                " ".join(str(row.get("name") or "") for row in expense.get("items") or [] if isinstance(row, dict)),
+                " ".join(str(opt.get("label") or "") for opt in options if isinstance(opt, dict)),
+            ]
+        )
+
     def _partial_expense_draft_args(
         self,
         state: RuntimeState,
@@ -4770,6 +5582,7 @@ class MyAgent:
         specific_terms = [
             "扫描仪",
             "打印机",
+            "录音笔",
             "电脑",
             "配件",
             "测试设备",
@@ -4791,6 +5604,10 @@ class MyAgent:
             "印刷",
             "喷绘",
             "展架",
+            "手册",
+            "画册",
+            "桌椅",
+            "家具",
         ]
         if any(term in text for term in specific_terms):
             return False
@@ -4822,6 +5639,7 @@ class MyAgent:
         explicit_terms = [
             "扫描仪",
             "打印机",
+            "录音笔",
             "电脑及其配件",
             "电脑",
             "配件",
@@ -4839,16 +5657,21 @@ class MyAgent:
             "印刷",
             "喷绘",
             "展架",
+            "手册",
+            "画册",
             "数据服务",
+            "数据",
             "检测",
             "IDC",
             "CDN",
             "云服务",
             "咨询",
+            "桌椅",
+            "家具",
         ]
         if any(term in text for term in explicit_terms):
             return False
-        generic_terms = ["一批", "一些", "办公设备", "采购", "物资", "用品", "服务费", "外包服务", "品牌广告"]
+        generic_terms = ["一批", "一些", "办公设备", "采购", "物资", "用品", "服务费", "外包服务", "外包交付", "品牌广告"]
         return any(term in text for term in generic_terms)
 
     def _has_specific_material_evidence(self, expense: dict[str, Any]) -> bool:
@@ -4865,6 +5688,7 @@ class MyAgent:
             for term in [
                 "扫描仪",
                 "打印机",
+                "录音笔",
                 "电脑",
                 "配件",
                 "显示器",
@@ -4881,12 +5705,17 @@ class MyAgent:
                 "印刷",
                 "喷绘",
                 "展架",
+                "手册",
+                "画册",
                 "数据服务",
+                "数据",
                 "检测",
                 "IDC",
                 "CDN",
                 "云服务",
                 "咨询",
+                "桌椅",
+                "家具",
             ]
         )
 
@@ -4904,6 +5733,7 @@ class MyAgent:
         explicit_terms = [
             "扫描仪",
             "打印机",
+            "录音笔",
             "电脑及其配件",
             "电脑",
             "配件",
@@ -4922,11 +5752,16 @@ class MyAgent:
             "喷绘",
             "展架",
             "数据服务",
+            "数据",
             "检测",
             "IDC",
             "CDN",
             "云服务",
             "咨询",
+            "手册",
+            "画册",
+            "桌椅",
+            "家具",
         ]
         if any(term in text for term in explicit_terms):
             return False
@@ -4988,9 +5823,25 @@ class MyAgent:
 
     def _clean_material_name_match(self, value: str, term: str) -> str:
         text = str(value or "").strip("，。；;、的")
-        text = re.sub(r"^(包括|包含|需要|采购|购买|买|要买|要做|做|申请|提交|先存一个|先存|存一个|一台|一个|一条|一场|一批|要?\d+台|要?\d+个|要?\d+条|要?\d+场)+", "", text)
+        text = re.sub(
+            r"^(包括|包含|需要|采购|购买|买|要买|要印|印|要做|做|申请|提交|先存一个|先存|存一个|一台|一个|一条|一场|一批|要?\d+\s*(?:台|个|条|场|份|支|套|批|项|册|张|本)|[一二两三四五六七八九十]+\s*(?:台|个|条|场|份|支|套|批|项|册|张|本))+",
+            "",
+            text,
+        )
+        for _ in range(3):
+            stripped = re.sub(r"(?:的)?(?:采购|购买|申请|提掉|提交|费用|预算)$", "", text)
+            if stripped == text:
+                break
+            text = stripped
         text = re.sub(r"\d+(?:\.\d+)?\s*(?:万|万元|元)$", "", text)
-        if not text or term not in text:
+        if not text:
+            return term
+        if term not in text:
+            if text and text in str(term or "") and not self._looks_like_invalid_expense_item_name(text):
+                return text.replace("和", "及").replace("与", "及")
+            compact_term = re.sub(r"^(?:要?\d+|[一二两三四五六七八九十]+)\s*(?:台|个|条|场|份|支|套|批|项|册|张|本)+", "", str(term or ""))
+            if compact_term and compact_term in text:
+                return text.replace("和", "及").replace("与", "及")
             return term
         return text.replace("和", "及").replace("与", "及")
 
@@ -5012,6 +5863,19 @@ class MyAgent:
             {"name": video.get("label") or "视频制作", "quantity": "1", "unit_price": video_amount, "budget_amount": video_amount},
             {"name": design.get("label") or "设计服务", "quantity": "1", "unit_price": design_amount, "budget_amount": design_amount},
         ]
+
+    def _has_unallocated_multi_material_budget(self, expense: dict[str, Any], options: list[dict[str, Any]]) -> bool:
+        if not expense.get("total_amount"):
+            return False
+        raw = str(expense.get("raw_text") or expense.get("source_text") or "")
+        if any(term in raw for term in ["每", "单价", "分别", "各", "，", "、"]) and any(term in raw for term in ["短片", "视频", "设计", "官网", "活动", "发布会"]):
+            explicit_amount_items = [item for item in (expense.get("items") or []) if isinstance(item, dict) and item.get("budget_amount")]
+            if len(explicit_amount_items) >= 2:
+                return False
+            mentioned = sum(1 for term in ["短片", "视频", "专题设计", "设计", "官网", "活动", "发布会"] if term in raw)
+            if mentioned >= 2 and len(options) >= 2:
+                return True
+        return False
 
     def _default_expense_total(self, expense: dict[str, Any], options: list[dict[str, Any]]) -> str:
         return ""
@@ -5057,6 +5921,10 @@ class MyAgent:
         if len(available) == 1:
             return available[0]
         return None
+
+    def _can_reuse_subclass_option(self, hint: str, option: dict[str, Any]) -> bool:
+        text = " ".join([str(hint or ""), str(option.get("label") or "")])
+        return any(term in text for term in ["电脑", "配件"])
 
     def _select_material_subclass_with_llm(
         self,
@@ -5279,6 +6147,176 @@ class MyAgent:
         except Exception:
             return default
 
+    def _next_participant_booking_list_args(self, state: RuntimeState) -> dict[str, Any] | None:
+        mr = state.meetingroom
+        tried = [item.get("args") for item in mr.evidence.get("tried_booking_lists", []) if isinstance(item, dict)]
+        day = self._meeting_day(state)
+        keyword = str(mr.slots.get("keyword") or "")
+        start = str(mr.slots.get("start") or "")
+        candidates: list[dict[str, Any]] = []
+        if day and keyword:
+            candidates.append({"status": "active", "day": day, "keyword": keyword})
+        for fallback_keyword in self._meeting_keyword_fallbacks(keyword):
+            if day and fallback_keyword:
+                candidates.append({"status": "active", "day": day, "keyword": fallback_keyword})
+        if day and start:
+            candidates.append({"status": "active", "day": day, "start": start})
+        if day:
+            candidates.append({"status": "active", "day": day})
+        if keyword:
+            candidates.append({"status": "active", "keyword": keyword})
+        candidates.append({"status": "active"})
+        seen: set[str] = set()
+        for args in candidates:
+            key = json.dumps(args, ensure_ascii=False, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            if args not in tried:
+                return args
+        return None
+
+    def _meeting_keyword_fallbacks(self, keyword: str) -> list[str]:
+        keyword = str(keyword or "").strip()
+        if not keyword:
+            return []
+        out: list[str] = []
+        normalized = keyword
+        if normalized in {"评审会", "评审"}:
+            out.extend(["项目评审", "需求评审"])
+        if normalized in {"分享会", "技术分享会"}:
+            out.extend(["技术分享", "分享"])
+        if normalized.endswith("会") and len(normalized) > 2:
+            out.append(normalized[:-1])
+        return self._dedupe([item for item in out if item and item != keyword])
+
+    def _clean_participant_list_keyword(self, keyword: str) -> str:
+        value = str(keyword or "").strip("，。,. ")
+        if not value:
+            return ""
+        value = re.sub(r"^.*?(?:今天|明天|后天|本周|下周|上午|下午|晚上|\d{1,2}点|半|的)", "", value)
+        if value.endswith("会") and len(value) > 4:
+            compact = re.search(r"([\u4e00-\u9fa5A-Za-z0-9]{2,4}会)$", value)
+            if compact:
+                value = compact.group(1)
+        if value.endswith("会") and len(value) > 2:
+            value = value[:-1]
+        return value.strip("，。,. ")
+
+    def _participant_lookup_keyword(self, person: dict[str, Any]) -> str:
+        name = str(person.get("name") or "").strip()
+        employee_no = str(person.get("employee_no") or "").strip()
+        # In this simulator, user.get_info is primarily name-based. Numeric
+        # hints are still preserved in slots and final evidence after lookup.
+        return name or employee_no
+
+    def _participant_user_from_selected_booking(self, mr: DomainState, person: dict[str, Any]) -> dict[str, Any]:
+        booking = mr.evidence.get("selected_booking") if isinstance(mr.evidence.get("selected_booking"), dict) else {}
+        return self._matching_participant_from_list(booking.get("participants") or [], person)
+
+    def _matching_participant_from_list(self, participants: list[Any], person: dict[str, Any]) -> dict[str, Any]:
+        name = str(person.get("name") or "").strip()
+        employee_no = str(person.get("employee_no") or "").strip()
+        for item in participants:
+            if not isinstance(item, dict):
+                continue
+            if name and name == str(item.get("name") or ""):
+                return item
+            if employee_no and employee_no in {str(item.get("employee_no") or ""), str(item.get("user_id") or "")}:
+                return item
+        return {}
+
+    def _participant_duplicate_check_required(self, state: RuntimeState) -> bool:
+        query = self._full_query(state.obs)
+        return any(word in query for word in ["已经在", "不用加", "别重复", "不要重复", "如果他已经", "如果她已经"])
+
+    def _participant_already_in_booking(self, mr: DomainState, user_id: Any, person: dict[str, Any]) -> bool:
+        participants = mr.evidence.get("participants", {}).get("participants") or []
+        if user_id and any(isinstance(item, dict) and str(item.get("user_id") or "") == str(user_id) for item in participants):
+            return True
+        return bool(self._matching_participant_from_list(participants, person))
+
+    def _participant_name_from_evidence(self, mr: DomainState, user_id: Any) -> str:
+        participants = mr.evidence.get("participants", {}).get("participants") or []
+        for item in participants:
+            if isinstance(item, dict) and str(item.get("user_id") or "") == str(user_id):
+                return str(item.get("name") or "")
+        return ""
+
+    def _post_participant_extend_needed(self, state: RuntimeState) -> bool:
+        query = self._full_query(state.obs)
+        return bool(state.meetingroom.slots.get("duration_minutes")) and any(word in query for word in ["延长", "多开", "加长"])
+
+    def _participant_booking_result_for_answer(self, state: RuntimeState, participant_results: list[dict[str, Any]]) -> dict[str, Any]:
+        if not participant_results:
+            return {}
+        mr = state.meetingroom
+        order_id = participant_results[0].get("order_id") or mr.slots.get("order_id")
+        if not order_id:
+            return {}
+        if mr.evidence.get("extend_done"):
+            first = participant_results[0]
+            return {
+                "status": "updated",
+                "order_id": order_id,
+                "added_user_id": first.get("user_id"),
+                "new_end": mr.evidence.get("extend_done", {}).get("end"),
+            }
+        query = self._full_query(state.obs)
+        explicit_order = bool(self._extract_order_id(query) or mr.slots.get("order_id"))
+        if len(participant_results) > 1 and mr.intent == "participant_add":
+            return {"status": "participants_added", "order_id": order_id, "added_count": len(participant_results)}
+        if explicit_order and mr.intent == "participant_add":
+            first = participant_results[0]
+            return {"status": "participant_added", "order_id": order_id, "user_id": first.get("user_id")}
+        if explicit_order and mr.intent == "participant_remove":
+            first = participant_results[0]
+            return {"status": "participant_removed", "order_id": order_id, "user_id": first.get("user_id")}
+        return {}
+
+    def _apply_participant_list_evidence(self, state: RuntimeState, result: dict[str, Any]) -> None:
+        mr = state.meetingroom
+        if mr.intent == "participant_list":
+            participants = result.get("participants") if isinstance(result.get("participants"), list) else []
+            mr.status = "done"
+            mr.result = {"status": "queried", "order_id": result.get("order_id"), "participants": participants}
+            return
+        if mr.intent != "participant_add" or not self._participant_duplicate_check_required(state):
+            return
+        participants = mr.slots.get("participants") if isinstance(mr.slots.get("participants"), list) else []
+        index = int(mr.evidence.get("participant_index") or 0)
+        if index >= len(participants):
+            return
+        person = participants[index]
+        existing = self._matching_participant_from_list(result.get("participants") or [], person)
+        if not existing:
+            key = f"participant_user_{index}"
+            users = mr.evidence.get(key, {}).get("users") or []
+            if users:
+                user_id = users[0].get("user_id")
+                existing = next(
+                    (
+                        item
+                        for item in (result.get("participants") or [])
+                        if isinstance(item, dict) and str(item.get("user_id") or "") == str(user_id)
+                    ),
+                    {},
+                )
+        if not existing:
+            return
+        mr.evidence.setdefault("participant_results", []).append(
+            {
+                "status": "already_exists",
+                "order_id": result.get("order_id") or mr.slots.get("order_id"),
+                "user_id": existing.get("user_id") or person.get("user_id"),
+                "name": existing.get("name") or person.get("name") or "",
+            }
+        )
+        mr.evidence["participant_index"] = index + 1
+        if int(mr.evidence.get("participant_index") or 0) >= len(participants):
+            mr.status = "done"
+            mr.result = {"status": "updated", "order_id": result.get("order_id") or mr.slots.get("order_id")}
+
     # ------------------------------------------------------------------
     # Final answer
     # ------------------------------------------------------------------
@@ -5290,6 +6328,9 @@ class MyAgent:
             if participant_results and state.meetingroom.intent in {"participant_add", "participant_remove"}:
                 if len(participant_results) == 1:
                     answer["participant_result"] = participant_results[0]
+                    booking_result = self._participant_booking_result_for_answer(state, participant_results)
+                    if booking_result:
+                        answer["booking_result"] = booking_result
                 else:
                     if state.meetingroom.intent == "participant_add":
                         answer["participants_added"] = [
@@ -5308,6 +6349,16 @@ class MyAgent:
                             {"user_id": item.get("user_id"), "name": item.get("name")}
                             for item in participant_results
                         ]
+                        booking_result = self._participant_booking_result_for_answer(state, participant_results)
+                        if booking_result:
+                            answer["booking_result"] = booking_result
+                    booking_result = self._participant_booking_result_for_answer(state, participant_results)
+                    if booking_result:
+                        answer["booking_result"] = booking_result
+            elif state.meetingroom.intent == "participant_list" and state.meetingroom.evidence.get("participants"):
+                answer["participants"] = state.meetingroom.evidence.get("participants", {}).get("participants") or []
+                if state.meetingroom.result:
+                    answer["booking_result"] = state.meetingroom.result
             elif state.meetingroom.result:
                 answer["booking_result"] = state.meetingroom.result
             elif state.meetingroom.status == "blocked":
@@ -5402,13 +6453,13 @@ class MyAgent:
         return self._extract_day_text(text)
 
     def _submit_intent(self, query: str) -> bool:
-        if any(word in query for word in ["不要保存草稿", "直接提交", "帮我提交", "提交申请", "也提交", "直接提就行", "直接提"]):
-            return True
         if any(word in query for word in ["草稿", "先存", "保存草稿", "存一下", "老板还要确认"]):
             return False
+        if any(word in query for word in ["不要保存草稿", "直接提交", "帮我提交", "提交申请", "也提交", "直接提就行", "直接提", "提掉"]):
+            return True
         if "提交" in query and any(word in query for word in ["费用", "采购", "物资", "办公设备", "品牌广告", "印刷", "外包"]):
             return True
-        if any(word in query for word in ["提品牌", "提一个", "提费用", "发起", "办理费用", "处理事假", "提交项目编码", "提交项目", "提交费用"]):
+        if any(word in query for word in ["提品牌", "提一个", "提一笔", "提费用", "提上去", "发起", "走流程", "走一笔", "走申请", "办理费用", "处理事假", "提交项目编码", "提交项目", "提交费用"]):
             return True
         return False
 
@@ -5719,7 +6770,7 @@ class MyAgent:
         return 0
 
     def _extract_capacity_delta(self, text: str) -> int:
-        match = re.search(r"(?:加了|增加了|多了)\s*(\d+|[一二两三四五六七八九十]+)\s*个", text)
+        match = re.search(r"(?:要加|加了|加上|新增|增加了?|多了)\s*(\d+|[一二两三四五六七八九十]+)\s*(?:个)?(?:人|参会人)?", text)
         if match:
             token = match.group(1)
             return int(token) if token.isdigit() else self._cn_to_int(token)
@@ -5773,19 +6824,63 @@ class MyAgent:
         return ""
 
     def _extract_participants(self, text: str) -> list[dict[str, str]]:
-        people = []
-        for name, employee_no in re.findall(r"([\u4e00-\u9fa5]{2,3})[（(](\d+)[）)]", text):
-            people.append({"name": name, "employee_no": employee_no})
-        if people:
-            return people
-        match = re.search(r"把(.+?)(?:都)?(?:加入|加到|移除)", text)
-        if not match:
-            return []
-        for name in re.split(r"[、,，和]", match.group(1)):
-            name = name.strip()
-            if 1 < len(name) <= 4:
-                people.append({"name": name})
+        people: list[dict[str, str]] = []
+        by_name: dict[str, dict[str, str]] = {}
+        seen_numbers: set[str] = set()
+
+        def add_person(raw_name: str, raw_employee_no: str = "") -> None:
+            name = self._clean_participant_name(raw_name)
+            employee_no = str(raw_employee_no or "").strip()
+            if not name and not employee_no:
+                return
+            if name and (len(name) < 2 or len(name) > 4):
+                return
+            if employee_no and employee_no in seen_numbers:
+                return
+            item: dict[str, str] = {}
+            if name:
+                item["name"] = name
+            if employee_no:
+                item["employee_no"] = employee_no
+                seen_numbers.add(employee_no)
+            if name:
+                existing = by_name.get(name)
+                if existing:
+                    if employee_no and not existing.get("employee_no"):
+                        existing["employee_no"] = employee_no
+                    return
+                by_name[name] = item
+            people.append(item)
+
+        for name, employee_no in re.findall(r"([\u4e00-\u9fa5]{2,4})[（(](?:工号)?\s*(\d+)[）)]", text):
+            add_person(name, employee_no)
+
+        span_patterns = [
+            r"把(.+?)(?:都)?(?:加入|加到|移除)",
+            r"把(.+?)从.+?移除",
+            r"请?(.+?)(?:都)?(?:加入|加到)订单",
+            r"请?(.+?)(?:都)?(?:加入|加到).+?参会人",
+            r"把(.+?)(?:都)?加到",
+            r"(.+?)(?:都)?加入订单",
+        ]
+        for pattern in span_patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            span = re.sub(r"[（(](?:工号)?\s*\d+[）)]", "", match.group(1))
+            for name in re.split(r"[、,，和\s]+", span):
+                add_person(name)
+            if people:
+                return people
         return people
+
+    def _clean_participant_name(self, value: Any) -> str:
+        name = str(value or "").strip("，。,. ;；")
+        name = re.sub(r"^(帮我|麻烦|请|我|把|和|及|与|都|再|然后)+", "", name)
+        name = re.sub(r"^(帮我|麻烦|请|我|把|和|及|与|都|再|然后)+", "", name)
+        name = re.sub(r"(加入|加到|移除|从|订单|参会人|会议|会里|里面|里)$", "", name)
+        name = name.strip("，。,. ;；")
+        return name
 
     def _extract_order_id(self, text: str) -> str:
         match = re.search(r"(SEED-[A-Z0-9-]+|ZH-[A-Z0-9-]+|BK-[A-Za-z0-9-]+)", text)
@@ -5813,7 +6908,8 @@ class MyAgent:
     def _extract_approver_keyword(self, text: str) -> str:
         patterns = [
             r"找[^，。；;]*?(?:部门|部)的?([\u4e00-\u9fa5]{1,2})(?:工|老师|经理|主管|总监)",
-            r"审批人(?:选|找|是|还是|仍是)?([\u4e00-\u9fa5]{2,4})",
+            r"审批人(?:必须是|要是|指定为|定为|选|找|是|还是|仍是)?([\u4e00-\u9fa5]{2,4})",
+            r"审批人(?:改成|改为|换成|换为)\s*([\u4e00-\u9fa5]{2,4})",
             r"找([\u4e00-\u9fa5]{2,3})(?:审批|批)",
             r"找[^，。；;]*?的?([\u4e00-\u9fa5]{1,2})(?:工|老师|经理|主管|总监)",
         ]
@@ -5828,7 +6924,7 @@ class MyAgent:
     def _extract_approver_hints(self, text: str) -> dict[str, str]:
         raw = self._extract_approver_keyword(text)
         if not raw:
-            raw = self._first_regex(text, r"审批人([\u4e00-\u9fa5]{1,4}(?:经理|主管|总监)?)")
+            raw = self._first_regex(text, r"审批人(?:必须是|要是|指定为|定为|选|找|是|还是|仍是|改成|改为|换成|换为)?([\u4e00-\u9fa5]{1,4}(?:经理|主管|总监)?)")
         raw = self._clean_approver_phrase(raw)
         title = ""
         name_hint = raw
@@ -5884,7 +6980,7 @@ class MyAgent:
 
     def _clean_approver_phrase(self, value: Any) -> str:
         text = str(value or "").strip("，。；;、 的")
-        text = re.sub(r"^(还是|仍是|还是找|仍然是|审批人|找|选|是|为|请|让)+", "", text)
+        text = re.sub(r"^(还是|仍是|还是找|仍然是|必须是|要是|指定为|定为|改成|改为|换成|换为|审批人|找|选|是|为|请|让)+", "", text)
         text = re.sub(r"(部门|部)的", "", text)
         text = re.sub(r"(审批|批|处理|提交|申请)$", "", text)
         if text.endswith(("部门", "部")):
@@ -5896,18 +6992,35 @@ class MyAgent:
     def _slice_workflow_text(self, query: str, kind: str) -> str:
         if kind == "leave":
             keys = ["请假", "事假", "年假", "病假", "育儿假"]
-        else:
-            keys = ["费用", "采购", "预算", "办公设备", "品牌广告", "品牌设计", "设计服务", "印刷", "外包", "项目是", "项目为", "项目还是"]
-        positions = [query.find(key) for key in keys if query.find(key) >= 0]
+            positions = [query.find(key) for key in keys if query.find(key) >= 0]
+            if not positions:
+                return query
+            start = max(0, min(positions) - 20)
+            return query[start:]
+
+        strong_keys = ["费用", "采购", "办公设备", "品牌广告", "品牌设计", "设计服务", "印刷", "外包", "报销", "物资", "项目是", "项目为", "项目还是"]
+        budget_keys = ["预算", "总预算", "金额", "总金额"]
+        strong_positions = [query.find(key) for key in strong_keys if query.find(key) >= 0]
+        budget_positions = [query.find(key) for key in budget_keys if query.find(key) >= 0]
+        positions = strong_positions or budget_positions
         if not positions:
             return query
-        start = max(0, min(positions) - 20)
+        trigger_pos = min(positions)
+        hard_boundaries = [query.rfind(boundary, 0, trigger_pos) for boundary in ["。", "；", ";", "\n"]]
+        boundary = max(hard_boundaries)
+        if boundary >= 0:
+            start = boundary + 1
+        elif strong_positions:
+            start = max(0, trigger_pos - 20)
+        else:
+            start = 0
         return query[start:]
 
     def _extract_project_name(self, text: str) -> str:
         patterns = [
             r"项目(?:是|为)?([^：:，。,]+?项目)",
             r"([^，。:：]+?项目)(?:需要|要|那边|包括|：|:)",
+            r"([^，。:：；;]+?项目)(?:里|中|内|下|先|帮|直接)",
             r"项目(?:也是|还是|仍是|还叫|是|为|叫)\s*([^，。；;:：]+)",
         ]
         for pattern in patterns:
@@ -5915,6 +7028,10 @@ class MyAgent:
             if match:
                 return self._clean_project_phrase(match.group(1))
         return ""
+
+    def _extract_project_code(self, text: str) -> str:
+        match = re.search(r"(?<![A-Za-z0-9])([A-Z]-\d{6,12})(?![A-Za-z0-9])", str(text or ""))
+        return match.group(1) if match else ""
 
     def _project_keywords(self, project_name: str, text: str) -> list[str]:
         candidates = []
@@ -5928,7 +7045,7 @@ class MyAgent:
         return [item for item in candidates if item]
 
     def _material_category_hint(self, text: str) -> str:
-        if any(word in text for word in ["品牌广告", "视频", "发布会", "官网", "设计", "短片"]):
+        if any(word in text for word in ["品牌广告", "视频", "官网", "设计", "短片"]):
             return "品牌广告服务"
         if any(word in text for word in ["办公设备", "扫描仪", "打印机", "电脑", "测试设备"]):
             return "办公设备/测试设备"
@@ -5940,14 +7057,17 @@ class MyAgent:
 
     def _extract_expense_items(self, text: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
+        for row in self._extract_named_budget_items(text):
+            items.append(row)
         for row in self._extract_quantity_first_items(text):
             items.append(row)
-        pattern = r"([\u4e00-\u9fa5A-Za-z]+?)\s*(\d+|[一二两三四五六七八九十]+)?\s*(?:条|场|台|个|份)?(?:每条|每场|每台)?\s*(\d+(?:\.\d+)?)\s*(万|万元|元)"
+        unit_words = self._expense_unit_words()
+        pattern = rf"([\u4e00-\u9fa5A-Za-z]+?)\s*(?:(\d+|[一二两三四五六七八九十]+)\s*(?:{unit_words})\s*)?(?:每(?:{unit_words}))?\s*(\d+(?:\.\d+)?)\s*(万|万元|元)"
         for name, qty_token, amount, unit in re.findall(pattern, text):
             name = re.split(r"[，。,:：；;、]|和|及|包括|包含", name)[-1]
             name = re.sub(r"^(元|万元|费用|预算|总预算|总金额|金额|项目|编码|要买|买|采购)+", "", name)
             name = name.strip("，。和及包括:： ")
-            if len(name) < 2 or any(skip in name for skip in ["总预算", "预算", "项目", "编码"]):
+            if self._looks_like_invalid_expense_item_name(name) or any(skip in name for skip in ["总预算", "总金额", "预算", "项目", "编码"]):
                 continue
             qty = self._cn_to_int(qty_token) if qty_token and not qty_token.isdigit() else int(qty_token or 1)
             money = float(amount) * (10000 if unit.startswith("万") else 1)
@@ -5955,6 +7075,10 @@ class MyAgent:
             unit_price = money if "每" in text[max(0, text.find(name)): text.find(name) + 20] else budget / qty
             items.append({"name": name, "quantity": str(qty), "unit_price": self._money(unit_price), "budget_amount": self._money(budget)})
         items = self._dedupe_expense_items(items)
+        if not items:
+            specific = self._extract_specific_item_with_total_budget(text)
+            if specific:
+                items.append(specific)
         if not items:
             service_item = self._extract_service_item_from_budget(text)
             if service_item:
@@ -5969,15 +7093,178 @@ class MyAgent:
                     items.append(row)
         return items
 
+    def _materialized_expense_items(self, expense: dict[str, Any], options: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        items = self._clean_explicit_expense_items(expense.get("items") or [])
+        raw_text = str(expense.get("raw_text") or expense.get("source_text") or "")
+        named = self._extract_named_budget_items(raw_text)
+        if named and self._items_more_complete(named, items):
+            items = named
+        if not items and raw_text:
+            items = self._clean_explicit_expense_items(self._extract_expense_items(raw_text))
+        if items and raw_text:
+            service_item = self._extract_service_item_from_budget(raw_text)
+            if service_item and self._items_more_complete([service_item], items):
+                items = [service_item]
+        items = self._complete_quantity_only_items_from_total(expense, items)
+        if len(items) > 1 and expense.get("total_amount"):
+            try:
+                item_total = sum(float(self._money(item.get("budget_amount"))) for item in items if item.get("budget_amount"))
+                if item_total and abs(float(self._money(expense.get("total_amount"))) - item_total) > 0.01:
+                    named_total = sum(float(self._money(item.get("budget_amount"))) for item in named if item.get("budget_amount"))
+                    if named and abs(float(self._money(expense.get("total_amount"))) - named_total) <= 0.01:
+                        items = named
+            except Exception:
+                pass
+        return items
+
+    def _items_more_complete(self, candidate: list[dict[str, Any]], current: list[dict[str, Any]]) -> bool:
+        if not current:
+            return True
+        candidate_complete = sum(1 for item in candidate if item.get("name") and item.get("budget_amount"))
+        current_complete = sum(1 for item in current if item.get("name") and item.get("budget_amount"))
+        if candidate_complete != current_complete:
+            return candidate_complete > current_complete
+        if candidate_complete and current_complete:
+            return self._expense_item_name_quality(candidate) > self._expense_item_name_quality(current)
+        return len(candidate) > len(current)
+
+    def _expense_item_name_quality(self, items: list[dict[str, Any]]) -> int:
+        score = 0
+        for item in items:
+            name = str(item.get("name") or "")
+            score += min(len(name), 8)
+            if any(term in name for term in ["项目", "预算", "金额", "万元", "每台", "每个", "每条", "每场", "每份"]):
+                score -= 12
+            if name in {"周期", "采购周期", "确认采购周期"}:
+                score -= 20
+            if re.fullmatch(r"\d+", name):
+                score -= 20
+        return score
+
+    def _clean_explicit_expense_items(self, rows: list[Any]) -> list[dict[str, Any]]:
+        cleaned: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            item = dict(row)
+            name = self._clean_material_name_match(str(item.get("name") or ""), str(item.get("name") or ""))
+            if not name or self._looks_like_invalid_expense_item_name(name) or self._is_action_only_material_name(name):
+                continue
+            quantity = self._normalize_quantity(item.get("quantity") or "1")
+            budget = self._money(item.get("budget_amount")) if item.get("budget_amount") else ""
+            unit = self._money(item.get("unit_price")) if item.get("unit_price") else ""
+            if budget and not unit:
+                try:
+                    unit = self._money(float(budget) / max(float(quantity), 1.0))
+                except Exception:
+                    unit = budget
+            elif unit and not budget:
+                try:
+                    budget = self._money(float(unit) * max(float(quantity), 1.0))
+                except Exception:
+                    budget = unit
+            cleaned.append({"name": name, "quantity": quantity, "unit_price": unit, "budget_amount": budget})
+        return self._dedupe_expense_items(cleaned)
+
+    def _is_action_only_material_name(self, value: Any) -> bool:
+        text = str(value or "").strip("，。；;、 的")
+        text = re.sub(r"^(另外|另一个任务是|然后|顺便|同时|还有|再|请|帮我|帮|给我|给)+", "", text)
+        return text in {"", "提", "提交", "发起", "申请", "保存", "处理", "办理", "直接提", "直接提交"}
+
+    def _complete_quantity_only_items_from_total(self, expense: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return items
+
+    def _looks_like_invalid_expense_item_name(self, name: str) -> bool:
+        text = str(name or "").strip()
+        if len(text) < 2:
+            return True
+        if re.fullmatch(r"\d+", text):
+            return True
+        if re.fullmatch(r"\d+(?:\.\d+)?\s*(?:万|万元|元|块)", text):
+            return True
+        if text in {"每台", "每个", "每条", "每场", "每份", "每支", "每套", "每册", "每张", "每本"} or text.startswith("每"):
+            return True
+        if text in {"总计", "合计", "总预算", "总金额", "预算", "金额", "帮我", "帮我把", "直接", "直接帮我", "提掉", "提交"}:
+            return True
+        if re.search(r"(台|个|条|场|份|支|套|批|项|册|张|本)每(?:台|个|条|场|份|支|套|批|项|册|张|本)?", text):
+            return True
+        if text in {"要做", "需要", "采购", "购买", "要买", "包括", "包含", "一批", "一些", "先帮我存", "先帮我", "帮我存", "需要做", "购置"}:
+            return True
+        if any(skip in text for skip in ["帮我先存", "草稿", "费用申请", "费用草稿"]):
+            return True
+        if any(skip in text for skip in ["总预算", "总金额", "项目编码", "项目是", "会议室", "万元"]):
+            return True
+        return False
+
+    def _extract_named_budget_items(self, text: str) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        pattern = r"(?P<name>[\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z0-9]{1,24}?)\s*(?P<amount>\d+(?:\.\d+)?)\s*(?P<unit>万|万元|元|块)"
+        for match in re.finditer(pattern, str(text or "")):
+            name = re.split(r"[，。,:：；;、]|和|及|包括|包含", match.group("name"))[-1]
+            name = re.sub(r"^(帮我|直接|提交|申请|费用|预算|总预算|总金额|金额|项目|编码|要买|买|采购|需要|做|要做|一批)+", "", name)
+            name = self._clean_material_name_match(name, name)
+            if self._looks_like_invalid_expense_item_name(name):
+                continue
+            if name in {"总计", "合计", "总预算", "总金额", "预算", "金额"}:
+                continue
+            if any(summary in name for summary in ["总预算", "总金额", "预算", "费用"]):
+                continue
+            amount = float(match.group("amount")) * (10000 if match.group("unit").startswith("万") else 1)
+            budget = self._money(amount)
+            items.append({"name": name, "quantity": "1", "unit_price": budget, "budget_amount": budget})
+        return self._dedupe_expense_items(items)
+
+    def _expense_unit_words(self) -> str:
+        return "台|个|条|场|份|支|套|批|项|册|张|本"
+
     def _extract_quantity_first_items(self, text: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
-        pattern = r"(?<![A-Za-z0-9.-])(\d{1,3}|[一二两三四五六七八九十]+)\s*(台|个|条|场|份)?\s*([\u4e00-\u9fa5A-Za-z0-9]{2,12}?)(?:每(?:台|个|条|场|份)?|单价)?\s*(\d+(?:\.\d+)?)\s*(万|万元|元)?"
-        for qty_token, unit_name, name, amount, money_unit in re.findall(pattern, text):
+        unit_words = self._expense_unit_words()
+        name_first_pattern = rf"([\u4e00-\u9fa5A-Za-z0-9]{{2,18}}?)\s*(\d{{1,5}}|[一二两三四五六七八九十]+)\s*({unit_words})(?:[，,、]?\s*(?:每(?:{unit_words})?|单价)?\s*(\d+(?:\.\d+)?)\s*(万|万元|元)?)?"
+        for name, qty_token, unit_name, amount, money_unit in re.findall(name_first_pattern, text):
             name = self._clean_material_name_match(name, name)
-            if len(name) < 2 or any(skip in name for skip in ["项目", "预算", "金额", "会议室"]):
+            if self._looks_like_invalid_expense_item_name(name) or any(skip in name for skip in ["项目", "预算", "金额", "会议室"]):
                 continue
             qty = self._cn_to_int(qty_token) if not str(qty_token).isdigit() else int(qty_token)
-            if qty <= 0 or qty > 100:
+            if qty <= 0 or qty > 100000:
+                continue
+            row = {"name": name, "quantity": str(qty), "unit_price": "", "budget_amount": ""}
+            if amount:
+                multiplier = 10000 if str(money_unit).startswith("万") else 1
+                unit_price = float(amount) * multiplier
+                row["unit_price"] = self._money(unit_price)
+                row["budget_amount"] = self._money(unit_price * qty)
+            items.append(row)
+        separated_pattern = rf"(?<![A-Za-z0-9.-])(\d{{1,5}}|[一二两三四五六七八九十]+)\s*({unit_words})\s*([\u4e00-\u9fa5A-Za-z0-9]{{2,16}}?)[，,、]?\s*每(?:{unit_words})?\s*(\d+(?:\.\d+)?)\s*(万|万元|元|块)?"
+        for qty_token, unit_name, name, amount, money_unit in re.findall(separated_pattern, text):
+            name = self._clean_material_name_match(name, name)
+            if self._looks_like_invalid_expense_item_name(name):
+                continue
+            qty = self._cn_to_int(qty_token) if not str(qty_token).isdigit() else int(qty_token)
+            if qty <= 0 or qty > 100000:
+                continue
+            multiplier = 10000 if str(money_unit).startswith("万") else 1
+            unit_price = float(amount) * multiplier
+            budget = unit_price * qty
+            items.append(
+                {
+                    "name": name,
+                    "quantity": str(qty),
+                    "unit_price": self._money(unit_price),
+                    "budget_amount": self._money(budget),
+                }
+            )
+        pattern = rf"(?<![A-Za-z0-9.-])(\d{{1,5}}|[一二两三四五六七八九十]+)\s*({unit_words})?\s*([\u4e00-\u9fa5A-Za-z0-9]{{2,12}}?)(?:每(?:{unit_words})?|单价)?\s*(\d+(?:\.\d+)?)\s*(万|万元|元|块)?"
+        for qty_token, unit_name, name, amount, money_unit in re.findall(pattern, text):
+            if not unit_name:
+                previous = text[max(0, text.find(str(qty_token)) - 2): text.find(str(qty_token))]
+                if any(marker in previous for marker in ["寸", "英寸"]) or str(name).startswith(("寸", "英寸")):
+                    continue
+            name = self._clean_material_name_match(name, name)
+            if self._looks_like_invalid_expense_item_name(name) or any(skip in name for skip in ["项目", "预算", "金额", "会议室"]):
+                continue
+            qty = self._cn_to_int(qty_token) if not str(qty_token).isdigit() else int(qty_token)
+            if qty <= 0 or qty > 100000:
                 continue
             if not unit_name and not any(marker in text for marker in [f"{qty_token}{name}", f"{qty_token} {name}"]):
                 qty = 1
@@ -5992,6 +7279,22 @@ class MyAgent:
                     "budget_amount": self._money(budget),
                 }
             )
+        whole_item_pattern = rf"(?:有|采购|购买|要买|要印|印|做)?\s*(?:一|1)\s*({unit_words})\s*([^，。；;、]{{2,18}}?)\s*(?:，|。|；|;|预算|总预算|总金额|金额)\s*(\d+(?:\.\d+)?)\s*(万|万元|元|块)?"
+        for unit_name, name, amount, money_unit in re.findall(whole_item_pattern, text):
+            name = self._clean_material_name_match(name, name)
+            if self._looks_like_invalid_expense_item_name(name):
+                continue
+            multiplier = 10000 if str(money_unit).startswith("万") else 1
+            budget = float(amount) * multiplier
+            items.append({"name": name, "quantity": "1", "unit_price": self._money(budget), "budget_amount": self._money(budget)})
+        whole_item_split_pattern = rf"(?:有|采购|购买|要买|要印|印|做)?\s*(?:一|1)\s*({unit_words})\s*([^，。；;、]{{2,18}}?)[，,、]\s*(?:预算|总预算|总金额|金额)\s*(\d+(?:\.\d+)?)\s*(万|万元|元|块)?"
+        for unit_name, name, amount, money_unit in re.findall(whole_item_split_pattern, text):
+            name = self._clean_material_name_match(name, name)
+            if self._looks_like_invalid_expense_item_name(name):
+                continue
+            multiplier = 10000 if str(money_unit).startswith("万") else 1
+            budget = float(amount) * multiplier
+            items.append({"name": name, "quantity": "1", "unit_price": self._money(budget), "budget_amount": self._money(budget)})
         return items
 
     def _extract_service_item_from_budget(self, text: str) -> dict[str, Any]:
@@ -6001,6 +7304,7 @@ class MyAgent:
         candidates: list[str] = []
         for pattern in [
             r"要做([^，。；;]+?)(?:，|。|预算|总预算|金额)",
+            r"(?:要做|需要|采购|购买|要买)(?:一批|一些)?\s*([^，。；;]+?)(?:，|。|预算|总预算|金额)",
             r"([\u4e00-\u9fa5A-Za-z0-9]{2,20}?)(?:费用|费)(?:草稿|申请|预算|，|。|；|;)",
             r"(官网[^，。；;]*设计)",
             r"([^，。；;]{2,20}?设计)",
@@ -6015,16 +7319,50 @@ class MyAgent:
             return {}
         return {"name": name, "quantity": "1", "unit_price": amount, "budget_amount": amount}
 
+    def _extract_specific_item_with_total_budget(self, text: str) -> dict[str, Any]:
+        amount = self._extract_total_amount(text) or self._extract_amount_after(text, ["预算", "总预算", "总金额", "金额"])
+        if not amount:
+            return {}
+        for pattern in [
+            r"(?:要做|需要|采购|购买|要买|包括|包含)(?:一批|一些)?\s*([^，。；;、]{2,18}?)(?:，|。|；|;|预算|总预算|总金额|金额)",
+            r"([^，。；;、]{2,18}?(?:折页|印刷|喷绘|展架|扫描仪|打印机|显示器|扩展坞|电脑|配件))(?:，|。|；|;|预算|总预算|总金额|金额)",
+        ]:
+            for match in re.finditer(pattern, str(text or "")):
+                name = self._clean_material_name_match(match.group(1), match.group(1))
+                if name and not self._looks_like_invalid_expense_item_name(name):
+                    return {"name": name, "quantity": "1", "unit_price": amount, "budget_amount": amount}
+        return {}
+
     def _dedupe_expense_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        seen: set[tuple[str, str, str]] = set()
+        by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
         for item in items:
-            key = (str(item.get("name") or ""), str(item.get("quantity") or ""), str(item.get("budget_amount") or ""))
-            if not key[0] or key in seen:
+            name = str(item.get("name") or "")
+            if not name:
                 continue
-            seen.add(key)
-            out.append(item)
-        return out
+            key = (self._expense_item_dedupe_name(name), str(item.get("quantity") or ""), str(item.get("budget_amount") or ""))
+            current = by_key.get(key)
+            if current is None or self._expense_item_quality(item) > self._expense_item_quality(current):
+                by_key[key] = item
+        return list(by_key.values())
+
+    def _expense_item_dedupe_name(self, name: str) -> str:
+        text = str(name or "")
+        text = re.sub(r"^(?:再|又|另)?(?:买|采购|购买|要买|要印|印|做|需要|把)", "", text)
+        text = re.sub(r"\d+(?:\.\d+)?\s*(?:台|个|条|场|份|支|套|批|项|册|张|本)$", "", text)
+        return text.strip("，。；;、 的") or str(name or "")
+
+    def _expense_item_quality(self, item: dict[str, Any]) -> int:
+        name = str(item.get("name") or "")
+        score = len(name)
+        if item.get("budget_amount"):
+            score += 10
+        if item.get("unit_price"):
+            score += 5
+        if any(prefix in name for prefix in ["再买", "要买", "采购", "需要", "申请", "提交"]):
+            score -= 8
+        if re.search(r"\d+(?:台|个|条|场|份|支|套|批|项|册|张|本)$", name):
+            score -= 5
+        return score
 
     def _extract_amount_after(self, text: str, markers: list[str]) -> str:
         for marker in markers:
@@ -6035,6 +7373,19 @@ class MyAgent:
                     return amount
         return ""
 
+    def _extract_total_amount(self, text: str) -> str:
+        for pattern in [
+            r"(?:总预算|总金额|总计|合计)\s*(\d+(?:\.\d+)?)\s*(万|万元|元)?",
+            r"预算\s*(\d+(?:\.\d+)?)\s*(万|万元|元|块)",
+            r"预算\s*(\d+(?:\.\d+)?)(?!\s*(?:台|个|条|场|份|支|套|批|项|册|张|本))",
+        ]:
+            match = re.search(pattern, str(text or ""))
+            if match:
+                unit = match.group(2) if (match.lastindex or 0) >= 2 else ""
+                value = float(match.group(1)) * (10000 if str(unit or "").startswith("万") else 1)
+                return self._format_money(value)
+        return ""
+
     def _extract_amount_near(self, text: str, marker: str) -> str:
         idx = text.find(marker)
         if idx < 0:
@@ -6042,7 +7393,7 @@ class MyAgent:
         return self._extract_first_amount(text[idx: idx + 30])
 
     def _extract_first_amount(self, text: str) -> str:
-        match = re.search(r"(\d+(?:\.\d+)?)\s*(万|万元|元)", text)
+        match = re.search(r"(\d+(?:\.\d+)?)\s*(万|万元|元|块)", text)
         if match:
             value = float(match.group(1)) * (10000 if match.group(2).startswith("万") else 1)
             return self._format_money(value)
@@ -6089,7 +7440,7 @@ class MyAgent:
             (["电脑", "配件"], ["电脑", "配件"]),
             (["测试设备"], ["测试设备"]),
             (["折页", "印刷"], ["折页", "印刷"]),
-            (["喷绘", "展架"], ["喷绘", "展架"]),
+            (["喷绘", "展架"], ["喷绘", "展架", "广宣"]),
             (["办公设备"], ["办公设备", "测试设备"]),
             (["品牌广告"], ["品牌广告"]),
             (["外包"], ["外包"]),
@@ -6101,6 +7452,19 @@ class MyAgent:
             if len(token) >= 2 and token in label:
                 score += 1
         return score
+
+    def _select_broad_material_option(self, hint: str, options: list[dict[str, Any]]) -> dict[str, Any] | None:
+        text = str(hint or "")
+        labels = [str(opt.get("label") or "") for opt in options]
+        has_print = any("印刷" in label for label in labels)
+        has_promo = any("广宣" in label for label in labels)
+        if not (has_print and has_promo):
+            return None
+        if any(term in text for term in ["折页", "印刷"]):
+            return self._find_option_by_hints(options, ["印刷"])
+        if any(term in text for term in ["喷绘", "展架", "物料", "宣传"]):
+            return self._find_option_by_hints(options, ["广宣"])
+        return None
 
     # ------------------------------------------------------------------
     # Small utilities
@@ -6180,30 +7544,9 @@ class MyAgent:
         try:
             start_date = date.fromisoformat(start_day)
             end_date = date.fromisoformat(end_day)
-            if end_date > start_date and start == "09:00" and end == "18:00":
-                return float(max(1, (end_date - start_date).days) * 8)
-            if end_date > start_date:
-                start_dt = datetime.combine(start_date, datetime.strptime(start, "%H:%M").time())
-                end_dt = datetime.combine(end_date, datetime.strptime(end, "%H:%M").time())
-                return round((end_dt - start_dt).total_seconds() / 3600, 2)
-            work_start = "09:00"
-            work_end = "18:00"
-            lunch_start = "12:00"
-            lunch_end = "13:00"
-
-            def work_hours(day_start: str, day_end: str) -> float:
-                start_minutes = max(self._time_to_minutes(day_start), self._time_to_minutes(work_start))
-                end_minutes = min(self._time_to_minutes(day_end), self._time_to_minutes(work_end))
-                if end_minutes <= start_minutes:
-                    return 0.0
-                minutes = end_minutes - start_minutes
-                overlap_start = max(start_minutes, self._time_to_minutes(lunch_start))
-                overlap_end = min(end_minutes, self._time_to_minutes(lunch_end))
-                if overlap_end > overlap_start:
-                    minutes -= overlap_end - overlap_start
-                return round(minutes / 60, 2)
-
-            return work_hours(start, end)
+            start_dt = datetime.combine(start_date, datetime.strptime(start, "%H:%M").time())
+            end_dt = datetime.combine(end_date, datetime.strptime(end, "%H:%M").time())
+            return round((end_dt - start_dt).total_seconds() / 3600, 2)
         except Exception:
             return self._hours_between(start, end)
 
