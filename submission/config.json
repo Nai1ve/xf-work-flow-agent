@@ -1,18 +1,35 @@
 {
   "runtime": {
     "case_deadline_seconds": 55,
-    "semantic_extraction": "auto",
+    "semantic_extraction": "always",
     "task_graph_log_path": "reports/runtime/task_graph.jsonl",
-    "task_graph_timeout_simple_seconds": 2,
-    "task_graph_timeout_normal_seconds": 3,
-    "task_graph_timeout_complex_seconds": 6
+    "task_graph_timeout_intent_seconds": 12,
+    "task_graph_timeout_simple_seconds": 10,
+    "task_graph_timeout_normal_seconds": 10,
+    "task_graph_timeout_complex_seconds": 10,
+    "static_context_enabled": true,
+    "static_context_path": "submission/static_context",
+    "static_context_max_chars": {
+      "intent": 700,
+      "task_graph": 3000,
+      "candidate": 6000,
+      "form": 7000
+    },
+    "parallel_read_planner_enabled": true,
+    "parallel_reads_enabled": false,
+    "parallel_read_max_workers": 4,
+    "parallel_read_max_batch_size": 6,
+    "parallel_read_min_remaining_seconds": 8,
+    "parallel_read_timeout_seconds": 6,
+    "empty_read_mapping_enabled": true,
+    "empty_read_mapping_max_variants": 3
   },
   "llm_fast": {
     "provider": "openai_compatible",
     "base_url": "https://api-slb.packyapi.com/v1",
     "model": "gpt-5.4",
     "api_key": "",
-    "timeout": 6,
+    "timeout": 12,
     "temperature": 0,
     "max_calls": 1,
     "max_history_items": 16,

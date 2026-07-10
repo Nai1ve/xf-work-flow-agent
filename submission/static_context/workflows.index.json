@@ -1,0 +1,762 @@
+{
+  "by_id": {
+    "34747": {
+      "dependencies": {
+        "wbs_code": [
+          {
+            "key": "project_name"
+          },
+          {
+            "key": "project_code"
+          }
+        ]
+      },
+      "detail_tables": {
+        "detail_2": {
+          "field_aliases": {
+            "budget_amount": "预算金额",
+            "expense_type1": "费用类型1",
+            "finance_subject2": "财务二级科目",
+            "material_name": "物资名称",
+            "material_subclass": "物资小类",
+            "quantity": "数量",
+            "unit_price": "预算单价"
+          },
+          "field_descriptions": {
+            "budget_amount": "预算金额",
+            "expense_type1": "费用类型1，通过 browser_search field_id=119439 查询",
+            "finance_subject2": "财务二级科目，通过 browser_search field_id=183922 查询，依赖 expense_type1",
+            "material_name": "物资名称",
+            "material_subclass": "物资小类，通过 browser_search field_id=29028 查询，依赖 wzlb(物资大类)",
+            "quantity": "数量",
+            "unit_price": "预算单价"
+          },
+          "field_types": {
+            "budget_amount": "number",
+            "expense_type1": "browser",
+            "finance_subject2": "browser",
+            "material_name": "text",
+            "material_subclass": "browser",
+            "quantity": "number",
+            "unit_price": "number"
+          },
+          "fields": [
+            {
+              "depends_on": [
+                {
+                  "key": "wbs_code"
+                },
+                {
+                  "key": "material_category"
+                }
+              ],
+              "description": "先确定项目和物资大类，再拉取该大类下全部小类供选择。",
+              "key": "material_subclass",
+              "label": "物资小类",
+              "readonly": false,
+              "recommended_input": "lookup",
+              "required": true,
+              "type": "browser"
+            },
+            {
+              "key": "material_name",
+              "label": "物资名称",
+              "readonly": false,
+              "recommended_input": "fillable",
+              "required": true,
+              "type": "text"
+            },
+            {
+              "key": "quantity",
+              "label": "数量",
+              "readonly": false,
+              "recommended_input": "fillable",
+              "required": true,
+              "type": "number"
+            },
+            {
+              "key": "unit_price",
+              "label": "预算单价",
+              "readonly": false,
+              "recommended_input": "fillable",
+              "required": true,
+              "type": "number"
+            },
+            {
+              "description": "通常等于 quantity * unit_price。",
+              "key": "budget_amount",
+              "label": "预算金额",
+              "readonly": false,
+              "recommended_input": "computed",
+              "required": true,
+              "type": "number"
+            },
+            {
+              "key": "expense_type1",
+              "label": "费用类型1",
+              "readonly": false,
+              "recommended_input": "lookup",
+              "required": true,
+              "type": "browser"
+            },
+            {
+              "depends_on": [
+                {
+                  "key": "expense_type1"
+                }
+              ],
+              "key": "finance_subject2",
+              "label": "财务二级科目",
+              "readonly": false,
+              "recommended_input": "lookup",
+              "required": true,
+              "type": "browser"
+            }
+          ],
+          "money_rules": [
+            "quantity * unit_price = budget_amount",
+            "workflow total_amount = sum(details[].budget_amount)"
+          ],
+          "required_fields": [
+            "material_subclass",
+            "material_name",
+            "quantity",
+            "unit_price",
+            "budget_amount",
+            "expense_type1",
+            "finance_subject2"
+          ]
+        }
+      },
+      "field_aliases": {
+        "applicant": "申请人",
+        "applicant_no": "申请人工号",
+        "material_category": "物资大类",
+        "project_code": "项目编码",
+        "project_name": "项目名称",
+        "total_amount": "申请总金额",
+        "wbs_code": "WBS编码"
+      },
+      "field_descriptions": {
+        "applicant": "申请人 user_id",
+        "applicant_no": "申请人工号",
+        "material_category": "物资大类，通过 workflow.browser_search 查询 field_id=29023",
+        "project_code": "项目编码，通过 workflow.project_search 查询",
+        "project_name": "项目名称，通过 workflow.project_search 查询",
+        "total_amount": "申请总金额",
+        "wbs_code": "WBS编码，通过 workflow.project_search 查询"
+      },
+      "field_evidence_requirements": {
+        "applicant": [
+          "user.get_info"
+        ],
+        "applicant_no": [
+          "user.get_info"
+        ],
+        "material_category": [
+          "workflow.browser_search or schema option set"
+        ],
+        "project_code": [
+          "workflow.project_search"
+        ],
+        "project_name": [
+          "workflow.project_search"
+        ],
+        "total_amount": [
+          "program_computed",
+          "sum(details.budget_amount)"
+        ],
+        "wbs_code": [
+          "workflow.project_search"
+        ]
+      },
+      "field_types": {
+        "applicant": "browser",
+        "applicant_no": "text",
+        "material_category": "browser",
+        "project_code": "text",
+        "project_name": "text",
+        "total_amount": "number",
+        "wbs_code": "text"
+      },
+      "fields": [
+        {
+          "default": "current_user_id",
+          "key": "applicant",
+          "label": "申请人",
+          "readonly": false,
+          "recommended_input": "auto_filled",
+          "required": true,
+          "type": "browser"
+        },
+        {
+          "default": "current_user_employee_no",
+          "key": "applicant_no",
+          "label": "申请人工号",
+          "readonly": true,
+          "recommended_input": "auto_filled",
+          "required": true,
+          "type": "text"
+        },
+        {
+          "key": "project_name",
+          "label": "项目名称",
+          "readonly": false,
+          "recommended_input": "lookup",
+          "required": true,
+          "returns_with": [
+            "project_code",
+            "wbs_code"
+          ],
+          "type": "text"
+        },
+        {
+          "key": "project_code",
+          "label": "项目编码",
+          "readonly": false,
+          "recommended_input": "lookup",
+          "required": true,
+          "returns_with": [
+            "project_name",
+            "wbs_code"
+          ],
+          "type": "text"
+        },
+        {
+          "depends_on": [
+            {
+              "key": "project_name"
+            },
+            {
+              "key": "project_code"
+            }
+          ],
+          "description": "从选中的项目搜索结果中读取对应 wbs_code，不应自行编造。",
+          "key": "wbs_code",
+          "label": "WBS编码",
+          "readonly": false,
+          "recommended_input": "lookup_result",
+          "required": true,
+          "type": "text"
+        },
+        {
+          "description": "通常直接拉取全部可见大类，再由 Agent 按语义选择。",
+          "key": "material_category",
+          "label": "物资大类",
+          "readonly": false,
+          "recommended_input": "lookup",
+          "required": true,
+          "type": "browser"
+        },
+        {
+          "description": "通常等于明细表 budget_amount 求和。",
+          "key": "total_amount",
+          "label": "申请总金额",
+          "readonly": false,
+          "recommended_input": "computed",
+          "required": true,
+          "type": "number"
+        }
+      ],
+      "fields_by_key": {
+        "applicant": {
+          "default": "current_user_id",
+          "key": "applicant",
+          "label": "申请人",
+          "readonly": false,
+          "recommended_input": "auto_filled",
+          "required": true,
+          "type": "browser"
+        },
+        "applicant_no": {
+          "default": "current_user_employee_no",
+          "key": "applicant_no",
+          "label": "申请人工号",
+          "readonly": true,
+          "recommended_input": "auto_filled",
+          "required": true,
+          "type": "text"
+        },
+        "material_category": {
+          "description": "通常直接拉取全部可见大类，再由 Agent 按语义选择。",
+          "key": "material_category",
+          "label": "物资大类",
+          "readonly": false,
+          "recommended_input": "lookup",
+          "required": true,
+          "type": "browser"
+        },
+        "project_code": {
+          "key": "project_code",
+          "label": "项目编码",
+          "readonly": false,
+          "recommended_input": "lookup",
+          "required": true,
+          "returns_with": [
+            "project_name",
+            "wbs_code"
+          ],
+          "type": "text"
+        },
+        "project_name": {
+          "key": "project_name",
+          "label": "项目名称",
+          "readonly": false,
+          "recommended_input": "lookup",
+          "required": true,
+          "returns_with": [
+            "project_code",
+            "wbs_code"
+          ],
+          "type": "text"
+        },
+        "total_amount": {
+          "description": "通常等于明细表 budget_amount 求和。",
+          "key": "total_amount",
+          "label": "申请总金额",
+          "readonly": false,
+          "recommended_input": "computed",
+          "required": true,
+          "type": "number"
+        },
+        "wbs_code": {
+          "depends_on": [
+            {
+              "key": "project_name"
+            },
+            {
+              "key": "project_code"
+            }
+          ],
+          "description": "从选中的项目搜索结果中读取对应 wbs_code，不应自行编造。",
+          "key": "wbs_code",
+          "label": "WBS编码",
+          "readonly": false,
+          "recommended_input": "lookup_result",
+          "required": true,
+          "type": "text"
+        }
+      },
+      "name": "007-2费用类物资申请（过渡）",
+      "required_fields": [
+        "applicant",
+        "applicant_no",
+        "project_name",
+        "project_code",
+        "wbs_code",
+        "material_category",
+        "total_amount"
+      ],
+      "submit_policy": "explicit submit intent required; draft by default",
+      "workflow_id": 34747
+    },
+    "72247": {
+      "dependencies": {
+        "reason": [
+          {
+            "key": "leave_type"
+          }
+        ]
+      },
+      "detail_tables": {},
+      "field_aliases": {
+        "applicant": "申请人",
+        "applicant_no": "申请人工号",
+        "approver": "自选审批人",
+        "attachment": "附件",
+        "contact_phone": "联系电话",
+        "duration": "时长",
+        "end_time": "请假结束日期",
+        "leave_type": "申请类型",
+        "reason": "申请原因",
+        "remark": "备注说明",
+        "start_time": "请假开始日期"
+      },
+      "field_descriptions": {
+        "applicant": "申请人 user_id，通过 user.get_info 查当前用户，再用 workflow.search_person 获取 user_id",
+        "applicant_no": "申请人工号，通过 workflow.search_person 返回的 employee_no 填入",
+        "approver": "自选审批人 user_id，通过 workflow.search_person 查询获取",
+        "duration": "请假时长（小时），根据起止时间计算填入",
+        "end_time": "请假结束时间，格式 YYYY-MM-DD HH:mm",
+        "leave_type": "申请类型，从 leave_type_options 中选取 value",
+        "reason": "申请原因，从 reason_options 中选取 value",
+        "start_time": "请假开始时间，格式 YYYY-MM-DD HH:mm"
+      },
+      "field_evidence_requirements": {
+        "applicant": [
+          "user.get_info"
+        ],
+        "applicant_no": [
+          "user.get_info"
+        ],
+        "approver": [
+          "workflow.search_person"
+        ],
+        "attachment": [],
+        "contact_phone": [],
+        "duration": [
+          "program_computed"
+        ],
+        "end_time": [],
+        "leave_type": [
+          "workflow.browser_search or schema option set"
+        ],
+        "reason": [
+          "workflow.browser_search or schema option set"
+        ],
+        "remark": [],
+        "start_time": []
+      },
+      "field_types": {
+        "applicant": "browser",
+        "applicant_no": "text",
+        "approver": "browser",
+        "attachment": "attachment",
+        "contact_phone": "text",
+        "duration": "number",
+        "end_time": "datetime",
+        "leave_type": "select",
+        "reason": "select",
+        "remark": "textarea",
+        "start_time": "datetime"
+      },
+      "fields": [
+        {
+          "default": "current_user_id",
+          "key": "applicant",
+          "label": "申请人",
+          "readonly": false,
+          "recommended_input": "auto_filled",
+          "required": true,
+          "type": "browser"
+        },
+        {
+          "key": "applicant_no",
+          "label": "申请人工号",
+          "readonly": true,
+          "recommended_input": "auto_filled",
+          "required": true,
+          "type": "text"
+        },
+        {
+          "format": "YYYY-MM-DD HH:mm",
+          "key": "start_time",
+          "label": "请假开始日期",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": true,
+          "type": "datetime"
+        },
+        {
+          "format": "YYYY-MM-DD HH:mm",
+          "key": "end_time",
+          "label": "请假结束日期",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": true,
+          "type": "datetime"
+        },
+        {
+          "key": "leave_type",
+          "label": "申请类型",
+          "options_key": "leave_type_options",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": true,
+          "type": "select"
+        },
+        {
+          "depends_on": [
+            {
+              "key": "leave_type"
+            }
+          ],
+          "key": "reason",
+          "label": "申请原因",
+          "options_key": "reason_options",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": true,
+          "type": "select"
+        },
+        {
+          "key": "approver",
+          "label": "自选审批人",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": true,
+          "type": "browser"
+        },
+        {
+          "description": "请假时长（小时），根据起止时间计算",
+          "key": "duration",
+          "label": "时长",
+          "readonly": false,
+          "recommended_input": "computed",
+          "required": true,
+          "type": "number"
+        },
+        {
+          "key": "contact_phone",
+          "label": "联系电话",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": false,
+          "type": "text"
+        },
+        {
+          "key": "remark",
+          "label": "备注说明",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": false,
+          "type": "textarea"
+        },
+        {
+          "key": "attachment",
+          "label": "附件",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": false,
+          "type": "attachment"
+        }
+      ],
+      "fields_by_key": {
+        "applicant": {
+          "default": "current_user_id",
+          "key": "applicant",
+          "label": "申请人",
+          "readonly": false,
+          "recommended_input": "auto_filled",
+          "required": true,
+          "type": "browser"
+        },
+        "applicant_no": {
+          "key": "applicant_no",
+          "label": "申请人工号",
+          "readonly": true,
+          "recommended_input": "auto_filled",
+          "required": true,
+          "type": "text"
+        },
+        "approver": {
+          "key": "approver",
+          "label": "自选审批人",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": true,
+          "type": "browser"
+        },
+        "attachment": {
+          "key": "attachment",
+          "label": "附件",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": false,
+          "type": "attachment"
+        },
+        "contact_phone": {
+          "key": "contact_phone",
+          "label": "联系电话",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": false,
+          "type": "text"
+        },
+        "duration": {
+          "description": "请假时长（小时），根据起止时间计算",
+          "key": "duration",
+          "label": "时长",
+          "readonly": false,
+          "recommended_input": "computed",
+          "required": true,
+          "type": "number"
+        },
+        "end_time": {
+          "format": "YYYY-MM-DD HH:mm",
+          "key": "end_time",
+          "label": "请假结束日期",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": true,
+          "type": "datetime"
+        },
+        "leave_type": {
+          "key": "leave_type",
+          "label": "申请类型",
+          "options_key": "leave_type_options",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": true,
+          "type": "select"
+        },
+        "reason": {
+          "depends_on": [
+            {
+              "key": "leave_type"
+            }
+          ],
+          "key": "reason",
+          "label": "申请原因",
+          "options_key": "reason_options",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": true,
+          "type": "select"
+        },
+        "remark": {
+          "key": "remark",
+          "label": "备注说明",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": false,
+          "type": "textarea"
+        },
+        "start_time": {
+          "format": "YYYY-MM-DD HH:mm",
+          "key": "start_time",
+          "label": "请假开始日期",
+          "readonly": false,
+          "recommended_input": "fillable",
+          "required": true,
+          "type": "datetime"
+        }
+      },
+      "name": "001-1 请假申请",
+      "required_fields": [
+        "applicant",
+        "applicant_no",
+        "start_time",
+        "end_time",
+        "leave_type",
+        "reason",
+        "approver",
+        "duration"
+      ],
+      "submit_policy": "explicit submit intent required; draft by default",
+      "workflow_id": 72247
+    }
+  },
+  "by_name": {
+    "001-1 请假申请": "72247",
+    "007-2费用类物资申请（过渡）": "34747"
+  },
+  "catalog": [
+    {
+      "name": "001-1 请假申请",
+      "workflow_id": 72247
+    },
+    {
+      "name": "007-2费用类物资申请（过渡）",
+      "workflow_id": 34747
+    }
+  ],
+  "counts": {
+    "option_sets": 4,
+    "schemas": 2,
+    "workflows": 2
+  },
+  "option_sets": {
+    "72247:leave_type": [
+      {
+        "label": "年休假",
+        "value": "N"
+      },
+      {
+        "label": "事假",
+        "value": "L"
+      },
+      {
+        "label": "病假",
+        "value": "S"
+      },
+      {
+        "label": "婚假",
+        "value": "M"
+      },
+      {
+        "label": "陪产假",
+        "value": "P"
+      },
+      {
+        "label": "父母陪护假",
+        "value": "H"
+      },
+      {
+        "label": "育儿假",
+        "value": "Y"
+      },
+      {
+        "label": "丧假",
+        "value": "F"
+      },
+      {
+        "label": "延时假",
+        "value": "V"
+      },
+      {
+        "label": "收养假",
+        "value": "AL"
+      }
+    ],
+    "72247:reason": [
+      {
+        "label": "本人身体不适",
+        "value": "01"
+      },
+      {
+        "label": "本人生病住院",
+        "value": "02"
+      },
+      {
+        "label": "本人结婚",
+        "value": "03"
+      },
+      {
+        "label": "配偶生产陪护",
+        "value": "04"
+      },
+      {
+        "label": "本人产检",
+        "value": "05"
+      },
+      {
+        "label": "本人怀孕生产",
+        "value": "06"
+      },
+      {
+        "label": "哺乳",
+        "value": "07"
+      },
+      {
+        "label": "家人生病",
+        "value": "08"
+      },
+      {
+        "label": "亲人过世",
+        "value": "09"
+      },
+      {
+        "label": "本人有事",
+        "value": "10"
+      }
+    ],
+    "72247:reason:leave_type=L": [
+      {
+        "label": "本人有事",
+        "value": "10"
+      }
+    ],
+    "72247:reason:leave_type=S": [
+      {
+        "label": "本人身体不适",
+        "value": "01"
+      },
+      {
+        "label": "本人生病住院",
+        "value": "02"
+      }
+    ]
+  },
+  "schema_version": "workflows-index-v1"
+}

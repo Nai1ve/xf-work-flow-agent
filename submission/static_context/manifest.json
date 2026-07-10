@@ -1,0 +1,48 @@
+{
+  "counts": {
+    "capabilities": 16,
+    "rooms": 139,
+    "tools": 22,
+    "workflows": 2
+  },
+  "files": {
+    "capabilities": "capabilities.index.json",
+    "meetingrooms": "meetingrooms.index.json",
+    "prompt_cards": "prompt_cards/",
+    "tools": "tools.index.json",
+    "workflows": "workflows.index.json"
+  },
+  "generated_at": "2026-07-10T10:04:23.267888+00:00",
+  "schema_version": "static-context-v1",
+  "sources": {
+    "meetingroom_data": {
+      "path": "contest/train/data/meetingroom_data.json",
+      "sha256": "c09ac3253904a99f4bb3710791b00736009d9e36babf29364e8c44c32b94a5a7"
+    },
+    "tool_specs": {
+      "path": "contest/train/tool_specs.json",
+      "sha256": "b34115cf241a3c4592780c5b9c141c814faa8c2da859543c2ff6ae35bf3a3af3"
+    },
+    "workflow_data": {
+      "path": "contest/train/data/workflow_data.json",
+      "sha256": "c0b51bebcc2007810eba7a0de42a679798092adda01e593303bcd73d2c4fc4ad"
+    }
+  },
+  "split_hash_checks": {
+    "data/meetingroom_data.json": {
+      "same": true,
+      "train_sha256": "c09ac3253904a99f4bb3710791b00736009d9e36babf29364e8c44c32b94a5a7",
+      "val_sha256": "c09ac3253904a99f4bb3710791b00736009d9e36babf29364e8c44c32b94a5a7"
+    },
+    "data/workflow_data.json": {
+      "same": true,
+      "train_sha256": "c0b51bebcc2007810eba7a0de42a679798092adda01e593303bcd73d2c4fc4ad",
+      "val_sha256": "c0b51bebcc2007810eba7a0de42a679798092adda01e593303bcd73d2c4fc4ad"
+    },
+    "tool_specs.json": {
+      "same": true,
+      "train_sha256": "b34115cf241a3c4592780c5b9c141c814faa8c2da859543c2ff6ae35bf3a3af3",
+      "val_sha256": "b34115cf241a3c4592780c5b9c141c814faa8c2da859543c2ff6ae35bf3a3af3"
+    }
+  }
+}

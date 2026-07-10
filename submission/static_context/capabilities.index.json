@@ -1,0 +1,414 @@
+{
+  "by_domain": {
+    "meetingroom": [
+      "meeting.book",
+      "meeting.book_multi_segments",
+      "meeting.cancel",
+      "meeting.cancel_rebook",
+      "meeting.extend",
+      "meeting.participant_add",
+      "meeting.participant_list",
+      "meeting.participant_remove",
+      "meeting.query_booking",
+      "meeting.query_room_schedule",
+      "meeting.rebook_larger",
+      "meeting.schedule_book"
+    ],
+    "workflow": [
+      "workflow.expense_draft",
+      "workflow.expense_submit",
+      "workflow.leave_draft",
+      "workflow.leave_submit"
+    ]
+  },
+  "by_risk": {
+    "high_risk_write": [
+      "meeting.cancel",
+      "meeting.cancel_rebook",
+      "meeting.extend",
+      "meeting.rebook_larger",
+      "workflow.expense_submit",
+      "workflow.leave_submit"
+    ],
+    "read": [
+      "meeting.participant_list",
+      "meeting.query_booking",
+      "meeting.query_room_schedule"
+    ],
+    "write": [
+      "meeting.book",
+      "meeting.book_multi_segments",
+      "meeting.participant_add",
+      "meeting.participant_remove",
+      "meeting.schedule_book",
+      "workflow.expense_draft",
+      "workflow.leave_draft"
+    ]
+  },
+  "capabilities": {
+    "meeting.book": {
+      "domain": "meetingroom",
+      "evidence_required": [
+        "room_candidate"
+      ],
+      "intent": "book_single",
+      "read_tools": [
+        "user.get_workspace",
+        "meetingroom.room.list",
+        "meetingroom.room.schedule"
+      ],
+      "required_slots": [
+        "day_text",
+        "start",
+        "end"
+      ],
+      "risk": "write",
+      "write_tools": [
+        "meetingroom.booking.create"
+      ]
+    },
+    "meeting.book_multi_segments": {
+      "domain": "meetingroom",
+      "evidence_required": [
+        "room_candidate"
+      ],
+      "intent": "book_multi_segments_same_room",
+      "read_tools": [
+        "meetingroom.room.list",
+        "meetingroom.room.schedule"
+      ],
+      "required_slots": [
+        "segments"
+      ],
+      "risk": "write",
+      "write_tools": [
+        "meetingroom.booking.create"
+      ]
+    },
+    "meeting.cancel": {
+      "domain": "meetingroom",
+      "evidence_required": [
+        "selected_booking"
+      ],
+      "intent": "cancel_existing",
+      "read_tools": [
+        "meetingroom.booking.list"
+      ],
+      "required_slots": [
+        "target_booking"
+      ],
+      "risk": "high_risk_write",
+      "write_tools": [
+        "meetingroom.booking.cancel"
+      ]
+    },
+    "meeting.cancel_rebook": {
+      "domain": "meetingroom",
+      "evidence_required": [
+        "selected_booking",
+        "room_candidate"
+      ],
+      "intent": "cancel_rebook_existing",
+      "read_tools": [
+        "meetingroom.booking.list",
+        "meetingroom.room.list"
+      ],
+      "required_slots": [
+        "target_booking"
+      ],
+      "risk": "high_risk_write",
+      "write_tools": [
+        "meetingroom.booking.cancel",
+        "meetingroom.booking.create"
+      ]
+    },
+    "meeting.extend": {
+      "domain": "meetingroom",
+      "evidence_required": [
+        "selected_booking"
+      ],
+      "intent": "extend_existing",
+      "read_tools": [
+        "meetingroom.booking.list"
+      ],
+      "required_slots": [
+        "target_booking",
+        "duration_minutes"
+      ],
+      "risk": "high_risk_write",
+      "write_tools": [
+        "meetingroom.booking.extend"
+      ]
+    },
+    "meeting.participant_add": {
+      "domain": "meetingroom",
+      "evidence_required": [
+        "selected_booking",
+        "verified_user"
+      ],
+      "intent": "participant_add",
+      "read_tools": [
+        "meetingroom.booking.list",
+        "user.get_info"
+      ],
+      "required_slots": [
+        "target_booking",
+        "participants"
+      ],
+      "risk": "write",
+      "write_tools": [
+        "meetingroom.booking.participant.add"
+      ]
+    },
+    "meeting.participant_list": {
+      "domain": "meetingroom",
+      "evidence_required": [
+        "selected_booking"
+      ],
+      "intent": "participant_list",
+      "read_tools": [
+        "meetingroom.booking.list",
+        "meetingroom.booking.participant.list"
+      ],
+      "required_slots": [
+        "target_booking"
+      ],
+      "risk": "read",
+      "write_tools": []
+    },
+    "meeting.participant_remove": {
+      "domain": "meetingroom",
+      "evidence_required": [
+        "selected_booking",
+        "verified_user"
+      ],
+      "intent": "participant_remove",
+      "read_tools": [
+        "meetingroom.booking.list",
+        "user.get_info"
+      ],
+      "required_slots": [
+        "target_booking",
+        "participants"
+      ],
+      "risk": "write",
+      "write_tools": [
+        "meetingroom.booking.participant.remove"
+      ]
+    },
+    "meeting.query_booking": {
+      "domain": "meetingroom",
+      "evidence_required": [],
+      "intent": "query_booking",
+      "read_tools": [
+        "meetingroom.booking.list"
+      ],
+      "required_slots": [],
+      "risk": "read",
+      "write_tools": []
+    },
+    "meeting.query_room_schedule": {
+      "domain": "meetingroom",
+      "evidence_required": [],
+      "intent": "query_room_schedule",
+      "read_tools": [
+        "meetingroom.room.schedule"
+      ],
+      "required_slots": [
+        "room_ids"
+      ],
+      "risk": "read",
+      "write_tools": []
+    },
+    "meeting.rebook_larger": {
+      "domain": "meetingroom",
+      "evidence_required": [
+        "selected_booking",
+        "room_candidate"
+      ],
+      "intent": "rebook_larger_existing",
+      "read_tools": [
+        "meetingroom.booking.list",
+        "meetingroom.room.list"
+      ],
+      "required_slots": [
+        "target_booking"
+      ],
+      "risk": "high_risk_write",
+      "write_tools": [
+        "meetingroom.booking.cancel",
+        "meetingroom.booking.create"
+      ]
+    },
+    "meeting.schedule_book": {
+      "domain": "meetingroom",
+      "evidence_required": [
+        "room_candidate",
+        "schedule"
+      ],
+      "intent": "book_by_schedule_analysis",
+      "read_tools": [
+        "meetingroom.room.list",
+        "meetingroom.room.schedule"
+      ],
+      "required_slots": [
+        "day_text"
+      ],
+      "risk": "write",
+      "write_tools": [
+        "meetingroom.booking.create"
+      ]
+    },
+    "workflow.expense_draft": {
+      "domain": "workflow",
+      "evidence_required": [
+        "applicant",
+        "workflow_schema",
+        "verified_project",
+        "category_option",
+        "subclass_option"
+      ],
+      "intent": "expense_material",
+      "read_tools": [
+        "user.get_info",
+        "workflow.catalog",
+        "workflow.schema",
+        "workflow.project_search",
+        "workflow.browser_search"
+      ],
+      "required_slots": [
+        "project_hint",
+        "material_hint"
+      ],
+      "risk": "write",
+      "write_tools": [
+        "workflow.save"
+      ]
+    },
+    "workflow.expense_submit": {
+      "domain": "workflow",
+      "evidence_required": [
+        "applicant",
+        "workflow_schema",
+        "verified_project",
+        "category_option",
+        "subclass_option"
+      ],
+      "intent": "expense_material",
+      "post_check": "oa.done.list",
+      "read_tools": [
+        "user.get_info",
+        "workflow.catalog",
+        "workflow.schema",
+        "workflow.project_search",
+        "workflow.browser_search"
+      ],
+      "required_slots": [
+        "explicit_submit",
+        "project_hint",
+        "material_hint"
+      ],
+      "risk": "high_risk_write",
+      "write_tools": [
+        "workflow.save"
+      ]
+    },
+    "workflow.leave_draft": {
+      "domain": "workflow",
+      "evidence_required": [
+        "applicant",
+        "workflow_schema",
+        "approver_candidate"
+      ],
+      "intent": "leave",
+      "read_tools": [
+        "user.get_info",
+        "workflow.catalog",
+        "workflow.schema",
+        "workflow.search_person"
+      ],
+      "required_slots": [
+        "day_text",
+        "start",
+        "end",
+        "leave_type_label",
+        "approver_hint"
+      ],
+      "risk": "write",
+      "write_tools": [
+        "workflow.save"
+      ]
+    },
+    "workflow.leave_submit": {
+      "domain": "workflow",
+      "evidence_required": [
+        "applicant",
+        "workflow_schema",
+        "approver_candidate"
+      ],
+      "intent": "leave",
+      "post_check": "oa.done.list",
+      "read_tools": [
+        "user.get_info",
+        "workflow.catalog",
+        "workflow.schema",
+        "workflow.search_person"
+      ],
+      "required_slots": [
+        "explicit_submit",
+        "day_text",
+        "start",
+        "end",
+        "leave_type_label",
+        "approver_hint"
+      ],
+      "risk": "high_risk_write",
+      "write_tools": [
+        "workflow.save"
+      ]
+    }
+  },
+  "counts": {
+    "capabilities": 16,
+    "domains": {
+      "meetingroom": 12,
+      "workflow": 4
+    },
+    "risk": {
+      "high_risk_write": 6,
+      "read": 3,
+      "write": 7
+    }
+  },
+  "meeting_intent_map": {
+    "book_by_schedule_analysis": "meeting.schedule_book",
+    "book_multi_segments_same_room": "meeting.book_multi_segments",
+    "book_single": "meeting.book",
+    "cancel": "meeting.cancel",
+    "cancel_existing": "meeting.cancel",
+    "cancel_rebook": "meeting.cancel_rebook",
+    "cancel_rebook_existing": "meeting.cancel_rebook",
+    "extend": "meeting.extend",
+    "extend_existing": "meeting.extend",
+    "participant_add": "meeting.participant_add",
+    "participant_list": "meeting.participant_list",
+    "participant_remove": "meeting.participant_remove",
+    "query": "meeting.query_booking",
+    "query_booking": "meeting.query_booking",
+    "query_room_schedule": "meeting.query_room_schedule",
+    "rebook_larger": "meeting.rebook_larger",
+    "rebook_larger_existing": "meeting.rebook_larger",
+    "schedule_book": "meeting.schedule_book"
+  },
+  "schema_version": "capabilities-index-v1",
+  "workflow_intent_map": {
+    "expense_material": {
+      "draft": "workflow.expense_draft",
+      "submit": "workflow.expense_submit"
+    },
+    "leave": {
+      "draft": "workflow.leave_draft",
+      "submit": "workflow.leave_submit"
+    }
+  }
+}
