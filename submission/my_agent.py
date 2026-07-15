@@ -33,6 +33,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "parallel_read_planner_enabled": True,
         "parallel_reads_enabled": False,
+        # The bundled simulator mutates shared state in call_tool and is not
+        # thread-safe. This enables a serialized async-scheduling A/B run;
+        # it never unlocks simulator tool calls.
+        "async_read_execution_enabled": False,
         "parallel_read_max_workers": 4,
         "parallel_read_max_batch_size": 6,
         "parallel_read_min_remaining_seconds": 8,
@@ -1818,6 +1822,9 @@ class MyAgent:
 
     def _parallel_reads_enabled(self) -> bool:
         return self._runtime_bool("parallel_reads_enabled", False)
+
+    def _async_read_execution_enabled(self) -> bool:
+        return self._runtime_bool("async_read_execution_enabled", False)
 
     def _parallel_read_max_workers(self) -> int:
         return self._runtime_int("parallel_read_max_workers", 4, minimum=1, maximum=8)
@@ -3838,6 +3845,10 @@ class MyAgent:
             return False
         if state.steps_used >= state.step_budget:
             return False
+        # In multi-turn expense flows, ask for the next missing user slot
+        # before spending the turn on catalog/schema/project prefetches.
+        if state.obs.get("mode") == "multi_turn" and self._expense_missing_slot_name(state):
+            return False
         plan = self._build_read_plan(state)
         reserve_steps = self._read_plan_step_reserve(state)
         max_batch = min(self._parallel_read_max_batch_size(), max(0, state.step_budget - state.steps_used - reserve_steps))
@@ -4011,8 +4022,13 @@ class MyAgent:
         if first:
             out.append(first)
         explicit = self._clean_project_phrase(expense.get("project_name") or "")
+        context_tokens = self._project_context_structural_tokens(state, explicit)
+        # "项目是 X" provides 项目 as a user-supplied structural context even
+        # when the extracted value X itself does not contain that word.
+        out.extend(context_tokens)
         formal_explicit = self._looks_like_formal_project_hint(explicit)
         if explicit:
+            out.extend(self._project_structural_candidates(explicit))
             if formal_explicit:
                 out.extend(self._formal_hint_core_candidates(explicit))
                 out.extend(self._project_candidate_forms(explicit))
@@ -4022,6 +4038,7 @@ class MyAgent:
         for keyword in expense.get("project_keywords") or []:
             text = self._clean_project_phrase(keyword)
             if text:
+                out.extend(self._project_structural_candidates(text))
                 if formal_explicit or self._looks_like_formal_project_hint(text):
                     out.append(text)
                     out.extend(self._project_candidate_forms(text))
@@ -4029,10 +4046,18 @@ class MyAgent:
                     out.extend(self._project_core_token_candidates(text))
         if formal_explicit:
             out.extend(self._project_phrase_candidates(self._workflow_query(state)))
+        derived_structure_tokens = set(context_tokens)
+        derived_structure_tokens.update(self._project_structural_tokens(explicit))
+        for keyword in expense.get("project_keywords") or []:
+            derived_structure_tokens.update(self._project_structural_tokens(str(keyword)))
         variants = []
         ordered = []
         for raw in out:
-            value = self._clean_project_phrase(str(raw or ""))
+            raw_value = str(raw or "").strip()
+            # _clean_project_phrase intentionally removes "项目" when it is a
+            # grammatical prefix. Preserve it here only after provenance has
+            # been established by the project phrase/context extractor.
+            value = raw_value if raw_value in derived_structure_tokens else self._clean_project_phrase(raw_value)
             if value and value not in ordered:
                 ordered.append(value)
         for value in ordered:
@@ -4040,17 +4065,16 @@ class MyAgent:
                 continue
             if value in tried and value != first:
                 continue
-            if not self._valid_project_search_candidate(value, allow_short=True):
+            # A bare structural term is allowed only when it was literally
+            # extracted from the user's project phrase, never as a global
+            # inventory probe.
+            if not self._valid_project_search_candidate(value, allow_short=True) and value not in derived_structure_tokens:
                 continue
             variants.append(value)
             if len(variants) >= 3:
                 break
         if not variants and first:
             variants = [first]
-        used = expense.setdefault("_tried_project_keywords", [])
-        for value in variants:
-            if value not in used:
-                used.append(value)
         self._debug_log(
             self._debug_llm_config(),
             {
@@ -4060,11 +4084,38 @@ class MyAgent:
                 "first_args": first_args,
             },
         )
-        # A sequential simulator charges every retry against the same small
-        # step budget.  Keep the initial read literal; an empty result then
-        # enters the bounded LLM semantic-mapping branch, whose TopK retries
-        # are only useful after the literal has been disproved.
-        return [{"project_name": value} for value in variants[:1]]
+        # Keep the literal plus bounded tokens/phrases extracted from the
+        # user's project text, including its explicit structure terms.
+        return [{"project_name": value} for value in variants[:3]]
+
+    def _project_structural_candidates(self, value: Any) -> list[str]:
+        """Split only the supplied project phrase around structural terms."""
+        text = re.sub(r"[^\u4e00-\u9fa5A-Za-z0-9]", "", self._clean_project_phrase(str(value or "")))
+        if len(text) < 4:
+            return []
+        candidates: list[str] = []
+        for match in re.finditer(r"项目|专项|工程|平台|系统", text):
+            start, end = match.span()
+            # Preserve a meaningful noun phrase containing the structure word.
+            candidates.extend([text[:end], text[max(0, start - 4) :], text[max(0, start - 2) : end]])
+            if end < len(text):
+                candidates.append(text[start : min(len(text), end + 4)])
+        phrases = [item for item in self._normalize_project_candidates(candidates) if self._valid_project_search_candidate(item, allow_short=True)]
+        # Individual terms are valid only because they come from this exact
+        # user phrase. Put them first so the bounded fanout actually tests it.
+        return self._dedupe(self._project_structural_tokens(text) + phrases)
+
+    def _project_structural_tokens(self, value: Any) -> list[str]:
+        text = re.sub(r"[^\u4e00-\u9fa5A-Za-z0-9]", "", self._clean_project_phrase(str(value or "")))
+        return self._dedupe(re.findall(r"项目|专项|工程|平台|系统", text))
+
+    def _project_context_structural_tokens(self, state: RuntimeState, explicit_project: str) -> list[str]:
+        if not explicit_project:
+            return []
+        query = self._workflow_query(state)
+        return self._dedupe(
+            re.findall(r"(项目|平台|系统|工程|专项)\s*(?:名(?:称)?\s*)?(?:是|为|叫|：|:)", query)
+        )
 
     def _looks_like_formal_project_hint(self, value: Any) -> bool:
         text = self._clean_project_phrase(str(value or ""))
@@ -4200,7 +4251,6 @@ class MyAgent:
                 mapping_score=self._bounded_float(variant.get("score"), 0.0),
             )
             if len(tasks) > before:
-                tried.append(keyword)
                 variants.append(keyword)
                 appended += 1
                 state.empty_read_retry_tasks_total += 1
@@ -4408,10 +4458,10 @@ class MyAgent:
                 "Return valid json only. The previous project_search queries returned no projects, so do recall-oriented translation rather than similarity rewrite. "
                 "Produce the top 3 alternative project_name substring queries that could appear inside formal enterprise project names. "
                 "Prefer concise parent-theme terms, formal project core words, and business-objective terms inferred from the user's project hint, material category, and line items. "
-                "At least one variant should be broader than the failed phrase when the failed phrase is long or event-like. "
+                "At least one variant should be a narrower or broader business phrase derived from the user-provided project wording when the failed phrase is long or event-like. "
                 "Score each query from 0 to 1 by expected retrieval probability, not lexical similarity to the failed query. "
                 "Do not output project_code or wbs_code unless typed by the user. Do not choose a project. "
-                "Avoid exact failed args and amount/material/action-only words."
+                "Avoid exact failed args and amount/material/action-only words. Never return generic state words such as 项目、平台、系统、工程 or 专项 alone; every query must be a concrete business phrase of at least four Chinese characters."
             ),
             "output_schema": {
                 "variants": [
@@ -4486,15 +4536,9 @@ class MyAgent:
 
     def _valid_project_retry_substring(self, value: str) -> bool:
         candidate = str(value or "").strip("，。:：；;、 的")
-        if not (2 <= len(candidate) <= 12):
+        if not (4 <= len(candidate) <= 12):
             return False
-        if re.search(r"\d+(?:\.\d+)?\s*(?:万|万元|元|台|个|条|场|份)", candidate):
-            return False
-        if re.fullmatch(r"(?:项目|费用|申请|预算|提交|总预算|总金额|包括|需要|帮我|服务)", candidate):
-            return False
-        if any(word in candidate for word in ["请假", "会议室", "总预算", "总金额", "预算", "提交申请"]):
-            return False
-        return True
+        return self._valid_project_search_candidate(candidate, allow_short=True)
 
     def _append_meetingroom_read_tasks(self, state: RuntimeState, tasks: list[ReadTask]) -> None:
         mr = state.meetingroom
@@ -4653,7 +4697,10 @@ class MyAgent:
         if not tasks:
             return 0
         state.read_plan_batches += 1
-        parallel_requested = self._parallel_reads_enabled() and len(tasks) > 1 and all(task.parallel_eligible for task in tasks)
+        async_requested = self._async_read_execution_enabled() and len(tasks) > 1 and all(task.parallel_eligible for task in tasks)
+        parallel_requested = (self._parallel_reads_enabled() or async_requested) and len(tasks) > 1 and all(task.parallel_eligible for task in tasks)
+        # IFTKEnv.call_tool mutates shared counters, history and tool instances.
+        # The A/B mode changes scheduling only and keeps this boundary locked.
         self._debug_log(
             llm_config,
             {
@@ -4662,7 +4709,8 @@ class MyAgent:
                 "batch_index": state.read_plan_batches,
                 "task_count": len(tasks),
                 "parallel_requested": parallel_requested,
-                "parallel_mode": "locked_env_call" if parallel_requested else "sequential",
+                "async_requested": async_requested,
+                "parallel_mode": "serialized_async_compare" if async_requested else ("locked_env_call" if parallel_requested else "sequential"),
                 "tasks": [self._read_task_summary(task) for task in tasks],
             },
         )
@@ -5195,6 +5243,10 @@ class MyAgent:
 
     def _next_expense_action(self, state: RuntimeState) -> StepAction | None:
         wf = state.workflow
+        if state.obs.get("mode") == "multi_turn":
+            ask = self._expense_missing_slot(state)
+            if ask:
+                return ask
         if not wf.evidence.get("applicant"):
             return StepAction("tool", "user.get_info", {})
         if not wf.evidence.get("catalog"):
@@ -5205,10 +5257,6 @@ class MyAgent:
         subclass_field_id = self._expense_subclass_field_id(state)
         if not category_field_id or not subclass_field_id:
             return self._block_workflow(state, "workflow_schema_lookup_contract_missing")
-        if state.obs.get("mode") == "multi_turn":
-            ask = self._expense_missing_slot(state)
-            if ask:
-                return ask
         expense = self._expense_slots(state)
         if not wf.evidence.get("verified_project"):
             singleton_project = self._verified_singleton_project_candidate(state)
@@ -5265,7 +5313,14 @@ class MyAgent:
         if not wf.evidence.get("subclass_options"):
             project = projects[0]
             if self._subclass_lookup_failed(state, project, category):
-                return self._block_workflow(state, "ambiguous_project")
+                # A dependent browser lookup rejects this category for the
+                # current WBS; it is not evidence that the project is wrong.
+                self._reject_expense_category_after_subclass_failure(state, {
+                    "dep": {"wbscode": project.get("wbs_code"), "wzlb": self._expense_category_id(category)}
+                }, "previous_lookup_failure")
+                category = self._select_material_category(state)
+                if not category:
+                    return self._block_workflow(state, "ambiguous_material_subclass")
             return StepAction(
                 "tool",
                 "workflow.browser_search",
@@ -5685,7 +5740,16 @@ class MyAgent:
 
     def _apply_workflow_tool_result(self, state: RuntimeState, tool: str, args: dict[str, Any], result: dict[str, Any]) -> None:
         wf = state.workflow
+        if tool == "workflow.project_search":
+            keyword = str(args.get("project_name") or "").strip()
+            if keyword:
+                tried = self._expense_slots(state).setdefault("_tried_project_keywords", [])
+                if keyword not in tried:
+                    tried.append(keyword)
         if result.get("error"):
+            if tool == "workflow.browser_search" and int(args.get("field_id") or 0) == (self._expense_subclass_field_id(state) or -1):
+                wf.evidence.setdefault("subclass_lookup_failures", []).append({"args": args, "result": result})
+                self._reject_expense_category_after_subclass_failure(state, args, str(result.get("error") or "tool_error"))
             return
         if tool == "user.get_info":
             users = result.get("users") or []
@@ -5755,6 +5819,7 @@ class MyAgent:
                 self._bind_expense_subclass_candidates(state, result)
             else:
                 wf.evidence.setdefault("subclass_lookup_failures", []).append({"args": args, "result": result})
+                self._reject_expense_category_after_subclass_failure(state, args, "empty_options")
         elif tool == "workflow.save" and result.get("draft_saved"):
             wf.evidence["save_done"] = {"args": args, "result": result}
             if args.get("workflow_id") == WORKFLOW_IDS["leave"]:
@@ -7114,24 +7179,29 @@ class MyAgent:
         return filtered
 
     def _expense_missing_slot(self, state: RuntimeState) -> StepAction | None:
+        slot = self._expense_missing_slot_name(state)
+        messages = {
+            "project_code": "请提供项目名称或项目编码。",
+            "material_category": "请问物资大类选哪个？",
+            "material_subclass": "请问具体物资小类选哪个？",
+            "total_amount": "请问总预算是多少？",
+        }
+        if slot and slot not in state.asked_slots:
+            state.asked_slots.add(slot)
+            return StepAction("reply", message=messages[slot])
+        return None
+
+    def _expense_missing_slot_name(self, state: RuntimeState) -> str:
         expense = self._expense_slots(state)
         if not self._has_explicit_project_slot(expense):
-            if "project_code" not in state.asked_slots:
-                state.asked_slots.add("project_code")
-                return StepAction("reply", message="请提供项目名称或项目编码。")
+            return "project_code"
         if not expense.get("material_category_hint"):
-            if "material_category" not in state.asked_slots:
-                state.asked_slots.add("material_category")
-                return StepAction("reply", message="请问物资大类选哪个？")
+            return "material_category"
         if not expense.get("material_subclass_hint") and not expense.get("items"):
-            if "material_subclass" not in state.asked_slots:
-                state.asked_slots.add("material_subclass")
-                return StepAction("reply", message="请问具体物资小类选哪个？")
+            return "material_subclass"
         if not expense.get("total_amount"):
-            if "total_amount" not in state.asked_slots:
-                state.asked_slots.add("total_amount")
-                return StepAction("reply", message="请问总预算是多少？")
-        return None
+            return "total_amount"
+        return ""
 
     def _has_explicit_project_slot(self, expense: dict[str, Any]) -> bool:
         if expense.get("project_code"):
@@ -7152,10 +7222,8 @@ class MyAgent:
         tried = expense.setdefault("_tried_project_keywords", [])
         for candidate in candidates:
             if candidate and candidate not in tried:
-                tried.append(candidate)
                 return {"project_name": candidate}
         if expense.get("project_name") and expense.get("project_name") not in tried:
-            tried.append(expense["project_name"])
             return {"project_name": expense["project_name"]}
         return None
 
@@ -7253,7 +7321,6 @@ class MyAgent:
         tried = expense.setdefault("_tried_project_keywords", [])
         for suggestion in suggestions:
             if suggestion and suggestion not in tried:
-                tried.append(suggestion)
                 return {"project_name": suggestion}
         return self._broad_project_probe_args(state, expense)
 
@@ -7266,7 +7333,6 @@ class MyAgent:
         probe_history = state.workflow.evidence.setdefault("broad_project_probe_keywords", [])
         for keyword in self._broad_project_probe_keywords(expense):
             if keyword not in tried:
-                tried.append(keyword)
                 probe_history.append(keyword)
                 return {"project_name": keyword}
         state.workflow.evidence["broad_project_probe_done"] = True
@@ -7330,6 +7396,14 @@ class MyAgent:
             if len(projects) == 1 and projects[0].get("project_code") == project.get("project_code"):
                 current_query = str(args.get("project_name") or "")
                 break
+        # A concrete user-derived query that already yielded one project is
+        # sufficient. Refinement is only for broad structural probes such as
+        # "项目" or "平台", which cannot establish a unique intent by itself.
+        if self._valid_project_search_candidate(current_query, allow_short=True) and self._project_search_has_explicit_support(
+            state, {"project_name": current_query}, project
+        ):
+            wf.evidence["project_refine_done"] = True
+            return None
         candidates = self._project_refine_candidates(state, project)
         for candidate in candidates:
             keyword = self._clean_project_phrase(candidate)
@@ -7485,7 +7559,14 @@ class MyAgent:
         for suffix in ["项目", "专项", "工程", "平台", "系统"]:
             target = cleaned or original
             if target.endswith(suffix) and len(target) > len(suffix) + 3:
-                forms.append(target[: -len(suffix)])
+                core = target[: -len(suffix)]
+                # A named X项目 is usually retrieved more precisely by X.
+                # Keep platform/system terms in their original order because
+                # they are also explicit user-provided structural candidates.
+                if suffix == "项目":
+                    forms = [core, *forms]
+                else:
+                    forms.append(core)
                 break
         return self._dedupe([item for item in forms if self._valid_project_search_candidate(item, allow_short=True)])
 
@@ -7547,6 +7628,7 @@ class MyAgent:
             phrase,
         )[0]
         phrase = re.sub(r"\d+(?:\.\d+)?\s*(?:万|万元|元|台|个|条|场|份|支|套|批|项|册)", "", phrase)
+        phrase = re.sub(r"^(?:项目|平台|系统|工程|专项)(?:名称)?(?:是|为|叫|：|:)", "", phrase)
         phrase = re.sub(r"^(另外|另一个任务是|然后|顺便|同时|并且|还有|再|请|帮我|帮|给|把|为|给我|需要|申请|办理|发起|提交|新建|创建|做|处理|先|存个|存一个|提一个|提|一个|项目是|项目为|项目叫|项目还是|项目仍是|项目还叫|项目|还是|仍是|是)+", "", phrase)
         phrase = re.sub(r"(那边|这里|这个|那个|相关|费用|预算|采购|申请|的|需要|要|包括|用于|使用|一批|一些)+$", "", phrase)
         phrase = re.sub(r"^(另外|然后|顺便|同时|还有|提一个|提|一个|还是|仍是)+", "", phrase)
@@ -7829,6 +7911,12 @@ class MyAgent:
     def _select_material_category(self, state: RuntimeState) -> dict[str, Any] | None:
         cached = state.workflow.evidence.get("selected_material_category")
         current_options = state.workflow.evidence.get("category_options", {}).get("options") or []
+        rejected = self._rejected_expense_category_ids(state)
+        current_options = [
+            item
+            for item in current_options
+            if isinstance(item, dict) and self._expense_category_id(item) not in rejected
+        ]
         current_ids = {str(item.get("value") or item.get("code") or "") for item in current_options if isinstance(item, dict)}
         if isinstance(cached, dict) and str(cached.get("value") or cached.get("code") or "") in current_ids:
             self._bind_expense_category(state, cached, "cached")
@@ -7875,6 +7963,41 @@ class MyAgent:
         self._bind_expense_category(state, options[0], "single_option")
         self._debug_log(self._debug_llm_config(), {"event": "expense_category_selection", "source": "single_option", "hint": hint, "selected": options[0]})
         return options[0]
+
+    def _rejected_expense_category_ids(self, state: RuntimeState) -> set[str]:
+        project = state.workflow.evidence.get("verified_project") or {}
+        fingerprint = self._expense_project_fingerprint(project) if isinstance(project, dict) else ""
+        rejected = state.workflow.evidence.get("rejected_material_categories") or {}
+        values = rejected.get(fingerprint) if isinstance(rejected, dict) else []
+        return {str(value) for value in values or []}
+
+    def _reject_expense_category_after_subclass_failure(self, state: RuntimeState, args: dict[str, Any], reason: str) -> None:
+        dep = args.get("dep") if isinstance(args.get("dep"), dict) else {}
+        category_id = str(dep.get("wzlb") or "")
+        project = state.workflow.evidence.get("verified_project") or {}
+        fingerprint = self._expense_project_fingerprint(project) if isinstance(project, dict) else ""
+        if not category_id or not fingerprint:
+            return
+        rejected = state.workflow.evidence.setdefault("rejected_material_categories", {})
+        values = rejected.setdefault(fingerprint, [])
+        if category_id not in values:
+            values.append(category_id)
+        selected = state.workflow.evidence.get("selected_material_category") or {}
+        if self._expense_category_id(selected) == category_id:
+            state.workflow.evidence.pop("selected_material_category", None)
+            bindings = state.workflow.evidence.setdefault("expense_bindings", {})
+            bindings.pop("category", None)
+        self._invalidate_expense_subclass_binding(state, f"category_rejected:{reason}")
+        self._debug_log(
+            self._debug_llm_config(),
+            {
+                "event": "expense_category_fallback",
+                "case_id": state.obs.get("case_id"),
+                "project": fingerprint,
+                "rejected_category": category_id,
+                "reason": reason,
+            },
+        )
 
     def _expense_project_fingerprint(self, project: dict[str, Any]) -> str:
         return f"{project.get('project_code') or ''}|{project.get('wbs_code') or ''}"
@@ -8002,6 +8125,9 @@ class MyAgent:
         source_items = self._clean_explicit_expense_items(expense.get("items") or [])
         source_reason = self._expense_source_item_evidence_reason(state, source_items, total)
         if source_reason:
+            draft_fallback = self._draft_explicit_subclass_ir_fallback(state, project, category, total)
+            if isinstance(draft_fallback, ExpenseDraftIR):
+                return self._expense_ir_to_save_args(state, project, category, draft_fallback)
             state.ledger.record_expense_translation(source="program", decision="rejected", reason=source_reason)
             return source_reason
         llm_config = self._llm_config("strong")
@@ -8035,12 +8161,18 @@ class MyAgent:
                 fallback = self._deterministic_expense_ir_fallback(state, project, category, total)
                 if isinstance(fallback, ExpenseDraftIR):
                     return self._expense_ir_to_save_args(state, project, category, fallback)
+                draft_fallback = self._draft_explicit_subclass_ir_fallback(state, project, category, total)
+                if isinstance(draft_fallback, ExpenseDraftIR):
+                    return self._expense_ir_to_save_args(state, project, category, draft_fallback)
                 state.ledger.record_expense_translation(source="program", decision="rejected", reason=str(fallback))
                 return str(ir_or_reason)
             state.ledger.record_expense_translation(source="llm_translation", decision="failed", reason="invalid_or_empty_llm_response")
         fallback = self._deterministic_expense_ir_fallback(state, project, category, total)
         if isinstance(fallback, ExpenseDraftIR):
             return self._expense_ir_to_save_args(state, project, category, fallback)
+        draft_fallback = self._draft_explicit_subclass_ir_fallback(state, project, category, total)
+        if isinstance(draft_fallback, ExpenseDraftIR):
+            return self._expense_ir_to_save_args(state, project, category, draft_fallback)
         state.ledger.record_expense_translation(source="program", decision="rejected", reason=str(fallback))
         return str(fallback)
 
@@ -8185,6 +8317,10 @@ class MyAgent:
         if not source_items:
             return "missing_material_detail_evidence"
         expense = self._expense_slots(state)
+        if state.workflow.slots.get("submit"):
+            submit_reason = self._submit_expense_item_evidence_reason(state, source_items)
+            if submit_reason:
+                return submit_reason
         category_hint = self._normalize_option_text(expense.get("material_category_hint") or "")
         total_amount: Decimal | None = None
         if total:
@@ -8221,6 +8357,28 @@ class MyAgent:
         if total_amount is not None and all(amount is not None for amount in item_amounts):
             if sum((amount or Decimal("0")) for amount in item_amounts) != total_amount:
                 return "source_amount_not_preserved"
+        return ""
+
+    def _submit_expense_item_evidence_reason(self, state: RuntimeState, source_items: list[dict[str, Any]]) -> str:
+        """Reject submit-only guesses hidden by a single aggregate amount."""
+        options = state.workflow.evidence.get("subclass_options", {}).get("options") or []
+        labels = [
+            self._normalize_option_text(item.get("label") or item.get("name") or "")
+            for item in options
+            if isinstance(item, dict)
+        ]
+        generic_terms = ("宣传物料", "交付支持", "相关服务", "相关费用", "一批物料", "物料", "服务")
+        for item in source_items:
+            name = self._normalize_option_text(item.get("name") or "")
+            if not name:
+                return "missing_material_detail_evidence"
+            exact_option = any(label and (name == label or name in label or label in name) for label in labels)
+            # "电脑及其配件" is allowed when it is a verified option; otherwise
+            # conjunctions mean several business objects share one amount.
+            if not exact_option and re.search(r"[、和与]|(?<!其)及", name):
+                return "insufficient_amount_breakdown"
+            if not exact_option and any(term in name for term in generic_terms):
+                return "ambiguous_material_subclass"
         return ""
 
     def _validate_expense_draft_ir(
@@ -8331,6 +8489,47 @@ class MyAgent:
                 }
             )
         return self._validate_expense_draft_ir(state, project, category, total, rows, "deterministic_unique_candidate")
+
+    def _draft_explicit_subclass_ir_fallback(
+        self,
+        state: RuntimeState,
+        project: dict[str, Any],
+        category: dict[str, Any],
+        total: str,
+    ) -> ExpenseDraftIR | str:
+        """Draft-only single-line fallback for a verified explicit subclass."""
+        if state.workflow.slots.get("submit"):
+            return "submit_requires_explicit_detail_evidence"
+        options = state.workflow.evidence.get("subclass_options", {}).get("options") or []
+        expense = self._expense_slots(state)
+        hints = [str(expense.get("material_subclass_hint") or "")]
+        hints.extend(str(item.get("name") or "") for item in self._clean_explicit_expense_items(expense.get("items") or []))
+        selected: dict[str, Any] | None = None
+        selected_hint = ""
+        for hint in self._dedupe(hints):
+            normalized_hint = self._normalize_option_text(hint)
+            candidate = self._select_expense_subclass_by_text(hint, options)
+            label = self._normalize_option_text((candidate or {}).get("label") or "")
+            if candidate and normalized_hint and label and (normalized_hint in label or label in normalized_hint):
+                selected = candidate
+                selected_hint = hint
+                break
+        if not selected:
+            return "draft_requires_explicit_verified_subclass"
+        subclass_id = str(selected.get("value") or selected.get("code") or "")
+        if not subclass_id:
+            return "draft_requires_explicit_verified_subclass"
+        material_name = self._clean_material_name_match(selected_hint, selected_hint)
+        if not material_name or self._looks_like_invalid_expense_item_name(material_name):
+            material_name = str(selected.get("label") or "").strip()
+        rows = [{
+            "material_subclass": subclass_id,
+            "material_name": material_name,
+            "quantity": "1",
+            "unit_price": total,
+            "budget_amount": total,
+        }]
+        return self._validate_expense_draft_ir(state, project, category, total, rows, "draft_explicit_subclass_fallback")
 
     def _expense_ir_to_save_args(
         self,
@@ -10376,7 +10575,7 @@ class MyAgent:
             start = max(0, min(positions) - 20)
             return query[start:]
 
-        strong_keys = ["费用", "采购", "报销", "物资", "项目是", "项目为", "项目还是"]
+        strong_keys = ["费用", "采购", "报销", "物资", "项目", "项目是", "项目为", "项目还是", "平台是", "平台为", "系统是", "系统为", "工程是", "工程为", "专项是", "专项为"]
         budget_keys = ["预算", "总预算", "金额", "总金额"]
         strong_positions = [query.find(key) for key in strong_keys if query.find(key) >= 0]
         budget_positions = [query.find(key) for key in budget_keys if query.find(key) >= 0]
@@ -10396,6 +10595,8 @@ class MyAgent:
 
     def _extract_project_name(self, text: str) -> str:
         patterns = [
+            r"(?:项目|平台|系统|工程|专项)(?:名称)?(?:是|为|叫|：|:)\s*([^，。；;:：]+)",
+            r"([\u4e00-\u9fa5A-Za-z0-9]{4,30}项目)(?:需要|要|包括|采购|，|。|；|;|$)",
             r"项目(?:是|为)?([^：:，。,]+?项目)",
             r"([^，。:：]+?项目)(?:需要|要|那边|包括|：|:)",
             r"([^，。:：；;]+?项目)(?:里|中|内|下|先|帮|直接)",
