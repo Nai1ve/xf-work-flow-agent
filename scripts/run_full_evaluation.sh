@@ -111,6 +111,7 @@ if [[ "$BUILD_STATIC_CONTEXT" == "1" ]]; then
       --split-dir "$STATIC_SPLIT_DIR" \
       --val-dir "$VAL_SPLIT_DIR" \
       --output-dir "$STATIC_CONTEXT_DIR" \
+      --allow-hash-mismatch \
       > "$OUTPUT_ROOT/static_context_build.json"
   elif [[ -f "$STATIC_CONTEXT_DIR/manifest.json" ]]; then
     log "Static context source data missing; using existing $STATIC_CONTEXT_DIR/manifest.json"

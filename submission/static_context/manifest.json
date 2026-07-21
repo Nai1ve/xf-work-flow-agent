@@ -1,20 +1,28 @@
 {
   "counts": {
     "capabilities": 16,
+    "expense_examples": 57,
     "rooms": 139,
     "tools": 22,
     "workflows": 2
   },
   "files": {
     "capabilities": "capabilities.index.json",
+    "expense_examples": "expense_examples.index.json",
     "meetingrooms": "meetingrooms.index.json",
     "prompt_cards": "prompt_cards/",
     "tools": "tools.index.json",
     "workflows": "workflows.index.json"
   },
-  "generated_at": "2026-07-10T10:04:23.267888+00:00",
+  "generated_at": "2026-07-21T02:03:05.775081+00:00",
   "schema_version": "static-context-v1",
   "sources": {
+    "expense_examples": {
+      "cases_path": "contest/train/cases",
+      "cases_sha256": "13f12d3b2733ce3dbdadc7425b390c0ccce6a3c2df8e21357c375a3db470f132",
+      "policy": "train gold only; case identifiers omitted; runtime ids must still be verified by tools",
+      "split": "train"
+    },
     "meetingroom_data": {
       "path": "contest/train/data/meetingroom_data.json",
       "sha256": "c09ac3253904a99f4bb3710791b00736009d9e36babf29364e8c44c32b94a5a7"
@@ -25,7 +33,7 @@
     },
     "workflow_data": {
       "path": "contest/train/data/workflow_data.json",
-      "sha256": "c0b51bebcc2007810eba7a0de42a679798092adda01e593303bcd73d2c4fc4ad"
+      "sha256": "4591318396772c152ea59ccb7a17c8e7a534a6a5c3ecbb76ce7c2c1a18ef34a2"
     }
   },
   "split_hash_checks": {
@@ -35,8 +43,8 @@
       "val_sha256": "c09ac3253904a99f4bb3710791b00736009d9e36babf29364e8c44c32b94a5a7"
     },
     "data/workflow_data.json": {
-      "same": true,
-      "train_sha256": "c0b51bebcc2007810eba7a0de42a679798092adda01e593303bcd73d2c4fc4ad",
+      "same": false,
+      "train_sha256": "4591318396772c152ea59ccb7a17c8e7a534a6a5c3ecbb76ce7c2c1a18ef34a2",
       "val_sha256": "c0b51bebcc2007810eba7a0de42a679798092adda01e593303bcd73d2c4fc4ad"
     },
     "tool_specs.json": {

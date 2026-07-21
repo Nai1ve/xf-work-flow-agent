@@ -184,7 +184,6 @@
           "default": "current_user_id",
           "key": "applicant",
           "label": "申请人",
-          "readonly": false,
           "recommended_input": "auto_filled",
           "required": true,
           "type": "browser"
@@ -263,7 +262,6 @@
           "default": "current_user_id",
           "key": "applicant",
           "label": "申请人",
-          "readonly": false,
           "recommended_input": "auto_filled",
           "required": true,
           "type": "browser"

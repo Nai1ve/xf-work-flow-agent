@@ -1,0 +1,2082 @@
+{
+  "counts": {
+    "memories": 57,
+    "request_shapes": {
+      "explicit_complete": 34,
+      "explicit_partial": 4,
+      "generic_package": 19
+    },
+    "source_cases": 200
+  },
+  "entries": [
+    {
+      "material_category": "WZLB-201911250001",
+      "memory_id": "04969ce07605f24f6763",
+      "project": {
+        "project_code": "M-260200004",
+        "project_name": "算力平台资源运营项目",
+        "wbs_code": "M-260200004.03"
+      },
+      "project_aliases": [
+        "平台资源",
+        "算力平台资源运营",
+        "算力平台资源运营项目"
+      ],
+      "project_search_queries": [
+        "算力平台资源运营"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "算力平台资源运营项目里有一笔对象存储与带宽费用，3.1万，直接提交。",
+      "rows": [
+        {
+          "budget_amount": "31000.00",
+          "material_name": "对象存储与带宽",
+          "material_subclass": "WZ_202206200005",
+          "quantity": "1",
+          "unit_price": "31000.00"
+        }
+      ],
+      "source_sha256": [
+        "2a20a6eeb12384577816c6414eda3b6ef53bffca25776ff0b1556ffb681cc493"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "31000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "063a075254dfc064fe07",
+      "project": {
+        "project_code": "D-260100004",
+        "project_name": "终端测试环境建设项目",
+        "wbs_code": "D-260100004.03"
+      },
+      "project_aliases": [
+        "终端测试环境建设项目",
+        "质量工程"
+      ],
+      "project_search_queries": [],
+      "request_shape": "explicit_complete",
+      "request_text": "按项目编码 D-260100004 帮我提交办公设备申请，要买1台测试手机，预算4500元。",
+      "rows": [
+        {
+          "budget_amount": "4500.00",
+          "material_name": "测试手机",
+          "material_subclass": "WZ_202206060019",
+          "quantity": "1",
+          "unit_price": "4500.00"
+        }
+      ],
+      "source_sha256": [
+        "974a18bbbf8b88a586181ea8035f159e141d2b9c3b58918adbb1086f363bbfc6"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "4500.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "14521fa93033ed1a87a9",
+      "project": {
+        "project_code": "B-260100002",
+        "project_name": "城市服务大模型发布活动项目",
+        "wbs_code": "B-260100002.03"
+      },
+      "project_aliases": [
+        "城市服务大模型",
+        "城市服务大模型发布活动项目",
+        "城市解决方案"
+      ],
+      "project_search_queries": [
+        "城市服务大模型"
+      ],
+      "request_shape": "explicit_partial",
+      "request_text": "帮我订下周二下午2点到3点小镇A1四楼6人会议室，主题项目复盘。订不到就算了。另外我需要提交品牌广告服务费用，项目还是城市服务大模型发布活动项目：视频制作2条每条1.5万元，活动发布会1场4万元，总预算7万元。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "2",
+          "unit_price": "15000.00"
+        },
+        {
+          "budget_amount": "40000.00",
+          "material_name": "活动、展会、发布会",
+          "material_subclass": "WZ_202210110012",
+          "quantity": "1",
+          "unit_price": "40000.00"
+        }
+      ],
+      "source_sha256": [
+        "5ffeb1d4fbdf1b84d7ffbacc7e59f7cc56ddf8d997027ebee9a327ddb8ce6061"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "70000.00"
+    },
+    {
+      "material_category": "WZLB-202001150001",
+      "memory_id": "20946557a8ddbe26e20b",
+      "project": {
+        "project_code": "P-260100001",
+        "project_name": "数字员工平台",
+        "wbs_code": "P-260100001.03"
+      },
+      "project_aliases": [
+        "AI研发",
+        "数字员工",
+        "数字员工平台"
+      ],
+      "project_search_queries": [
+        "数字员工"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "订明天下午的会议室开数字员工项目复盘会，顺便帮我存个视频制作费用草稿，项目也是数字员工，预算3万。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202001150001",
+          "quantity": "1",
+          "unit_price": "30000.00"
+        }
+      ],
+      "source_sha256": [
+        "7a1e979f1bf8f92e67301d1d938db42a1e9f8bd51d6a14c4b4e316f220a278cc"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "30000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "21866d5aca4a8667bd32",
+      "project": {
+        "project_code": "D-260100004",
+        "project_name": "终端测试环境建设项目",
+        "wbs_code": "D-260100004.03"
+      },
+      "project_aliases": [
+        "终端测试",
+        "终端测试环境",
+        "终端测试环境建设项目"
+      ],
+      "project_search_queries": [
+        "终端测试环境"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我提交终端测试环境建设项目的2台安卓测试机采购申请，总预算1.6万元。",
+      "rows": [
+        {
+          "budget_amount": "16000.00",
+          "material_name": "安卓测试机",
+          "material_subclass": "WZ_202206060019",
+          "quantity": "2",
+          "unit_price": "8000.00"
+        }
+      ],
+      "source_sha256": [
+        "0c94090b9cc9af852b36c364d81ee4c5e8ba77f43c0a457e2e24d97dd1a7bc8c"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "16000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "2933c5b794a663ab2a69",
+      "project": {
+        "project_code": "D-260100004",
+        "project_name": "终端测试环境建设项目",
+        "wbs_code": "D-260100004.03"
+      },
+      "project_aliases": [
+        "终端测试环境",
+        "终端测试环境建设项目",
+        "质量工程"
+      ],
+      "project_search_queries": [
+        "终端测试环境"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我先存一个办公设备申请草稿，项目是星火质量工程平台，要买2台显示器，每台1500元，总预算3000元，我还要再确认采购时间。",
+      "rows": [
+        {
+          "budget_amount": "3000.00",
+          "material_name": "显示器",
+          "material_subclass": "WZ_202206060014",
+          "quantity": "2",
+          "unit_price": "1500.00"
+        }
+      ],
+      "source_sha256": [
+        "bdd12a28f73b8df9a8087bcd0a3fde7522a0adf0b62b0f4346ce704a4b0c3211"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "3000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "2bb22c046b1bb20d8e16",
+      "project": {
+        "project_code": "B-260100002",
+        "project_name": "城市服务大模型发布活动项目",
+        "wbs_code": "B-260100002.03"
+      },
+      "project_aliases": [
+        "城市服务大模型",
+        "城市服务大模型发布活动项目",
+        "城市解决方案"
+      ],
+      "project_search_queries": [
+        "城市服务大模型"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "帮我订明天下午 2 点到 3 点的会议室，A1 不行就 A2，10 个人，要带屏幕。顺手把发布活动项目的品牌广告费用两条明细提交。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "2",
+          "unit_price": "15000.00"
+        },
+        {
+          "budget_amount": "40000.00",
+          "material_name": "活动、展会、发布会",
+          "material_subclass": "WZ_202210110012",
+          "quantity": "1",
+          "unit_price": "40000.00"
+        }
+      ],
+      "source_sha256": [
+        "ab88438331768cbc7b790167019965b2d5f2cdcbc2967a429b6d70b598b62a41"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "70000.00"
+    },
+    {
+      "material_category": "WZLB-202302280001",
+      "memory_id": "2c4c46921eb989ccfbde",
+      "project": {
+        "project_code": "H-260100008",
+        "project_name": "年度活动定制物资项目",
+        "wbs_code": "H-260100008.03"
+      },
+      "project_aliases": [
+        "品牌市场",
+        "年度活动定制",
+        "年度活动定制物资项目"
+      ],
+      "project_search_queries": [
+        "年度活动定制"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "先帮我存个定制服装申请草稿，项目是品牌市场产品发布会，需要定制活动服装，预算16000元。",
+      "rows": [
+        {
+          "budget_amount": "16000.00",
+          "material_name": "定制服装",
+          "material_subclass": "WZ_202302280002",
+          "quantity": "1",
+          "unit_price": "16000.00"
+        }
+      ],
+      "source_sha256": [
+        "3cf5defad3e69026889cdde3c7cb4f72ef4e17a4ba22dcc96a83a270e1a658b7"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "16000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "2cc57f359eb7d24eb501",
+      "project": {
+        "project_code": "B-260100002",
+        "project_name": "城市服务大模型发布活动项目",
+        "wbs_code": "B-260100002.03"
+      },
+      "project_aliases": [
+        "城市服务大模型",
+        "城市服务大模型发布活动项目",
+        "城市解决方案"
+      ],
+      "project_search_queries": [
+        "城市服务大模型"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "我明天下午两点有个A1的项目复盘会，能延长半小时就延，冲突就别动原会议。另外把城市服务大模型发布活动项目的品牌广告费用先存成草稿，总预算5万。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "1",
+          "unit_price": "30000.00"
+        },
+        {
+          "budget_amount": "20000.00",
+          "material_name": "活动、展会、发布会",
+          "material_subclass": "WZ_202210110012",
+          "quantity": "1",
+          "unit_price": "20000.00"
+        }
+      ],
+      "source_sha256": [
+        "34ae91ff9234ce17d7a3b6097737468b1168a84a5e4e4a7eed21b3a81f1a2b2d"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "50000.00"
+    },
+    {
+      "material_category": "WZLB-202206060003",
+      "memory_id": "2dd42d822bf502fb67f4",
+      "project": {
+        "project_code": "G-260100007",
+        "project_name": "办公空间升级项目",
+        "wbs_code": "G-260100007.03"
+      },
+      "project_aliases": [
+        "办公空间升级",
+        "办公空间升级项目",
+        "行政支持"
+      ],
+      "project_search_queries": [
+        "办公空间升级"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "先帮我存个办公家具采购草稿，项目是行政支持产品发布会，需要购置1套办公桌椅，预算9000元。",
+      "rows": [
+        {
+          "budget_amount": "9000.00",
+          "material_name": "办公桌椅",
+          "material_subclass": "WZ_202206060027",
+          "quantity": "1",
+          "unit_price": "9000.00"
+        }
+      ],
+      "source_sha256": [
+        "b84f8a3ca9390212c59d430d22a62157efb3e31a38dc6bf9a1dceceed8d4bc67"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "9000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "2f937d744a2e9899aae0",
+      "project": {
+        "project_code": "D-260100004",
+        "project_name": "终端测试环境建设项目",
+        "wbs_code": "D-260100004.03"
+      },
+      "project_aliases": [
+        "测试环境",
+        "终端测试环境建设项目",
+        "质量工程"
+      ],
+      "project_search_queries": [
+        "测试环境"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我给测试环境建设项目存一个扫描仪采购草稿，预算2800元。",
+      "rows": [
+        {
+          "budget_amount": "2800.00",
+          "material_name": "扫描仪",
+          "material_subclass": "WZ_202206060015",
+          "quantity": "1",
+          "unit_price": "2800.00"
+        }
+      ],
+      "source_sha256": [
+        "46e125dfe80bc273fbefd8ba1548eb070c8c9a36ce32062a5e9fce264d9db3c6"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "2800.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "324217eaa45e18f3699b",
+      "project": {
+        "project_code": "Q-260200007",
+        "project_name": "企业官网改版传播项目",
+        "wbs_code": "Q-260200007.03"
+      },
+      "project_aliases": [
+        "企业官网改版传播项目",
+        "官网改版",
+        "官网运营"
+      ],
+      "project_search_queries": [
+        "官网改版"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "先帮我把企业官网改版那边的专题页视觉设计费用存成草稿，预算2.6万元，项目是官网改版那个。",
+      "rows": [
+        {
+          "budget_amount": "26000.00",
+          "material_name": "官网专题页视觉设计",
+          "material_subclass": "WZ_202210110008",
+          "quantity": "1",
+          "unit_price": "26000.00"
+        }
+      ],
+      "source_sha256": [
+        "0738cd02224b4c239c84dfdc835166a3a3aee6b349adc8634e3fad704f5a1cb1"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "26000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "32a545929dac68bf7635",
+      "project": {
+        "project_code": "C-260100003",
+        "project_name": "知识助手官网与内容设计项目",
+        "wbs_code": "C-260100003.03"
+      },
+      "project_aliases": [
+        "内容设计",
+        "知识助手官网",
+        "知识助手官网与内容设计项目"
+      ],
+      "project_search_queries": [
+        "知识助手官网"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "先帮我存一个品牌设计服务草稿，项目是内容设计产品发布会，要做官网落地页和海报设计，预算2万元。",
+      "rows": [
+        {
+          "budget_amount": "20000.00",
+          "material_name": "官网落地页及海报设计",
+          "material_subclass": "WZ_202210110008",
+          "quantity": "1",
+          "unit_price": "20000.00"
+        }
+      ],
+      "source_sha256": [
+        "c540fa60b265a7f91960af12f9057c31174db5e34dc1ad9b7aa3de0492a49de0"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "20000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "3ab8a4bd85a55a196290",
+      "project": {
+        "project_code": "C-260100003",
+        "project_name": "知识助手官网与内容设计项目",
+        "wbs_code": "C-260100003.03"
+      },
+      "project_aliases": [
+        "知识产品",
+        "知识助手",
+        "知识助手官网与内容设计项目"
+      ],
+      "project_search_queries": [
+        "知识助手"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我提交知识助手升级项目的官网改版设计费用，预算2.2万元。",
+      "rows": [
+        {
+          "budget_amount": "22000.00",
+          "material_name": "官网改版设计",
+          "material_subclass": "WZ_202210110008",
+          "quantity": "1",
+          "unit_price": "22000.00"
+        }
+      ],
+      "source_sha256": [
+        "72fe51af540bd5ff3af47ae57cbab428e3790a3206dc0fa893531b681009d6dc"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "22000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "42969242c296b8a53f88",
+      "project": {
+        "project_code": "B-260100002",
+        "project_name": "城市服务大模型发布活动项目",
+        "wbs_code": "B-260100002.03"
+      },
+      "project_aliases": [
+        "城市服务大模型",
+        "城市服务大模型发布活动项目",
+        "城市解决方案"
+      ],
+      "project_search_queries": [
+        "城市服务大模型"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "我明天下午两点的评审会参会人增加了 4 个，帮我换大一点的会议室。再把费用申请存成草稿，预算 5 万，老板还要确认。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "1",
+          "unit_price": "30000.00"
+        },
+        {
+          "budget_amount": "20000.00",
+          "material_name": "活动、展会、发布会",
+          "material_subclass": "WZ_202210110012",
+          "quantity": "1",
+          "unit_price": "20000.00"
+        }
+      ],
+      "source_sha256": [
+        "447f56dc5d87ae803616d9c0e56dd75fedc76e915ca22083721dcb799e3713d7"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "50000.00"
+    },
+    {
+      "material_category": "WZLB-201812270001",
+      "memory_id": "44907c31ef3282acedff",
+      "project": {
+        "project_code": "T-260200010",
+        "project_name": "渠道布展升级项目",
+        "wbs_code": "T-260200010.03"
+      },
+      "project_aliases": [
+        "渠道布展升级",
+        "渠道布展升级项目",
+        "渠道建设"
+      ],
+      "project_search_queries": [
+        "渠道布展升级"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "先把渠道布展升级项目里门型展架和导视牌的物料申请存成草稿，预算1.8万。",
+      "rows": [
+        {
+          "budget_amount": "18000.00",
+          "material_name": "门型展架与导视牌",
+          "material_subclass": "WZ_202206060025",
+          "quantity": "1",
+          "unit_price": "18000.00"
+        }
+      ],
+      "source_sha256": [
+        "3144ac79ec09ace3d98bd7576a5fd187993b87b83beb28e5f5ff69058d12337d"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "18000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "4e690226ae5e3eec08a8",
+      "project": {
+        "project_code": "D-260100004",
+        "project_name": "终端测试环境建设项目",
+        "wbs_code": "D-260100004.03"
+      },
+      "project_aliases": [
+        "终端测试环境",
+        "终端测试环境建设项目",
+        "质量工程"
+      ],
+      "project_search_queries": [
+        "终端测试环境"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我申请测试设备费用，项目是终端测试环境建设项目，要买1套测试设备，预算8000元，直接提交。",
+      "rows": [
+        {
+          "budget_amount": "8000.00",
+          "material_name": "测试设备",
+          "material_subclass": "WZ_202206060020",
+          "quantity": "1",
+          "unit_price": "8000.00"
+        }
+      ],
+      "source_sha256": [
+        "c4f1268b7e2225d7ffe842f106baf0477d414f2e4a431bc0ceaa250c78b5caec"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "8000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "5172c4ef02eb7d2a75a1",
+      "project": {
+        "project_code": "B-260100002",
+        "project_name": "城市服务大模型发布活动项目",
+        "wbs_code": "B-260100002.03"
+      },
+      "project_aliases": [
+        "城市服务大模型",
+        "城市服务大模型发布活动项目",
+        "城市解决方案"
+      ],
+      "project_search_queries": [
+        "城市服务大模型"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "帮我订明天下午 2 点到 3 点的小镇会议室，优先 A1 四楼，不行就 A2，主题写复盘。然后把品牌广告费用草稿存一下。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "1",
+          "unit_price": "30000.00"
+        },
+        {
+          "budget_amount": "20000.00",
+          "material_name": "活动、展会、发布会",
+          "material_subclass": "WZ_202210110012",
+          "quantity": "1",
+          "unit_price": "20000.00"
+        }
+      ],
+      "source_sha256": [
+        "96d297c95732c14726e5dd7912462642490dd15d8ab64629388e75a07e9bbb83"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "50000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "5bc7e3de3246531352ad",
+      "project": {
+        "project_code": "L-260200003",
+        "project_name": "终端兼容性专项测试项目",
+        "wbs_code": "L-260200003.03"
+      },
+      "project_aliases": [
+        "测试保障",
+        "终端兼容性专项测试项目"
+      ],
+      "project_search_queries": [],
+      "request_shape": "explicit_complete",
+      "request_text": "按项目编码 L-260200003 帮我把3支录音笔的采购提掉，每支900，总预算2700。",
+      "rows": [
+        {
+          "budget_amount": "2700.00",
+          "material_name": "录音笔",
+          "material_subclass": "WZ_202206060019",
+          "quantity": "3",
+          "unit_price": "900.00"
+        }
+      ],
+      "source_sha256": [
+        "4dbd37ea2decff5cbe6b6717053af3e396aed446c80ab91675f40d4006ef8afd"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "2700.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "626b4c604c5f5aa206c7",
+      "project": {
+        "project_code": "B-260100002",
+        "project_name": "城市服务大模型发布活动项目",
+        "wbs_code": "B-260100002.03"
+      },
+      "project_aliases": [
+        "城市服务大模型",
+        "城市服务大模型发布活动项目",
+        "城市解决方案"
+      ],
+      "project_search_queries": [
+        "城市服务大模型"
+      ],
+      "request_shape": "explicit_partial",
+      "request_text": "帮我先把品牌广告服务费用申请草稿存一下，项目还是城市解决方案产品发布会，视频制作3万元、活动发布会2万元，总预算5万元，我还要让老板确认预算。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "1",
+          "unit_price": "30000.00"
+        },
+        {
+          "budget_amount": "20000.00",
+          "material_name": "活动、展会、发布会",
+          "material_subclass": "WZ_202210110012",
+          "quantity": "1",
+          "unit_price": "20000.00"
+        }
+      ],
+      "source_sha256": [
+        "a13626608997b15bcd1ebe714433a8ec424dc933f9f09ae85be4655e3abea9e6"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "50000.00"
+    },
+    {
+      "material_category": "WZLB-202206060003",
+      "memory_id": "62e596a56b5f2bc65add",
+      "project": {
+        "project_code": "N-260200005",
+        "project_name": "办公场景焕新项目",
+        "wbs_code": "N-260200005.03"
+      },
+      "project_aliases": [
+        "办公场景焕新",
+        "办公场景焕新项目",
+        "行政服务"
+      ],
+      "project_search_queries": [
+        "办公场景焕新"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "办公场景焕新项目里有一套洽谈区桌椅组合，预算9800，帮我直接提交流程。",
+      "rows": [
+        {
+          "budget_amount": "9800.00",
+          "material_name": "洽谈区桌椅组合",
+          "material_subclass": "WZ_202206060027",
+          "quantity": "1",
+          "unit_price": "9800.00"
+        }
+      ],
+      "source_sha256": [
+        "dd5a4699cfac93f8ef23445ca5858eb63622f2741056396ccf4a38a7ce47bfec"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "9800.00"
+    },
+    {
+      "material_category": "WZLB-201812270001",
+      "memory_id": "648bf2d545b1987a2f5f",
+      "project": {
+        "project_code": "E-260100005",
+        "project_name": "渠道宣传印刷推广项目",
+        "wbs_code": "E-260100005.03"
+      },
+      "project_aliases": [
+        "渠道宣传印刷",
+        "渠道宣传印刷推广项目",
+        "渠道运营"
+      ],
+      "project_search_queries": [
+        "渠道宣传印刷"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我申请广宣印刷物资费用，项目是渠道运营产品发布会，要做一批宣传折页，预算12000元，直接提交。",
+      "rows": [
+        {
+          "budget_amount": "12000.00",
+          "material_name": "宣传折页印刷",
+          "material_subclass": "WZ_202110250002",
+          "quantity": "1",
+          "unit_price": "12000.00"
+        }
+      ],
+      "source_sha256": [
+        "895a649131b6d62abc249ab9c0dc29ea42e7aa3ea6975692d88c158a9282c291"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "12000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "665f319a5002e00f93e5",
+      "project": {
+        "project_code": "A-260100001",
+        "project_name": "智能办公平台品牌升级项目",
+        "wbs_code": "A-260100001.03"
+      },
+      "project_aliases": [
+        "产品平台",
+        "智能办公平台品牌升级项目"
+      ],
+      "project_search_queries": [],
+      "request_shape": "generic_package",
+      "request_text": "帮我订小镇 A1 四楼 6 人会，订不到就算了。另一个任务是给项目编码 A-260100001 提交品牌广告费用。",
+      "rows": [
+        {
+          "budget_amount": "40000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "1",
+          "unit_price": "40000.00"
+        },
+        {
+          "budget_amount": "20000.00",
+          "material_name": "设计服务（含网页制作）",
+          "material_subclass": "WZ_202210110008",
+          "quantity": "1",
+          "unit_price": "20000.00"
+        }
+      ],
+      "source_sha256": [
+        "dd66dfebd1fe42030b9fbd7ef4351c019f318dc1bb12851393430c0c551c86a4"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "60000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "6674f7bd8ce6a8c95a5b",
+      "project": {
+        "project_code": "A-260100001",
+        "project_name": "智能办公平台品牌升级项目",
+        "wbs_code": "A-260100001.03"
+      },
+      "project_aliases": [
+        "产品平台",
+        "智能办公平台",
+        "智能办公平台品牌升级项目"
+      ],
+      "project_search_queries": [
+        "智能办公平台"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我先存一个设计服务费用申请草稿。",
+      "rows": [
+        {
+          "budget_amount": "40000.00",
+          "material_name": "设计服务（含网页制作）",
+          "material_subclass": "WZ_202210110008",
+          "quantity": "1",
+          "unit_price": "40000.00"
+        }
+      ],
+      "source_sha256": [
+        "ac1de9b453af70999cb29999399af180c1ed06cd5cfaf72cd80807c34c4d51cf",
+        "99664f1ef645868ec2dc0879ebe8dccb001a3bcb53a4ad9dffb91f460b52e769"
+      ],
+      "submit": false,
+      "support_count": 2,
+      "total_amount": "40000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "66b65aadea901d882a89",
+      "project": {
+        "project_code": "A-260100001",
+        "project_name": "智能办公平台品牌升级项目",
+        "wbs_code": "A-260100001.03"
+      },
+      "project_aliases": [
+        "产品平台",
+        "品牌升级",
+        "智能办公平台品牌升级项目"
+      ],
+      "project_search_queries": [
+        "品牌升级"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我提交办公平台升级项目的官网改版设计费用，预算1.8万元。",
+      "rows": [
+        {
+          "budget_amount": "18000.00",
+          "material_name": "官网改版设计",
+          "material_subclass": "WZ_202210110008",
+          "quantity": "1",
+          "unit_price": "18000.00"
+        }
+      ],
+      "source_sha256": [
+        "9addf94b9f8645f8d3d53ecfa1e64a6dd9a0dd4ba12c305fb0d2359ae4580e0d"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "18000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "699841d41a33afad31b6",
+      "project": {
+        "project_code": "D-260100004",
+        "project_name": "终端测试环境建设项目",
+        "wbs_code": "D-260100004.03"
+      },
+      "project_aliases": [
+        "终端测试",
+        "终端测试环境建设项目"
+      ],
+      "project_search_queries": [],
+      "request_shape": "generic_package",
+      "request_text": "帮我先存一个办公设备费用草稿。",
+      "rows": [
+        {
+          "budget_amount": "20000.00",
+          "material_name": "电脑及其配件",
+          "material_subclass": "WZ_DEV_001",
+          "quantity": "1",
+          "unit_price": "20000.00"
+        }
+      ],
+      "source_sha256": [
+        "54f56bf69782af7912049079a0831cf6f056709e591a5a20d7787f2bc94f0280"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "20000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "6b59bb9b2bae7ca7b2bd",
+      "project": {
+        "project_code": "A-260100001",
+        "project_name": "智能办公平台品牌升级项目",
+        "wbs_code": "A-260100001.03"
+      },
+      "project_aliases": [
+        "产品平台",
+        "智能办公平台品牌升级项目"
+      ],
+      "project_search_queries": [],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我给项目编码 A-260100001 申请品牌广告服务费用，视频制作4万元、设计服务2万元，总预算6万元，直接提交。",
+      "rows": [
+        {
+          "budget_amount": "40000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "1",
+          "unit_price": "40000.00"
+        },
+        {
+          "budget_amount": "20000.00",
+          "material_name": "设计服务（含网页制作）",
+          "material_subclass": "WZ_202210110008",
+          "quantity": "1",
+          "unit_price": "20000.00"
+        }
+      ],
+      "source_sha256": [
+        "f4758612d806546e302f9d5de77c4124408bdac89ef82c47ebe428b0b42e7145"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "60000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "6e0ecb94a8ff9e54c109",
+      "project": {
+        "project_code": "D-260100004",
+        "project_name": "终端测试环境建设项目",
+        "wbs_code": "D-260100004.03"
+      },
+      "project_aliases": [
+        "终端测试",
+        "终端测试环境建设项目"
+      ],
+      "project_search_queries": [],
+      "request_shape": "generic_package",
+      "request_text": "帮我提一个办公设备采购申请。",
+      "rows": [
+        {
+          "budget_amount": "18000.00",
+          "material_name": "手机、3C数码",
+          "material_subclass": "WZ_DEV_003",
+          "quantity": "1",
+          "unit_price": "18000.00"
+        }
+      ],
+      "source_sha256": [
+        "bc0dcd26f23d407e9173f214ebc9f2e5b6cf09d9b3fbfd44e3c95e901a2113db",
+        "d74f1ddf120cca28ea3d12521d5840dd66be02b86a62f1b21dfd7bead8ca440c"
+      ],
+      "submit": true,
+      "support_count": 2,
+      "total_amount": "18000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "6eb28b930a8111e3d7e3",
+      "project": {
+        "project_code": "G-260100007",
+        "project_name": "办公空间升级项目",
+        "wbs_code": "G-260100007.03"
+      },
+      "project_aliases": [
+        "办公空间升级",
+        "办公空间升级项目",
+        "行政支持"
+      ],
+      "project_search_queries": [
+        "办公空间升级"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "先帮我存个办公设备申请草稿，项目是星火行政支持平台，要买显示器2台每台1500元，再买打印机1台2500元，总预算5500元。",
+      "rows": [
+        {
+          "budget_amount": "3000.00",
+          "material_name": "显示器",
+          "material_subclass": "WZ_202206060014",
+          "quantity": "2",
+          "unit_price": "1500.00"
+        },
+        {
+          "budget_amount": "2500.00",
+          "material_name": "打印机",
+          "material_subclass": "WZ_202206060015",
+          "quantity": "1",
+          "unit_price": "2500.00"
+        }
+      ],
+      "source_sha256": [
+        "51a79de3f12b24aec0bd1166f7b365d5ae2fa4a59156df18246b93b579d44fb7"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "5500.00"
+    },
+    {
+      "material_category": "WZLB-201812270001",
+      "memory_id": "6ee6cb68b575500355c5",
+      "project": {
+        "project_code": "E-260100005",
+        "project_name": "渠道宣传印刷推广项目",
+        "wbs_code": "E-260100005.03"
+      },
+      "project_aliases": [
+        "渠道宣传",
+        "渠道宣传印刷推广项目",
+        "渠道运营"
+      ],
+      "project_search_queries": [
+        "渠道宣传"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "帮我先存一个渠道活动现场易拉宝和展架物料草稿，项目是渠道宣传印刷推广项目，总预算1.2万元。",
+      "rows": [
+        {
+          "budget_amount": "12000.00",
+          "material_name": "易拉宝与展架",
+          "material_subclass": "WZ_202206060025",
+          "quantity": "1",
+          "unit_price": "12000.00"
+        }
+      ],
+      "source_sha256": [
+        "40e34cb9fa5b5f17242c25297445a350b515f7a14a964b8009913001bc6d2f0d"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "12000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "75f7f085c0a34f6805de",
+      "project": {
+        "project_code": "L-260200003",
+        "project_name": "终端兼容性专项测试项目",
+        "wbs_code": "L-260200003.03"
+      },
+      "project_aliases": [
+        "测试保障",
+        "终端兼容性",
+        "终端兼容性专项测试项目"
+      ],
+      "project_search_queries": [
+        "终端兼容性"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "终端兼容性专项测试项目需要2台安卓验收机，总预算1.5万，直接提掉。",
+      "rows": [
+        {
+          "budget_amount": "15000.00",
+          "material_name": "安卓验收机",
+          "material_subclass": "WZ_202206060019",
+          "quantity": "2",
+          "unit_price": "7500.00"
+        }
+      ],
+      "source_sha256": [
+        "234237d419db233607024c9b8c286ee2d130db11df49fe2e1ea5b180d403aec4"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "15000.00"
+    },
+    {
+      "material_category": "WZLB-201911250001",
+      "memory_id": "7708145a63099f402574",
+      "project": {
+        "project_code": "F-260100006",
+        "project_name": "智能服务外包交付项目",
+        "wbs_code": "F-260100006.03"
+      },
+      "project_aliases": [
+        "交付运营",
+        "外包交付",
+        "智能服务外包交付项目"
+      ],
+      "project_search_queries": [
+        "外包交付"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我提交外包服务费用，项目是交付运营产品发布会，软硬件检测1项22000元，咨询服务1项8000元，总预算3万元。",
+      "rows": [
+        {
+          "budget_amount": "22000.00",
+          "material_name": "软硬件检测",
+          "material_subclass": "WZ_202206200002",
+          "quantity": "1",
+          "unit_price": "22000.00"
+        },
+        {
+          "budget_amount": "8000.00",
+          "material_name": "咨询服务",
+          "material_subclass": "WZ_202206200010",
+          "quantity": "1",
+          "unit_price": "8000.00"
+        }
+      ],
+      "source_sha256": [
+        "ceb9a3e5bd817604d1eea84c28a53816091ccc01786a12c52e7c7ba52ae6220b"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "30000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "77ecb2ea7315fb28c1eb",
+      "project": {
+        "project_code": "B-260100002",
+        "project_name": "城市服务大模型发布活动项目",
+        "wbs_code": "B-260100002.03"
+      },
+      "project_aliases": [
+        "城市服务大模型",
+        "城市服务大模型发布活动项目",
+        "城市解决方案"
+      ],
+      "project_search_queries": [
+        "城市服务大模型"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "帮我找个离工位近的合肥 A4 会议室，明天下午 2 点到 3 点开项目复盘。再把发布活动项目的品牌广告费用两条明细提交掉。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "2",
+          "unit_price": "15000.00"
+        },
+        {
+          "budget_amount": "40000.00",
+          "material_name": "活动、展会、发布会",
+          "material_subclass": "WZ_202210110012",
+          "quantity": "1",
+          "unit_price": "40000.00"
+        }
+      ],
+      "source_sha256": [
+        "511937043d70a8b2c738856309791a51e7ba1f353ea869765eb9910689727c5f"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "70000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "8543f71ed18766b662bd",
+      "project": {
+        "project_code": "K-260200002",
+        "project_name": "区域营销联合路演项目",
+        "wbs_code": "K-260200002.03"
+      },
+      "project_aliases": [
+        "区域营销",
+        "区域营销联合路演项目",
+        "联合路演"
+      ],
+      "project_search_queries": [
+        "联合路演"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "帮我把区域联合路演项目里的采访短片和会场执行一起提掉：短片1.8万，会场执行3.2万，直接提交。",
+      "rows": [
+        {
+          "budget_amount": "18000.00",
+          "material_name": "嘉宾采访短片",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "1",
+          "unit_price": "18000.00"
+        },
+        {
+          "budget_amount": "32000.00",
+          "material_name": "路演会场执行",
+          "material_subclass": "WZ_202210110012",
+          "quantity": "1",
+          "unit_price": "32000.00"
+        }
+      ],
+      "source_sha256": [
+        "dbf2df9dc8e0dacf21975cb842415f38956ef85855ee4a9f9175b5bace341d3f"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "50000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "8f925087c03e92a76a9c",
+      "project": {
+        "project_code": "D-260100004",
+        "project_name": "终端测试环境建设项目",
+        "wbs_code": "D-260100004.03"
+      },
+      "project_aliases": [
+        "终端测试环境建设项目",
+        "质量工程"
+      ],
+      "project_search_queries": [],
+      "request_shape": "explicit_complete",
+      "request_text": "按项目编码 D-260100004 帮我提交测试手机采购申请，预算4500元。",
+      "rows": [
+        {
+          "budget_amount": "4500.00",
+          "material_name": "测试手机",
+          "material_subclass": "WZ_202206060019",
+          "quantity": "1",
+          "unit_price": "4500.00"
+        }
+      ],
+      "source_sha256": [
+        "510badba1a13c6de82998de1ca406df7801a5c5ae79f116db22731deb0ee2520"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "4500.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "92ca2dc9458d9fb915a9",
+      "project": {
+        "project_code": "B-260100002",
+        "project_name": "城市服务大模型发布活动项目",
+        "wbs_code": "B-260100002.03"
+      },
+      "project_aliases": [
+        "城市服务大模型",
+        "城市服务大模型发布活动项目",
+        "城市解决方案"
+      ],
+      "project_search_queries": [
+        "城市服务大模型"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "我下周二下午2点到3点在A1园区有个项目复盘会，后面没冲突就延长半小时，有冲突就别动原会议。另外把城市服务大模型发布活动项目的品牌广告服务费用先存个草稿，总预算5万元。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "1",
+          "unit_price": "30000.00"
+        },
+        {
+          "budget_amount": "20000.00",
+          "material_name": "活动、展会、发布会",
+          "material_subclass": "WZ_202210110012",
+          "quantity": "1",
+          "unit_price": "20000.00"
+        }
+      ],
+      "source_sha256": [
+        "160d9620a0d1079b07f872b4d1200594054fbc8314ed383e65a5c74690da3c70"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "50000.00"
+    },
+    {
+      "material_category": "WZLB-201911250001",
+      "memory_id": "93fd938a87335683b9d1",
+      "project": {
+        "project_code": "F-260100006",
+        "project_name": "智能服务外包交付项目",
+        "wbs_code": "F-260100006.03"
+      },
+      "project_aliases": [
+        "交付运营",
+        "外包交付",
+        "智能服务外包交付项目"
+      ],
+      "project_search_queries": [
+        "外包交付"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我提交外包服务费用申请，项目是交付运营产品发布会，需要做一项软硬件检测服务，预算22000元。",
+      "rows": [
+        {
+          "budget_amount": "22000.00",
+          "material_name": "软硬件检测服务",
+          "material_subclass": "WZ_202206200002",
+          "quantity": "1",
+          "unit_price": "22000.00"
+        }
+      ],
+      "source_sha256": [
+        "13ec394a0ff6f3dc07526d13a4f4fdb0c37bd18c94619fe2a9a224325df29244"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "22000.00"
+    },
+    {
+      "material_category": "WZLB-201812260001",
+      "memory_id": "985f1dfa4777dc19f31f",
+      "project": {
+        "project_code": "P-260100002",
+        "project_name": "星火平台",
+        "wbs_code": "P-260100002.03"
+      },
+      "project_aliases": [
+        "AI研发",
+        "星火平台"
+      ],
+      "project_search_queries": [
+        "星火平台"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "订明天上午会议室，另外帮我提交办公设备申请，要2台显示器每台1500，1个扩展坞800，项目是星火平台。",
+      "rows": [
+        {
+          "budget_amount": "3000.00",
+          "material_name": "显示器",
+          "material_subclass": "WZ_201812260001",
+          "quantity": "2",
+          "unit_price": "1500.00"
+        },
+        {
+          "budget_amount": "800.00",
+          "material_name": "扩展坞",
+          "material_subclass": "WZ_201812260002",
+          "quantity": "1",
+          "unit_price": "800.00"
+        }
+      ],
+      "source_sha256": [
+        "ad4160286ab6ce7f3f093be1f7381c401d4d55aedc974e41a4de26e84e0de6c0"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "3800.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "9eca3dd99f493f0e0b95",
+      "project": {
+        "project_code": "R-260200018",
+        "project_name": "城市展厅互动设备项目",
+        "wbs_code": "R-260200018.03"
+      },
+      "project_aliases": [
+        "城市展厅互动",
+        "城市展厅互动设备项目",
+        "展陈运营"
+      ],
+      "project_search_queries": [
+        "城市展厅互动"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我给城市展厅互动项目存一个触控一体机采购草稿，预算1.4万。",
+      "rows": [
+        {
+          "budget_amount": "14000.00",
+          "material_name": "触控一体机",
+          "material_subclass": "WZ_202206060014",
+          "quantity": "1",
+          "unit_price": "14000.00"
+        }
+      ],
+      "source_sha256": [
+        "d62834bd0cdf0f7906dd2bea58eb2485bfdc95c1b4940c86197a3ef4d7cca1c0"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "14000.00"
+    },
+    {
+      "material_category": "WZLB-202001150001",
+      "memory_id": "a498d704e148000d34f2",
+      "project": {
+        "project_code": "P-260100001",
+        "project_name": "数字员工平台",
+        "wbs_code": "P-260100001.03"
+      },
+      "project_aliases": [
+        "AI研发",
+        "数字员工",
+        "数字员工平台"
+      ],
+      "project_search_queries": [
+        "数字员工"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "订明天会议室，再存个品牌广告费用草稿，项目是数字员工。",
+      "rows": [
+        {
+          "budget_amount": "10000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202001150001",
+          "quantity": "1",
+          "unit_price": "10000.00"
+        }
+      ],
+      "source_sha256": [
+        "fd8774996888166c30372724810b065077c8eac0f2cccb31cfba83bdd6ae4740"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "10000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "a660675091234a3491ab",
+      "project": {
+        "project_code": "B-260100002",
+        "project_name": "城市服务大模型发布活动项目",
+        "wbs_code": "B-260100002.03"
+      },
+      "project_aliases": [
+        "城市服务大模型",
+        "城市服务大模型发布活动项目",
+        "城市解决方案"
+      ],
+      "project_search_queries": [
+        "城市服务大模型"
+      ],
+      "request_shape": "explicit_partial",
+      "request_text": "我需要申请品牌广告服务费用，项目还是城市解决方案产品发布会。视频制作2条，每条1.5万元；活动、展会、发布会1场4万元，总预算7万元，帮我提交。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "2",
+          "unit_price": "15000.00"
+        },
+        {
+          "budget_amount": "40000.00",
+          "material_name": "活动、展会、发布会",
+          "material_subclass": "WZ_202210110012",
+          "quantity": "1",
+          "unit_price": "40000.00"
+        }
+      ],
+      "source_sha256": [
+        "8c2433fcfa41d17996cb7f71380c39516f5f73221d11b19ebd9536a4177eca1a"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "70000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "a88c03d80c87db775d6f",
+      "project": {
+        "project_code": "J-260200001",
+        "project_name": "智能客服知识库改造项目",
+        "wbs_code": "J-260200001.03"
+      },
+      "project_aliases": [
+        "智能客服",
+        "智能客服知识库改造项目",
+        "知识库改造"
+      ],
+      "project_search_queries": [
+        "知识库改造"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "知识库改造项目要做官网专题图文页面，2.4万，帮我提交。",
+      "rows": [
+        {
+          "budget_amount": "24000.00",
+          "material_name": "官网专题图文页面",
+          "material_subclass": "WZ_202210110008",
+          "quantity": "1",
+          "unit_price": "24000.00"
+        }
+      ],
+      "source_sha256": [
+        "5ac9478b51c7bc269c505386ecef4bcbf2089bfcc700133c7770236aed795fb2"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "24000.00"
+    },
+    {
+      "material_category": "WZLB-202302280001",
+      "memory_id": "af4ef0d3f1b2170ed4c5",
+      "project": {
+        "project_code": "H-260100008",
+        "project_name": "年度活动定制物资项目",
+        "wbs_code": "H-260100008.03"
+      },
+      "project_aliases": [
+        "品牌市场",
+        "年度活动定制",
+        "年度活动定制物资项目"
+      ],
+      "project_search_queries": [
+        "年度活动定制"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "先帮我存一个活动服装物资草稿，项目是年度活动定制物资项目，预算16000元。",
+      "rows": [
+        {
+          "budget_amount": "16000.00",
+          "material_name": "活动服装",
+          "material_subclass": "WZ_202302280002",
+          "quantity": "1",
+          "unit_price": "16000.00"
+        }
+      ],
+      "source_sha256": [
+        "7932c609a06e92b495f49d4bd0ea704c62dcfdeaf89ea3ecf051a1a67041b3e0"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "16000.00"
+    },
+    {
+      "material_category": "WZLB-201911250001",
+      "memory_id": "b465f6c8b2642c50c355",
+      "project": {
+        "project_code": "F-260100006",
+        "project_name": "智能服务外包交付项目",
+        "wbs_code": "F-260100006.03"
+      },
+      "project_aliases": [
+        "交付运营",
+        "智能服务外包交付项目"
+      ],
+      "project_search_queries": [],
+      "request_shape": "explicit_complete",
+      "request_text": "按项目编码 F-260100006 帮我提交一笔云服务费用，预算26000元。",
+      "rows": [
+        {
+          "budget_amount": "26000.00",
+          "material_name": "云服务采购",
+          "material_subclass": "WZ_202206200005",
+          "quantity": "1",
+          "unit_price": "26000.00"
+        }
+      ],
+      "source_sha256": [
+        "6668d0311749adb83fa03a943f3d3d1ecd249df7d55ea905640514c1ebef49df"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "26000.00"
+    },
+    {
+      "material_category": "WZLB-202302280001",
+      "memory_id": "bd5f81d113c0099092ba",
+      "project": {
+        "project_code": "H-260100008",
+        "project_name": "年度活动定制物资项目",
+        "wbs_code": "H-260100008.03"
+      },
+      "project_aliases": [
+        "品牌市场",
+        "年度活动定制",
+        "年度活动定制物资项目"
+      ],
+      "project_search_queries": [
+        "年度活动定制"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我提交定制物资申请，项目是品牌市场产品发布会，要做一批定制促品，预算10000元。",
+      "rows": [
+        {
+          "budget_amount": "10000.00",
+          "material_name": "定制促品",
+          "material_subclass": "WZ_202302280001",
+          "quantity": "1",
+          "unit_price": "10000.00"
+        }
+      ],
+      "source_sha256": [
+        "1037b818522b380fa507b2350c3470435a0f1f29e102c3a355c341e4c87ba802"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "10000.00"
+    },
+    {
+      "material_category": "WZLB-201812270001",
+      "memory_id": "c0bcae4bda7867755fdf",
+      "project": {
+        "project_code": "E-260100005",
+        "project_name": "渠道宣传印刷推广项目",
+        "wbs_code": "E-260100005.03"
+      },
+      "project_aliases": [
+        "渠道宣传印刷",
+        "渠道宣传印刷推广项目",
+        "渠道运营"
+      ],
+      "project_search_queries": [
+        "渠道宣传印刷"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "先存个广宣印刷物资草稿，项目是渠道运营产品发布会，宣传册印刷2批每批4000元，活动喷绘1批6000元，总预算14000元。",
+      "rows": [
+        {
+          "budget_amount": "8000.00",
+          "material_name": "宣传册印刷",
+          "material_subclass": "WZ_202110250002",
+          "quantity": "2",
+          "unit_price": "4000.00"
+        },
+        {
+          "budget_amount": "6000.00",
+          "material_name": "活动喷绘",
+          "material_subclass": "WZ_202206060025",
+          "quantity": "1",
+          "unit_price": "6000.00"
+        }
+      ],
+      "source_sha256": [
+        "ac94eb956dcd0d5d4aee6ef3e45ba9370534bccc419b9a51c1417a3eaab530d9"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "14000.00"
+    },
+    {
+      "material_category": "WZLB-201911250001",
+      "memory_id": "c71d0bb4caf3c210ca90",
+      "project": {
+        "project_code": "F-260100006",
+        "project_name": "智能服务外包交付项目",
+        "wbs_code": "F-260100006.03"
+      },
+      "project_aliases": [
+        "交付运营",
+        "外包交付",
+        "智能服务外包交付项目"
+      ],
+      "project_search_queries": [
+        "外包交付"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "先帮我存一个外包数据服务草稿，项目是交付运营产品发布会，预算30000元，后面我还要确认采购周期。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "数据服务",
+          "material_subclass": "WZ_202506190001",
+          "quantity": "1",
+          "unit_price": "30000.00"
+        }
+      ],
+      "source_sha256": [
+        "5cbaff183942bbdd3bf453e5252724e8ce858811465c3d69e1aa612f6c4150c9"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "30000.00"
+    },
+    {
+      "material_category": "WZLB-202001150001",
+      "memory_id": "d3df480a1286481c4014",
+      "project": {
+        "project_code": "P-260100001",
+        "project_name": "数字员工平台",
+        "wbs_code": "P-260100001.03"
+      },
+      "project_aliases": [
+        "AI研发",
+        "数字员工",
+        "数字员工平台"
+      ],
+      "project_search_queries": [
+        "数字员工"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "订明天会议室，存个品牌广告费用草稿，然后帮我看看待办里有没有。",
+      "rows": [
+        {
+          "budget_amount": "15000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202001150001",
+          "quantity": "1",
+          "unit_price": "15000.00"
+        }
+      ],
+      "source_sha256": [
+        "c24d95ae351036ba34474456a52addd492b86ded18425d8e4bcc6834e3e587d9"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "15000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "d8f54cac75dd7738d844",
+      "project": {
+        "project_code": "D-260100004",
+        "project_name": "终端测试环境建设项目",
+        "wbs_code": "D-260100004.03"
+      },
+      "project_aliases": [
+        "终端测试环境",
+        "终端测试环境建设项目",
+        "质量工程"
+      ],
+      "project_search_queries": [
+        "终端测试环境"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "帮我申请办公设备费用，项目是星火质量工程平台，要买2台显示器，每台1500元，直接提交。",
+      "rows": [
+        {
+          "budget_amount": "3000.00",
+          "material_name": "显示器",
+          "material_subclass": "WZ_202206060014",
+          "quantity": "2",
+          "unit_price": "1500.00"
+        }
+      ],
+      "source_sha256": [
+        "61ef65bf8de2122cf495cecdd0ab5b05cc67b9bec7e3110de1f1eae7b7d6cdd0"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "3000.00"
+    },
+    {
+      "material_category": "WZLB-201812270001",
+      "memory_id": "d95c30a8629243fee806",
+      "project": {
+        "project_code": "T-260200020",
+        "project_name": "渠道布展升级印刷项目",
+        "wbs_code": "T-260200020.03"
+      },
+      "project_aliases": [
+        "布展升级印刷",
+        "渠道布展升级印刷项目",
+        "渠道建设"
+      ],
+      "project_search_queries": [
+        "布展升级印刷"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "渠道布展升级印刷项目要印2000册招商手册，每册6块，直接帮我提交。",
+      "rows": [
+        {
+          "budget_amount": "12000.00",
+          "material_name": "招商手册印刷",
+          "material_subclass": "WZ_202110250002",
+          "quantity": "2000",
+          "unit_price": "6.00"
+        }
+      ],
+      "source_sha256": [
+        "954a4b79e03685bf63b334241ce6f1b957c566cb377bc372ec4e15d04d81a1b7"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "12000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "d9cc12bd93429db78291",
+      "project": {
+        "project_code": "B-260100002",
+        "project_name": "城市服务大模型发布活动项目",
+        "wbs_code": "B-260100002.03"
+      },
+      "project_aliases": [
+        "城市服务大模型",
+        "城市服务大模型发布活动项目",
+        "城市解决方案"
+      ],
+      "project_search_queries": [
+        "城市服务大模型"
+      ],
+      "request_shape": "explicit_partial",
+      "request_text": "帮我订明天下午2点到3点小镇A1四楼10人带屏幕的会议室，订不到就算了。另外我需要提品牌广告服务费用，项目是城市服务大模型发布活动项目：视频2条每条1.5万，发布会1场4万。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "2",
+          "unit_price": "15000.00"
+        },
+        {
+          "budget_amount": "40000.00",
+          "material_name": "活动、展会、发布会",
+          "material_subclass": "WZ_202210110012",
+          "quantity": "1",
+          "unit_price": "40000.00"
+        }
+      ],
+      "source_sha256": [
+        "b88abe3ff683d22dea7a34cc9fae7c560b02a9e8666ab1c998c1132189857f8a"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "70000.00"
+    },
+    {
+      "material_category": "WZLB-201911250001",
+      "memory_id": "e1f703b432aa0fd462b5",
+      "project": {
+        "project_code": "S-260200009",
+        "project_name": "交付巡检与数据治理项目",
+        "wbs_code": "S-260200009.03"
+      },
+      "project_aliases": [
+        "交付巡检与数据治理项目",
+        "交付治理",
+        "数据治理"
+      ],
+      "project_search_queries": [
+        "数据治理"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "交付巡检与数据治理项目先存个草稿：数据整理2.4万，治理咨询0.8万，总计3.2万。",
+      "rows": [
+        {
+          "budget_amount": "24000.00",
+          "material_name": "质量看板数据整理",
+          "material_subclass": "WZ_202506190001",
+          "quantity": "1",
+          "unit_price": "24000.00"
+        },
+        {
+          "budget_amount": "8000.00",
+          "material_name": "治理方案咨询",
+          "material_subclass": "WZ_202206200010",
+          "quantity": "1",
+          "unit_price": "8000.00"
+        }
+      ],
+      "source_sha256": [
+        "ca2e5170142ab457412e2bbca9a88247b34469d8eb15d0a0faccc5808cbaa5fd"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "32000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "e5fbddd1bad7f0e73ba4",
+      "project": {
+        "project_code": "N-260200005",
+        "project_name": "办公场景焕新项目",
+        "wbs_code": "N-260200005.03"
+      },
+      "project_aliases": [
+        "办公场景焕新",
+        "办公场景焕新项目",
+        "行政服务"
+      ],
+      "project_search_queries": [
+        "办公场景焕新"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "办公场景焕新项目这边先存个草稿：27寸显示器2台、扩展坞3个，总预算5300元。",
+      "rows": [
+        {
+          "budget_amount": "3200.00",
+          "material_name": "27寸显示器",
+          "material_subclass": "WZ_202206060014",
+          "quantity": "2",
+          "unit_price": "1600.00"
+        },
+        {
+          "budget_amount": "2100.00",
+          "material_name": "扩展坞",
+          "material_subclass": "WZ_202206060014",
+          "quantity": "3",
+          "unit_price": "700.00"
+        }
+      ],
+      "source_sha256": [
+        "1aca943cd904724a3fd3cb25fcc81f91f6d605eb0efce6dca9f29897cecf3c9b"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "5300.00"
+    },
+    {
+      "material_category": "WZLB-201812270001",
+      "memory_id": "e80e56bd60a8d40cf280",
+      "project": {
+        "project_code": "T-260200020",
+        "project_name": "渠道布展升级印刷项目",
+        "wbs_code": "T-260200020.03"
+      },
+      "project_aliases": [
+        "布展升级印刷",
+        "渠道布展升级印刷项目",
+        "渠道建设"
+      ],
+      "project_search_queries": [
+        "布展升级印刷"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "明天下午帮我订个会议室开渠道物料评审会，再把王敏加进去。顺手把渠道布展升级印刷项目的招商手册印刷费用1.2万提交掉。",
+      "rows": [
+        {
+          "budget_amount": "12000.00",
+          "material_name": "招商手册印刷",
+          "material_subclass": "WZ_202110250002",
+          "quantity": "2000",
+          "unit_price": "6.00"
+        }
+      ],
+      "source_sha256": [
+        "86fda7becf88705462c53bb3352a41e68ee03f8e98cd3bbee4d16e11a77b5ad4"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "12000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "f14f375786661104eb7d",
+      "project": {
+        "project_code": "B-260100002",
+        "project_name": "城市服务大模型发布活动项目",
+        "wbs_code": "B-260100002.03"
+      },
+      "project_aliases": [
+        "城市服务大模型",
+        "城市服务大模型发布活动项目",
+        "城市解决方案"
+      ],
+      "project_search_queries": [
+        "城市服务大模型"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "我明天下午两点有个 A1 的项目复盘会，能延长半小时就延，冲突就别动原会议。另外把城市服务大模型发布活动项目的品牌广告费用先存成草稿，总预算 5 万。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "1",
+          "unit_price": "30000.00"
+        },
+        {
+          "budget_amount": "20000.00",
+          "material_name": "活动、展会、发布会",
+          "material_subclass": "WZ_202210110012",
+          "quantity": "1",
+          "unit_price": "20000.00"
+        }
+      ],
+      "source_sha256": [
+        "4b3cf5127076d5d945e79135e9ca34b2818b6ded836b373664cc4f30def1ec64"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "50000.00"
+    },
+    {
+      "material_category": "WZLB-202206060001",
+      "memory_id": "f4c1375c3306ea273ce6",
+      "project": {
+        "project_code": "L-260200003",
+        "project_name": "终端兼容性专项测试项目",
+        "wbs_code": "L-260200003.03"
+      },
+      "project_aliases": [
+        "测试保障",
+        "终端兼容性",
+        "终端兼容性专项测试项目"
+      ],
+      "project_search_queries": [
+        "终端兼容性"
+      ],
+      "request_shape": "explicit_complete",
+      "request_text": "终端兼容性专项测试项目需要2台安卓验收机，总预算1.5万，直接提交。",
+      "rows": [
+        {
+          "budget_amount": "15000.00",
+          "material_name": "安卓验收机",
+          "material_subclass": "WZ_202206060019",
+          "quantity": "2",
+          "unit_price": "7500.00"
+        }
+      ],
+      "source_sha256": [
+        "e6b204b288e3011c60925d583ae9bda3941e88bd655adbf9b0a9d73ea238bd4e"
+      ],
+      "submit": true,
+      "support_count": 1,
+      "total_amount": "15000.00"
+    },
+    {
+      "material_category": "WZLB-202005120001",
+      "memory_id": "f4d64c3a261432ea5c62",
+      "project": {
+        "project_code": "B-260100002",
+        "project_name": "城市服务大模型发布活动项目",
+        "wbs_code": "B-260100002.03"
+      },
+      "project_aliases": [
+        "城市服务大模型",
+        "城市服务大模型发布活动项目",
+        "城市解决方案"
+      ],
+      "project_search_queries": [
+        "城市服务大模型"
+      ],
+      "request_shape": "generic_package",
+      "request_text": "如果我明天下午2点到3点已经订了项目复盘会，就先尝试延长半小时；后面有冲突就取消原会议并重订新的。顺手把城市服务大模型发布活动项目的费用草稿存一下。",
+      "rows": [
+        {
+          "budget_amount": "30000.00",
+          "material_name": "视频制作",
+          "material_subclass": "WZ_202210110009",
+          "quantity": "1",
+          "unit_price": "30000.00"
+        },
+        {
+          "budget_amount": "20000.00",
+          "material_name": "活动、展会、发布会",
+          "material_subclass": "WZ_202210110012",
+          "quantity": "1",
+          "unit_price": "20000.00"
+        }
+      ],
+      "source_sha256": [
+        "9d3297754b4c1f18733588607c893a29549c60c05b0586e37c77ea4e9ef8d84d"
+      ],
+      "submit": false,
+      "support_count": 1,
+      "total_amount": "50000.00"
+    }
+  ],
+  "provenance": {
+    "cases_path": "contest/train/cases",
+    "cases_sha256": "13f12d3b2733ce3dbdadc7425b390c0ccce6a3c2df8e21357c375a3db470f132",
+    "policy": "train gold only; case identifiers omitted; runtime ids must still be verified by tools",
+    "split": "train"
+  },
+  "schema_version": "expense-examples-v1"
+}

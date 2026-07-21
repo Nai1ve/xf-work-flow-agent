@@ -14,6 +14,7 @@ submission/config.local.json
 contest/source_zips/
 contest/train/
 contest/val/
+contest/*.zip
 tmp/
 
 # Generated analysis and evaluation artifacts.
@@ -21,3 +22,4 @@ reports/
 
 # Local submission packages.
 submission*.zip
+submission/submission/

@@ -17,6 +17,7 @@
     },
     "parallel_read_planner_enabled": true,
     "parallel_reads_enabled": false,
+    "async_read_execution_enabled": false,
     "parallel_read_max_workers": 4,
     "parallel_read_max_batch_size": 6,
     "parallel_read_min_remaining_seconds": 8,
