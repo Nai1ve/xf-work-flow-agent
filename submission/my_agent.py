@@ -422,6 +422,161 @@ class ReadPlan:
         return out
 
 
+class WorkflowSkillRuntime:
+    """Persistent execution state for one project-local workflow skill DAG."""
+
+    TERMINAL_STATUSES = {"completed", "blocked", "skipped"}
+
+    def __init__(self, skill_id: str, definition: dict[str, Any]):
+        self.skill_id = skill_id
+        self.definition = json.loads(json.dumps(definition, ensure_ascii=False, default=str))
+        self.nodes = [item for item in self.definition.get("nodes") or [] if isinstance(item, dict) and item.get("id")]
+        self.statuses = {str(item["id"]): "pending" for item in self.nodes}
+        self.blocked_reason = ""
+        self.transitions: list[dict[str, Any]] = []
+
+    def sync_completed(self, completed_node_ids: set[str]) -> None:
+        for node_id in completed_node_ids:
+            if node_id in self.statuses and self.statuses[node_id] != "completed":
+                previous = self.statuses[node_id]
+                self.statuses[node_id] = "completed"
+                self.transitions.append({"node": node_id, "from": previous, "to": "completed"})
+
+    def mark_running(self, node_id: str) -> None:
+        if self.statuses.get(node_id) == "pending":
+            self.statuses[node_id] = "running"
+            self.transitions.append({"node": node_id, "from": "pending", "to": "running"})
+
+    def mark_blocked(self, reason: str) -> None:
+        self.blocked_reason = reason
+        self.transitions.append({"node": self.next_ready_id(), "to": "blocked", "reason": reason})
+
+    def node(self, node_id: str) -> dict[str, Any] | None:
+        return next((item for item in self.nodes if str(item.get("id")) == node_id), None)
+
+    def is_ready(self, node_id: str) -> bool:
+        node = self.node(node_id)
+        if node is None or self.statuses.get(node_id) in self.TERMINAL_STATUSES:
+            return False
+        return all(self.statuses.get(str(dep)) == "completed" for dep in node.get("depends_on") or [])
+
+    def ready_nodes(self, phases: set[str] | None = None) -> list[dict[str, Any]]:
+        return [
+            node
+            for node in self.nodes
+            if self.is_ready(str(node.get("id"))) and (not phases or str(node.get("phase")) in phases)
+        ]
+
+    def next_ready_id(self) -> str:
+        ready = self.ready_nodes()
+        return str(ready[0].get("id")) if ready else ""
+
+    def remaining_cost(self, phases: set[str] | None = None) -> int:
+        return sum(
+            int(node.get("cost") or 0)
+            for node in self.nodes
+            if self.statuses.get(str(node.get("id"))) not in self.TERMINAL_STATUSES
+            and (not phases or str(node.get("phase")) in phases)
+        )
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "skill_id": self.skill_id,
+            "statuses": dict(self.statuses),
+            "next_ready": [str(item.get("id")) for item in self.ready_nodes()],
+            "remaining_cost": self.remaining_cost(),
+            "blocked_reason": self.blocked_reason,
+            "transition_count": len(self.transitions),
+        }
+
+
+class WorkflowSkillRegistry:
+    def __init__(self, index: dict[str, Any] | None = None):
+        self.index = index or {}
+        self.skills = self.index.get("skills") if isinstance(self.index.get("skills"), dict) else {}
+
+    def definition(self, skill_id: str) -> dict[str, Any]:
+        raw = self.skills.get(skill_id)
+        if not isinstance(raw, dict):
+            return {}
+        definition = json.loads(json.dumps(raw, ensure_ascii=False))
+        parent_id = str(definition.get("extends") or "")
+        if parent_id:
+            parent = self.definition(parent_id)
+            if not parent:
+                return {}
+            replacements = definition.get("replace_nodes") if isinstance(definition.get("replace_nodes"), dict) else {}
+            nodes = []
+            for node in parent.get("nodes") or []:
+                node_id = str(node.get("id") or "") if isinstance(node, dict) else ""
+                nodes.append(json.loads(json.dumps(replacements.get(node_id, node), ensure_ascii=False)))
+            parent.update({key: value for key, value in definition.items() if key not in {"extends", "replace_nodes", "nodes"}})
+            parent["nodes"] = nodes
+            definition = parent
+        return definition
+
+    def select(self, intent: str, submit: bool, replace: bool = False) -> tuple[str, dict[str, Any]]:
+        if intent == "leave" and replace and submit:
+            skill_id = "workflow.leave.replace_submit"
+        elif intent == "leave":
+            skill_id = "workflow.leave.submit" if submit else "workflow.leave.draft"
+        elif intent == "expense_material":
+            skill_id = "workflow.expense.submit" if submit else "workflow.expense.draft"
+        else:
+            return "", {}
+        return skill_id, self.definition(skill_id)
+
+
+class OutcomePolicyMemory:
+    """Deterministic terminal/next-action matcher over verified runtime facts."""
+
+    def __init__(self, index: dict[str, Any] | None = None):
+        self.index = index or {}
+        rules = self.index.get("rules") if isinstance(self.index.get("rules"), list) else []
+        self.rules = sorted(
+            [item for item in rules if isinstance(item, dict)],
+            key=lambda item: (-int(item.get("priority") or 0), str(item.get("id") or "")),
+        )
+
+    def match(self, scope: str, facts: dict[str, Any]) -> dict[str, Any] | None:
+        for rule in self.rules:
+            if str(rule.get("scope") or "") != scope:
+                continue
+            conditions = rule.get("when") if isinstance(rule.get("when"), dict) else {}
+            if all(self._condition_matches(facts.get(key), expected) for key, expected in conditions.items()):
+                return {
+                    "policy_id": str(rule.get("id") or ""),
+                    "decision": str(rule.get("decision") or "terminal"),
+                    "reason": str(rule.get("reason") or ""),
+                    "action": str(rule.get("action") or ""),
+                }
+        return None
+
+    def _condition_matches(self, actual: Any, expected: Any) -> bool:
+        if not isinstance(expected, dict):
+            return actual == expected
+        for operator, target in expected.items():
+            if operator == "eq" and actual != target:
+                return False
+            if operator == "ne" and actual == target:
+                return False
+            if operator == "gt" and not self._compare(actual, target, lambda a, b: a > b):
+                return False
+            if operator == "gte" and not self._compare(actual, target, lambda a, b: a >= b):
+                return False
+            if operator == "lt" and not self._compare(actual, target, lambda a, b: a < b):
+                return False
+            if operator == "in" and actual not in (target if isinstance(target, list) else [target]):
+                return False
+        return True
+
+    def _compare(self, actual: Any, target: Any, comparator: Any) -> bool:
+        try:
+            return bool(comparator(float(actual), float(target)))
+        except Exception:
+            return False
+
+
 class ReadPlanExecutor:
     def __init__(self, agent: Any):
         self.agent = agent
@@ -1151,6 +1306,22 @@ class PreflightGuard:
             return {"passed": True, "reason": "", "errors": [], "warnings": [], "evidence_refs": []}
         if tool == "workflow.save":
             return self._validate_workflow_save(state, args)
+        if tool == "workflow.delete":
+            request_id = str(args.get("request_id") or "")
+            source = state.workflow.evidence.get("replacement_source_lookup") or {}
+            allowed = {
+                str(item.get("request_id") or "")
+                for item in source.get("items") or []
+                if isinstance(item, dict)
+            }
+            errors = [] if request_id and request_id in allowed else ["workflow_delete_not_bound_to_source_lookup"]
+            return {
+                "passed": not errors,
+                "reason": "" if not errors else "workflow_delete_preflight_failed",
+                "errors": errors,
+                "warnings": [],
+                "evidence_refs": ["oa.done.list"] if allowed else [],
+            }
         if tool.startswith("meetingroom."):
             return self._validate_meetingroom_write(state, tool, args)
         return {"passed": True, "reason": "", "errors": [], "warnings": [], "evidence_refs": []}
@@ -1373,6 +1544,7 @@ class RuntimeState:
         self.llm_semantic: dict[str, Any] = {}
         self.task_graph: dict[str, Any] = {"tasks": []}
         self.task_runtimes: list[TaskRuntime] = []
+        self.workflow_skill: WorkflowSkillRuntime | None = None
         self.active_task_ids: dict[str, str] = {}
         self.task_results: list[dict[str, Any]] = []
         # Read scheduling must not let one domain consume steps reserved for
@@ -1410,6 +1582,8 @@ class StaticContextStore:
         self.meetingrooms: dict[str, Any] = {}
         self.capabilities: dict[str, Any] = {}
         self.expense_examples: dict[str, Any] = {}
+        self.workflow_skills: dict[str, Any] = {}
+        self.outcome_policies: dict[str, Any] = {}
         self.cards: dict[str, str] = {}
         if enabled:
             self._load()
@@ -1424,6 +1598,12 @@ class StaticContextStore:
             expense_examples_path = self.base_dir / "expense_examples.index.json"
             if expense_examples_path.is_file():
                 self.expense_examples = self._load_json("expense_examples.index.json")
+            workflow_skills_path = self.base_dir / "workflow_skills.index.json"
+            if workflow_skills_path.is_file():
+                self.workflow_skills = self._load_json("workflow_skills.index.json")
+            outcome_policies_path = self.base_dir / "outcome_policies.index.json"
+            if outcome_policies_path.is_file():
+                self.outcome_policies = self._load_json("outcome_policies.index.json")
             cards_dir = self.base_dir / "prompt_cards"
             for name in [
                 "routing.md",
@@ -1628,6 +1808,8 @@ class MyAgent:
         self.workflow_registry = WorkflowSchemaRegistry(self.static_context.workflows)
         self.meetingroom_index = MeetingroomIndex(self.static_context.meetingrooms)
         self.capability_registry = CapabilityRegistry(self.static_context.capabilities)
+        self.workflow_skill_registry = WorkflowSkillRegistry(self.static_context.workflow_skills)
+        self.outcome_policy_memory = OutcomePolicyMemory(self.static_context.outcome_policies)
         self.task_graph_normalizer = TaskGraphContractNormalizer(self.capability_registry)
         self.tool_adapter = ToolAdapter(self.meetingroom_index)
         self.preflight_guard = PreflightGuard(self.tool_registry, self.workflow_registry, self.meetingroom_index)
@@ -1746,6 +1928,8 @@ class MyAgent:
                     "expense_draft_ir": state.workflow.evidence.get("expense_draft_ir") or {},
                     "expense_line_evidence": state.workflow.evidence.get("expense_line_evidence") or {},
                     "project_resolution": state.workflow.evidence.get("project_resolution") or {},
+                    "workflow_skill": state.workflow_skill.summary() if state.workflow_skill is not None else {},
+                    "outcome_policy_decision": state.workflow.evidence.get("outcome_policy_decision") or {},
                     "non_llm_elapsed_seconds": round(max(0.0, elapsed_seconds - llm_elapsed_seconds), 3),
                     "answer": answer,
                     "history": state.history,
@@ -3170,7 +3354,10 @@ class MyAgent:
             start = "09:00"
         if not end and "上午" in leave_text:
             end = "11:00" if "后天上午" in leave_text or "请假的草稿" in leave_text else "12:00"
-        leave_type_label = self._first_match(leave_text, ["育儿假", "年休假", "年假", "病假", "事假"]) or ("事假" if "私事" in leave_text or "个人" in leave_text else "")
+        leave_type_label = self._target_leave_type_label(leave_text) or self._first_match(
+            leave_text,
+            ["育儿假", "年休假", "年假", "病假", "事假"],
+        ) or ("事假" if "私事" in leave_text or "个人" in leave_text else "")
         reason_label = self._first_match(leave_text, ["住院", "孩子", "私事", "个人事情", "个人事务", "本人有事", "身体不适"]) or leave_type_label
         return {
             "day_text": day_text,
@@ -3485,6 +3672,7 @@ class MyAgent:
             state.workflow.needed = True
         self._normalize_workflow_slots(state)
         self._apply_canonical_semantic_facts(state)
+        self._initialize_workflow_skill(state)
         self._refresh_task_runtime_statuses(state)
         self._initialize_domain_step_budgets(state)
 
@@ -3502,6 +3690,73 @@ class MyAgent:
             if value not in (None, "") and state.semantic_facts.source(path) == "user_literal":
                 self._leave_slots(state)[key] = value
         state.workflow.facts = state.semantic_facts.summary()
+
+    def _initialize_workflow_skill(self, state: RuntimeState) -> None:
+        if not state.workflow.needed or state.workflow.intent not in {"leave", "expense_material"}:
+            state.workflow_skill = None
+            return
+        replace = state.workflow.intent == "leave" and self._is_leave_replace_request(self._leave_query(state))
+        skill_id, definition = self.workflow_skill_registry.select(
+            state.workflow.intent,
+            bool(state.workflow.slots.get("submit")),
+            replace=replace,
+        )
+        if not definition:
+            state.workflow_skill = None
+            return
+        if state.workflow_skill is None or state.workflow_skill.skill_id != skill_id:
+            state.workflow_skill = WorkflowSkillRuntime(skill_id, definition)
+        self._sync_workflow_skill(state)
+
+    def _sync_workflow_skill(self, state: RuntimeState) -> None:
+        skill = state.workflow_skill
+        if skill is None:
+            return
+        wf = state.workflow
+        completed: set[str] = set()
+        if wf.evidence.get("applicant"):
+            completed.add("applicant")
+        if wf.evidence.get("catalog"):
+            completed.add("catalog")
+        if wf.evidence.get("schema"):
+            completed.add("schema")
+        if wf.evidence.get("replacement_source_lookup"):
+            completed.add("source_lookup")
+        if wf.evidence.get("replacement_delete_done"):
+            completed.add("delete_source")
+        if wf.intent == "leave":
+            if self._leave_plan(state):
+                completed.add("leave_form")
+            if wf.evidence.get("approver_search_attempts"):
+                completed.add("approver_search")
+            people = self._select_leave_people(state, self._collected_approver_people(wf))
+            if len(people) == 1:
+                completed.add("approver_resolved")
+            if wf.evidence.get("workflow_skill_draft_ir"):
+                completed.add("draft_ir")
+        elif wf.intent == "expense_material":
+            if wf.evidence.get("verified_project"):
+                completed.add("project")
+            if wf.evidence.get("category_options") and wf.evidence.get("selected_material_category"):
+                completed.add("category")
+            if wf.evidence.get("subclass_options"):
+                completed.add("subclass")
+            if wf.evidence.get("workflow_skill_draft_ir"):
+                completed.add("draft_ir")
+        if wf.evidence.get("save_done"):
+            completed.add("save")
+        if wf.evidence.get("oa_checked"):
+            completed.add("verify")
+        skill.sync_completed(completed)
+
+    def _mark_workflow_skill_action_running(self, state: RuntimeState, tool: str) -> None:
+        skill = state.workflow_skill
+        if skill is None or not (tool.startswith("workflow.") or tool.startswith("oa.") or tool == "user.get_info"):
+            return
+        for node in skill.ready_nodes():
+            if str(node.get("tool") or "") == tool:
+                skill.mark_running(str(node.get("id") or ""))
+                return
 
     def _initialize_task_runtimes(self, state: RuntimeState) -> None:
         state.task_runtimes = [TaskRuntime(task) for task in state.task_graph.get("tasks") or [] if isinstance(task, dict)]
@@ -3717,6 +3972,7 @@ class MyAgent:
                 self._deep_update_non_empty(self._expense_slots(state), self._heuristic_expense(workflow_source))
         self._normalize_workflow_slots(state)
         self._apply_canonical_semantic_facts(state)
+        self._initialize_workflow_skill(state)
 
     def _merge_task_slots_into_domain(self, state: RuntimeState, domain: str) -> None:
         task = self._primary_task(state, domain)
@@ -4106,21 +4362,16 @@ class MyAgent:
         reads = 0
         writes = 0
         if domain == "workflow" and state.workflow.needed and state.workflow.status in {"pending", "ready", "done"}:
-            wf = state.workflow
-            if wf.status != "done":
+            self._sync_workflow_skill(state)
+            if state.workflow_skill is not None:
+                reads = state.workflow_skill.remaining_cost({"read", "postcheck"})
+                writes = state.workflow_skill.remaining_cost({"write"})
+            else:
+                wf = state.workflow
                 reads += int(not bool(wf.evidence.get("applicant")))
                 reads += int(not bool(wf.evidence.get("catalog")))
                 reads += int(not bool(wf.evidence.get("schema")))
-                if wf.intent == "expense_material":
-                    reads += int(not bool(wf.evidence.get("verified_project")))
-                    reads += int(not bool(wf.evidence.get("category_options")))
-                    reads += int(not bool(wf.evidence.get("subclass_options")))
-                elif wf.intent == "leave":
-                    reads += int(not bool(self._collected_approver_people(wf)))
                 writes += int(not bool(wf.evidence.get("save_done")))
-            if (wf.evidence.get("save_done") or writes) and not wf.evidence.get("oa_checked"):
-                oa_tool = "oa.done.list" if wf.slots.get("submit") else "oa.todo.list"
-                reads += int(oa_tool in state.tools)
         elif domain == "meetingroom" and state.meetingroom.needed and state.meetingroom.status in {"pending", "ready"}:
             mr = state.meetingroom
             if mr.intent in {"query_booking", "cancel_existing", "extend_existing", "cancel_rebook_existing", "rebook_larger_existing"}:
@@ -4149,11 +4400,11 @@ class MyAgent:
                 reserve += max(1, len(segments) - len(created))
         wf = state.workflow
         if wf.needed and wf.status in {"pending", "ready"}:
-            if wf.intent in {"leave", "expense_material"} and not wf.evidence.get("save_done"):
+            self._sync_workflow_skill(state)
+            if state.workflow_skill is not None:
+                reserve += state.workflow_skill.remaining_cost({"write", "postcheck"})
+            elif wf.intent in {"leave", "expense_material"} and not wf.evidence.get("save_done"):
                 reserve += 1
-                oa_tool = "oa.done.list" if wf.slots.get("submit") else "oa.todo.list"
-                if oa_tool in state.tools:
-                    reserve += 1
         return reserve
 
     def _build_read_plan(self, state: RuntimeState) -> ReadPlan:
@@ -4211,27 +4462,42 @@ class MyAgent:
             return
         if wf.intent not in {"leave", "expense_material"}:
             return
+        self._sync_workflow_skill(state)
+        skill = state.workflow_skill
+
+        def ready(node_id: str) -> bool:
+            return skill is None or skill.is_ready(node_id)
+
         workflow_id = WORKFLOW_IDS["leave"] if wf.intent == "leave" else WORKFLOW_IDS["expense"]
         catalog_keyword = "请假" if wf.intent == "leave" else "费用类物资"
-        if not wf.evidence.get("applicant"):
+        if not wf.evidence.get("applicant") and ready("applicant"):
             self._append_read_task(state, tasks, "user.get_info", {}, "workflow")
-        if not wf.evidence.get("catalog"):
+        if not wf.evidence.get("catalog") and ready("catalog"):
             self._append_read_task(state, tasks, "workflow.catalog", {"keyword": catalog_keyword}, "workflow")
-        if not wf.evidence.get("schema"):
+        if not wf.evidence.get("schema") and ready("schema"):
             self._append_read_task(state, tasks, "workflow.schema", {"workflow_id": workflow_id}, "workflow")
 
         if wf.intent == "leave":
+            if ready("source_lookup") and not wf.evidence.get("replacement_source_lookup"):
+                self._append_read_task(
+                    state,
+                    tasks,
+                    "oa.done.list",
+                    {"keyword": "请假"},
+                    "workflow",
+                    deadline_min_remaining=5.0,
+                )
             plan = self._leave_plan(state)
-            if plan and not self._collected_approver_people(wf):
-                args = self._next_approver_search_args(state, plan)
+            if plan and not self._collected_approver_people(wf) and ready("approver_search"):
+                args = self._next_approver_search_args(state, plan, mark_attempt=False)
                 if args is not None:
                     self._append_read_task(state, tasks, "workflow.search_person", args, "workflow")
         elif wf.intent == "expense_material":
             expense = self._expense_slots(state)
-            if not wf.evidence.get("verified_project") and not wf.evidence.get("project_candidates"):
+            if ready("project") and not wf.evidence.get("verified_project") and not wf.evidence.get("project_candidates"):
                 if not self._append_project_empty_retry_tasks(state, tasks, expense):
                     self._append_project_search_fanout_tasks(state, tasks, expense)
-            if not wf.evidence.get("category_options"):
+            if ready("category") and not wf.evidence.get("category_options"):
                 field_id = self._expense_category_field_id(state)
                 if field_id:
                     self._append_read_task(
@@ -4241,7 +4507,8 @@ class MyAgent:
                         {"workflow_id": WORKFLOW_IDS["expense"], "field_id": field_id},
                         "workflow",
                     )
-            self._append_expense_subclass_read_task(state, tasks)
+            if ready("subclass"):
+                self._append_expense_subclass_read_task(state, tasks)
 
         if self._workflow_needs_oa_check(state) and self._remaining_seconds(state) > 6.0:
             action = self._next_oa_action(state, self._oa_keyword_for_workflow(state))
@@ -4996,11 +5263,14 @@ class MyAgent:
         if "room_candidates" in mr.evidence:
             return
         tried_args = [item.get("args") for item in mr.evidence.get("tried_room_lists", [])]
+        single_workspace_query = bool(mr.slots.get("needs_workspace") and mr.evidence.get("workspace"))
         for day in self._room_search_days(state):
             for candidate in self._room_search_candidates(state):
                 args = self._room_list_args_for_candidate(state, candidate, day=day or None)
                 if args and args not in tried_args:
                     self._append_read_task(state, tasks, "meetingroom.room.list", args, "meetingroom")
+                    if single_workspace_query and len(tasks) > before_count:
+                        return
         if len(tasks) == before_count:
             args = self._next_room_list_args(state)
             if args is not None:
@@ -5246,6 +5516,11 @@ class MyAgent:
 
     def _workflow_write_likely_ready(self, state: RuntimeState) -> bool:
         wf = state.workflow
+        self._sync_workflow_skill(state)
+        if state.workflow_skill is not None:
+            ready = state.workflow_skill.ready_nodes({"compute", "write", "postcheck"})
+            if any(str(node.get("id") or "") in {"draft_ir", "delete_source", "save", "verify"} for node in ready):
+                return True
         if wf.evidence.get("save_done"):
             return bool(self._workflow_needs_oa_check(state))
         if wf.intent == "leave":
@@ -5588,11 +5863,29 @@ class MyAgent:
 
     def _next_workflow_action(self, state: RuntimeState) -> StepAction | None:
         wf = state.workflow
+        self._sync_workflow_skill(state)
         if wf.intent == "leave":
+            if state.workflow_skill and state.workflow_skill.skill_id == "workflow.leave.replace_submit":
+                replacement_action = self._next_leave_replace_action(state)
+                if replacement_action is not None:
+                    return replacement_action
             return self._next_leave_action(state)
         if wf.intent == "expense_material":
             return self._next_expense_action(state)
         return self._block_workflow(state, "missing_required_info")
+
+    def _next_leave_replace_action(self, state: RuntimeState) -> StepAction | None:
+        wf = state.workflow
+        if not wf.evidence.get("applicant"):
+            return StepAction("tool", "user.get_info", {})
+        if not wf.evidence.get("replacement_source_lookup"):
+            return StepAction("tool", "oa.done.list", {"keyword": "请假"})
+        source = self._replacement_leave_source_item(state)
+        if not source:
+            return self._block_workflow(state, "existing_workflow_not_found")
+        if not wf.evidence.get("replacement_delete_done"):
+            return StepAction("tool", "workflow.delete", {"request_id": source.get("request_id")})
+        return None
 
     def _next_leave_action(self, state: RuntimeState) -> StepAction | None:
         wf = state.workflow
@@ -5621,9 +5914,15 @@ class MyAgent:
         if wf.evidence.get("save_done"):
             next_plan = self._next_recurring_leave_plan(state)
             if next_plan:
-                return StepAction("tool", "workflow.save", self._leave_save_args(state, next_plan, people[0]))
+                save_args = self._leave_save_args(state, next_plan, people[0])
+                wf.evidence["workflow_skill_draft_ir"] = {"workflow_id": WORKFLOW_IDS["leave"], "submit": save_args.get("submit")}
+                self._sync_workflow_skill(state)
+                return StepAction("tool", "workflow.save", save_args)
             return self._next_oa_action(state, "请假")
-        return StepAction("tool", "workflow.save", self._leave_save_args(state, plan, people[0]))
+        save_args = self._leave_save_args(state, plan, people[0])
+        wf.evidence["workflow_skill_draft_ir"] = {"workflow_id": WORKFLOW_IDS["leave"], "submit": save_args.get("submit")}
+        self._sync_workflow_skill(state)
+        return StepAction("tool", "workflow.save", save_args)
 
     def _next_expense_action(self, state: RuntimeState) -> StepAction | None:
         wf = state.workflow
@@ -5737,6 +6036,12 @@ class MyAgent:
         save_args_or_reason = self._expense_ir_save_args_or_block(state, projects[0], category)
         if isinstance(save_args_or_reason, str):
             return self._block_workflow(state, save_args_or_reason)
+        wf.evidence["workflow_skill_draft_ir"] = {
+            "workflow_id": WORKFLOW_IDS["expense"],
+            "submit": save_args_or_reason.get("submit"),
+            "total_amount": ((save_args_or_reason.get("data") or {}).get("total_amount")),
+        }
+        self._sync_workflow_skill(state)
         return StepAction("tool", "workflow.save", save_args_or_reason)
 
     def _next_oa_action(self, state: RuntimeState, keyword: str) -> StepAction | None:
@@ -5813,6 +6118,7 @@ class MyAgent:
             self._debug_log(llm_config, {"event": "invalid_action", **record})
             return
         args = self.tool_adapter.adapt(action.tool, self._clean_args(action.args))
+        self._mark_workflow_skill_action_running(state, action.tool)
         validation = self.tool_registry.validate_call(action.tool, args, state.tools)
         if validation.get("errors") or validation.get("warnings") or validation.get("missing_required"):
             self._debug_log(
@@ -6149,6 +6455,13 @@ class MyAgent:
 
     def _apply_workflow_tool_result(self, state: RuntimeState, tool: str, args: dict[str, Any], result: dict[str, Any]) -> None:
         wf = state.workflow
+        if tool == "workflow.search_person":
+            tried = wf.evidence.setdefault("approver_search_tried", [])
+            if args not in tried:
+                tried.append(dict(args))
+            wf.evidence.setdefault("approver_search_attempts", []).append(
+                {"args": dict(args), "error": str(result.get("error") or "")}
+            )
         if tool == "workflow.project_search":
             keyword = str(args.get("project_name") or "").strip()
             if keyword:
@@ -6255,6 +6568,9 @@ class MyAgent:
             else:
                 wf.evidence.setdefault("subclass_lookup_failures", []).append({"args": args, "result": result})
                 self._reject_expense_category_after_subclass_failure(state, args, "empty_options")
+        elif tool == "workflow.delete" and result.get("deleted"):
+            wf.evidence["replacement_delete_done"] = {"args": dict(args), "result": result}
+            wf.evidence.pop("oa_checked", None)
         elif tool == "workflow.save" and result.get("draft_saved"):
             wf.evidence["save_done"] = {"args": args, "result": result}
             if args.get("workflow_id") == WORKFLOW_IDS["leave"]:
@@ -6272,23 +6588,45 @@ class MyAgent:
                 result_for_answer["_saved_leave_requests"] = wf.evidence.get("saved_leave_requests") or []
             wf.result = self._workflow_result_from_save(args, result_for_answer)
         elif tool in {"oa.done.list", "oa.todo.list"}:
-            wf.evidence["oa_checked"] = result
+            if (
+                tool == "oa.done.list"
+                and state.workflow_skill is not None
+                and state.workflow_skill.skill_id == "workflow.leave.replace_submit"
+                and not wf.evidence.get("replacement_delete_done")
+            ):
+                wf.evidence["replacement_source_lookup"] = result
+            else:
+                wf.evidence["oa_checked"] = result
+        self._sync_workflow_skill(state)
 
     def _close_pending_domains(self, state: RuntimeState) -> None:
         if state.meetingroom.needed and state.meetingroom.status in {"pending", "ready"}:
             state.meetingroom.status = "blocked"
-            state.meetingroom.blocked_reason = state.meetingroom.blocked_reason or "missing_required_info"
+            decision = self._outcome_policy_decision(state, "meetingroom")
+            if decision:
+                state.meetingroom.evidence["outcome_policy_decision"] = decision
+            policy_reason = str((decision or {}).get("reason") or "") if (decision or {}).get("decision") == "terminal" else ""
+            state.meetingroom.blocked_reason = state.meetingroom.blocked_reason or policy_reason or "missing_required_info"
             state.meetingroom.result = {"status": "blocked", "reason": state.meetingroom.blocked_reason}
         if state.workflow.needed and state.workflow.status in {"pending", "ready"}:
             state.workflow.status = "blocked"
-            state.workflow.blocked_reason = state.workflow.blocked_reason or self._workflow_pending_block_reason(state)
+            decision = self._outcome_policy_decision(state, "workflow")
+            if decision:
+                state.workflow.evidence["outcome_policy_decision"] = decision
+            policy_reason = str((decision or {}).get("reason") or "") if (decision or {}).get("decision") == "terminal" else ""
+            state.workflow.blocked_reason = state.workflow.blocked_reason or policy_reason or self._workflow_pending_block_reason(state)
             state.workflow.result = {"status": "blocked", "reason": state.workflow.blocked_reason}
+            if state.workflow_skill is not None:
+                state.workflow_skill.mark_blocked(state.workflow.blocked_reason)
         for runtime in state.task_runtimes:
             if runtime.status not in TaskRuntime.TERMINAL_STATUSES:
                 runtime.status = "blocked"
                 runtime.blocked_reason = runtime.blocked_reason or "execution_incomplete"
 
     def _workflow_pending_block_reason(self, state: RuntimeState) -> str:
+        decision = self._outcome_policy_decision(state, "workflow")
+        if decision and decision.get("decision") == "terminal" and decision.get("reason"):
+            return str(decision["reason"])
         wf = state.workflow
         if wf.intent == "expense_material":
             if wf.evidence.get("subclass_options") and not wf.evidence.get("save_done"):
@@ -6296,6 +6634,53 @@ class MyAgent:
             if wf.evidence.get("project_search_history") and not wf.evidence.get("verified_project"):
                 return "ambiguous_project"
         return "missing_required_info"
+
+    def _outcome_policy_decision(self, state: RuntimeState, domain: str) -> dict[str, Any] | None:
+        if domain == "workflow":
+            wf = state.workflow
+            if wf.intent == "leave":
+                leave = self._leave_slots(state)
+                people = self._select_leave_people(state, self._collected_approver_people(wf))
+                facts = {
+                    "approver_hint_present": bool(
+                        leave.get("approver_keyword")
+                        or leave.get("approver_name_hint")
+                        or leave.get("approver_title")
+                        or leave.get("approver_title_hint")
+                    ),
+                    "approver_search_completed": bool(wf.evidence.get("approver_search_attempts")),
+                    "approver_candidate_count": len(people),
+                }
+                return self.outcome_policy_memory.match("workflow.leave", facts)
+            if wf.intent == "expense_material":
+                expense = self._expense_slots(state)
+                options = (wf.evidence.get("subclass_options") or {}).get("options") or []
+                project_registry = (wf.evidence.get("project_resolution") or {}).get("candidate_registry") or {}
+                request_shape = self._expense_request_shape(state, expense, options)
+                facts = {
+                    "subclass_query_completed": bool(wf.evidence.get("subclass_options") or wf.evidence.get("subclass_lookup_failures")),
+                    "specific_material_evidence": self._has_specific_material_evidence(expense),
+                    "save_completed": bool(wf.evidence.get("save_done")),
+                    "explicit_multi_item_total_only": request_shape == "explicit_multi_unallocated",
+                    "project_query_completed": bool(wf.evidence.get("project_search_history")),
+                    "project_resolved": bool(wf.evidence.get("verified_project")),
+                    "project_candidate_count": len(project_registry),
+                }
+                return self.outcome_policy_memory.match("workflow.expense_material", facts)
+            return None
+        if domain == "meetingroom":
+            mr = state.meetingroom
+            rooms = (mr.evidence.get("room_candidates") or {}).get("rooms") or []
+            start = str(mr.slots.get("start") or "")
+            end = str(mr.slots.get("end") or "")
+            bookable = [room for room in rooms if isinstance(room, dict) and self._room_is_legal_for_window(room, mr, start, end)]
+            facts = {
+                "room_query_completed": "room_candidates" in mr.evidence,
+                "bookable_room_count": len(bookable),
+                "booking_completed": bool(mr.evidence.get("create_done")),
+            }
+            return self.outcome_policy_memory.match("meetingroom", facts)
+        return None
 
     # ------------------------------------------------------------------
     # Meetingroom helpers
@@ -6543,10 +6928,10 @@ class MyAgent:
         if slots.get("needs_workspace") and mr.evidence.get("workspace"):
             workspace_address = str((mr.evidence.get("workspace") or {}).get("office_address") or "")
             if workspace_address:
-                add("office_address", workspace_address)
                 building_address = self._building_address(workspace_address)
                 if building_address and building_address != workspace_address:
                     add("office_address", building_address)
+                add("office_address", workspace_address)
 
         prefer_address = bool(slots.get("office_address_candidates")) and (
             str(slots.get("fallback_policy") or "") == "block_if_unavailable"
@@ -7279,6 +7664,31 @@ class MyAgent:
     # Workflow helpers
     # ------------------------------------------------------------------
 
+    def _is_leave_replace_request(self, query: str) -> bool:
+        text = str(query or "")
+        leave_types = [item for item in ["育儿假", "年休假", "年假", "病假", "事假"] if item in text]
+        return bool(
+            len(set(leave_types)) >= 2
+            and any(word in text for word in ["改成", "改为", "换成", "换为", "转成", "转为"])
+            and any(word in text for word in ["昨天", "已经", "之前", "原来", "原先", "请了", "提交过"])
+        )
+
+    def _target_leave_type_label(self, query: str) -> str:
+        match = re.search(
+            r"(?:改成|改为|换成|换为|转成|转为)[^，。；;]{0,10}?(育儿假|年休假|年假|病假|事假)",
+            str(query or ""),
+        )
+        return match.group(1) if match else ""
+
+    def _replacement_leave_source_item(self, state: RuntimeState) -> dict[str, Any] | None:
+        source = state.workflow.evidence.get("replacement_source_lookup") or {}
+        items = [
+            item
+            for item in source.get("items") or []
+            if isinstance(item, dict) and int(item.get("workflow_id") or 0) == WORKFLOW_IDS["leave"] and item.get("request_id")
+        ]
+        return items[0] if items else None
+
     def _normalize_workflow_slots(self, state: RuntimeState) -> None:
         wf = state.workflow
         query = self._full_query(state.obs)
@@ -7295,6 +7705,9 @@ class MyAgent:
         if wf.intent == "leave":
             self._normalize_approver_hints(self._leave_slots(state))
             leave = self._leave_slots(state)
+            target_leave_type = self._target_leave_type_label(self._leave_query(state))
+            if target_leave_type:
+                leave["leave_type_label"] = target_leave_type
             if not leave.get("leave_type_label"):
                 leave["leave_type_label"] = "事假"
             if not leave.get("reason_label"):
@@ -7503,7 +7916,13 @@ class MyAgent:
         }
         return {"workflow_id": WORKFLOW_IDS["leave"], "submit": bool(state.workflow.slots.get("submit")), "data": data}
 
-    def _next_approver_search_args(self, state: RuntimeState, plan: dict[str, Any]) -> dict[str, Any] | None:
+    def _next_approver_search_args(
+        self,
+        state: RuntimeState,
+        plan: dict[str, Any],
+        *,
+        mark_attempt: bool = False,
+    ) -> dict[str, Any] | None:
         tried = state.workflow.evidence.setdefault("approver_search_tried", [])
         leave = self._leave_slots(state)
         raw_keyword = self._clean_approver_phrase(plan.get("approver_employee_no") or plan.get("approver_keyword") or "")
@@ -7537,7 +7956,8 @@ class MyAgent:
             add("", "经理")
         for args in candidates:
             if args not in tried:
-                tried.append(args)
+                if mark_attempt:
+                    tried.append(args)
                 return args
         return None
 
@@ -7720,7 +8140,14 @@ class MyAgent:
                 if len(normalized) < 4:
                     continue
                 if normalized in source:
-                    best_alias_score = max(best_alias_score, 0.8 + min(len(normalized), 16) * 0.01)
+                    coverage = min(1.0, len(normalized) / max(1, len(explicit))) if explicit else 0.0
+                    specificity_bonus = coverage * 0.08
+                    if explicit and normalized == explicit:
+                        specificity_bonus += 0.04
+                    best_alias_score = max(
+                        best_alias_score,
+                        0.8 + min(len(normalized), 16) * 0.01 + specificity_bonus,
+                    )
                 elif explicit and (normalized in explicit or explicit in normalized):
                     best_alias_score = max(best_alias_score, 0.72 + min(len(normalized), 16) * 0.01)
             if best_alias_score <= 0:
@@ -8663,6 +9090,8 @@ class MyAgent:
             memory_ir = self._expense_memory_draft_ir(state, project, category, self._money(total) if total not in (None, "") else "")
             if isinstance(memory_ir, ExpenseDraftIR):
                 return self._expense_ir_to_save_args(state, project, category, memory_ir)
+            state.ledger.record_expense_translation(source="program", decision="rejected", reason="ambiguous_material_subclass")
+            return "ambiguous_material_subclass"
         if total in (None, ""):
             state.ledger.record_expense_translation(source="program", decision="rejected", reason="missing_user_literal_total")
             return "missing_required_info"
@@ -8905,7 +9334,11 @@ class MyAgent:
         items = self._clean_explicit_expense_items(expense.get("items") or [])
         if self._has_unallocated_multi_material_budget(expense, options):
             return "explicit_multi_unallocated"
-        if items and all(self._is_expense_memory_generic_name(item.get("name"), expense) for item in items):
+        if (
+            items
+            and all(self._is_expense_memory_generic_name(item.get("name"), expense) for item in items)
+            and not all(self._has_unique_literal_subclass_match(item.get("name"), options) for item in items)
+        ):
             return "business_package"
         if len(items) > 1:
             if any(not item.get("budget_amount") for item in items):
@@ -10172,23 +10605,55 @@ class MyAgent:
     def _is_generic_material_item_hint(self, item_hint: Any, expense: dict[str, Any], options: list[dict[str, Any]]) -> bool:
         if len(options) <= 1:
             return False
-        hint = self._normalize_option_text(item_hint)
+        raw_hint = str(item_hint or "")
+        hint = self._normalize_option_text(raw_hint)
         if not hint:
             return False
+        if self._has_unique_literal_subclass_match(hint, options):
+            return False
+        project_name = self._normalize_option_text(expense.get("project_name") or "")
+        if project_name and hint.startswith(project_name):
+            hint = hint[len(project_name) :]
+        hint = re.sub(r"^项目", "", hint)
+        hint = re.sub(r"^(?:需要|计划|准备|想要|要)?(?:走一笔|购买|采购|买|补充|补|申请|提交|提)?", "", hint)
+        hint = re.sub(r"^(?:一批|一些|若干|部分|几件|几套|一笔)", "", hint)
+        hint = re.sub(r"(?:费用|费|申请|采购)$", "", hint)
         category_hint = self._normalize_option_text(expense.get("material_category_hint") or "")
         subclass_hint = self._normalize_option_text(expense.get("material_subclass_hint") or "")
         if subclass_hint and subclass_hint != category_hint and subclass_hint != hint:
             return False
         labels = [self._normalize_option_text(opt.get("label") or opt.get("name") or "") for opt in options]
-        direct_matches = [label for label in labels if label and (hint == label or hint in label or label in hint)]
-        if len(direct_matches) == 1 and len(direct_matches[0]) > len(hint):
-            return False
         if category_hint and (hint == category_hint or hint in category_hint or category_hint in hint):
+            return True
+        if re.search(r"一批|一些|若干|一笔|部分|各类|相关", raw_hint):
             return True
         generic_terms = {"物资", "用品", "设备", "服务", "采购", "费用"}
         if hint in generic_terms:
             return True
         return len(hint) <= 4 and any(term in hint for term in generic_terms)
+
+    def _has_unique_literal_subclass_match(self, item_hint: Any, options: list[dict[str, Any]]) -> bool:
+        """Require a unique user-visible subclass term, not a fuzzy noun overlap."""
+        hint = self._normalize_option_text(item_hint)
+        if not hint:
+            return False
+        matches = 0
+        for option in options:
+            raw_label = str(option.get("label") or option.get("name") or "")
+            label = self._normalize_option_text(raw_label)
+            if not label:
+                continue
+            terms = []
+            for chunk in re.findall(r"[\u4e00-\u9fa5A-Za-z0-9]+", raw_label):
+                terms.extend(re.split(r"及其|以及|包含|含", chunk))
+            normalized_terms = {
+                self._normalize_option_text(term)
+                for term in terms
+                if len(self._normalize_option_text(term)) >= 2
+            }
+            if hint == label or label in hint or any(term == hint or term in hint for term in normalized_terms):
+                matches += 1
+        return matches == 1
 
     def _infer_single_item_from_specific_hint(self, expense: dict[str, Any], options: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return []
@@ -10900,12 +11365,29 @@ class MyAgent:
         return "oa.todo.list" in state.tools
 
     def _block_meetingroom(self, state: RuntimeState, reason: str, order_id: str | None = None) -> StepAction:
+        decision = self._outcome_policy_decision(state, "meetingroom")
+        if decision:
+            state.meetingroom.evidence["outcome_policy_decision"] = decision
+        if decision and decision.get("decision") == "terminal" and decision.get("reason"):
+            reason = str(decision["reason"])
         args = {"reason": reason}
         if order_id:
             args["order_id"] = order_id
         return StepAction("block_meetingroom", args=args)
 
     def _block_workflow(self, state: RuntimeState, reason: str) -> StepAction:
+        decision = self._outcome_policy_decision(state, "workflow")
+        if decision:
+            state.workflow.evidence["outcome_policy_decision"] = decision
+        if decision and decision.get("decision") == "next_action" and decision.get("action") == "workflow.search_person":
+            plan = self._leave_plan(state)
+            args = self._next_approver_search_args(state, plan, mark_attempt=False) if plan else None
+            if args is not None:
+                return StepAction("tool", "workflow.search_person", args)
+        if decision and decision.get("decision") == "terminal" and decision.get("reason"):
+            reason = str(decision["reason"])
+        if state.workflow_skill is not None:
+            state.workflow_skill.mark_blocked(reason)
         return StepAction("block_workflow", args={"reason": reason})
 
     # ------------------------------------------------------------------
@@ -10954,6 +11436,8 @@ class MyAgent:
         if any(word in query for word in ["不要保存草稿", "直接提交", "帮我提交", "提交申请", "也提交", "直接提就行", "直接提", "提掉"]):
             return True
         if "提交" in query and any(word in query for word in ["费用", "采购", "物资", "预算", "金额", "项目"]):
+            return True
+        if re.search(r"(?:需要|要|帮我)?提(?:交)?(?:一个|一笔|一批)?[^，。；;]{0,20}(?:费用|采购|物资)(?:申请)?", query):
             return True
         if any(word in query for word in ["提一个", "提一笔", "提费用", "提上去", "发起", "走流程", "走一笔", "走申请", "办理费用", "处理事假", "提交项目编码", "提交项目", "提交费用"]):
             return True
@@ -11295,7 +11779,7 @@ class MyAgent:
 
     def _normalize_meeting_title(self, title: Any) -> str:
         value = str(title or "").strip("，。,. ")
-        if value in {"复盘", "复盘会"}:
+        if value in {"复盘", "复盘会", "项目复盘会"}:
             return "项目复盘"
         return value
 

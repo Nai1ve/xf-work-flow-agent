@@ -1,0 +1,302 @@
+{
+  "schema_version": "workflow-skills-v1",
+  "skills": {
+    "workflow.expense.draft": {
+      "domain": "workflow",
+      "intent": "expense_material",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "id": "applicant",
+          "phase": "read",
+          "tool": "user.get_info"
+        },
+        {
+          "cost": 1,
+          "depends_on": [],
+          "id": "catalog",
+          "phase": "read",
+          "tool": "workflow.catalog"
+        },
+        {
+          "cost": 1,
+          "depends_on": [],
+          "id": "schema",
+          "phase": "read",
+          "tool": "workflow.schema"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "applicant",
+            "catalog",
+            "schema"
+          ],
+          "id": "project",
+          "phase": "read",
+          "tool": "workflow.project_search"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "project"
+          ],
+          "id": "category",
+          "phase": "read",
+          "tool": "workflow.browser_search"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "project",
+            "category"
+          ],
+          "id": "subclass",
+          "phase": "read",
+          "tool": "workflow.browser_search"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "subclass"
+          ],
+          "id": "draft_ir",
+          "phase": "compute"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "draft_ir"
+          ],
+          "id": "save",
+          "phase": "write",
+          "tool": "workflow.save"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "save"
+          ],
+          "id": "verify",
+          "phase": "postcheck",
+          "tool": "oa.todo.list"
+        }
+      ],
+      "submit": false
+    },
+    "workflow.expense.submit": {
+      "extends": "workflow.expense.draft",
+      "replace_nodes": {
+        "verify": {
+          "cost": 1,
+          "depends_on": [
+            "save"
+          ],
+          "id": "verify",
+          "phase": "postcheck",
+          "tool": "oa.done.list"
+        }
+      },
+      "submit": true
+    },
+    "workflow.leave.draft": {
+      "domain": "workflow",
+      "intent": "leave",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "id": "applicant",
+          "phase": "read",
+          "tool": "user.get_info"
+        },
+        {
+          "cost": 1,
+          "depends_on": [],
+          "id": "catalog",
+          "phase": "read",
+          "tool": "workflow.catalog"
+        },
+        {
+          "cost": 1,
+          "depends_on": [],
+          "id": "schema",
+          "phase": "read",
+          "tool": "workflow.schema"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "applicant",
+            "catalog",
+            "schema"
+          ],
+          "id": "leave_form",
+          "phase": "compute"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "leave_form"
+          ],
+          "id": "approver_search",
+          "phase": "read",
+          "tool": "workflow.search_person"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "approver_search"
+          ],
+          "id": "approver_resolved",
+          "phase": "compute"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "approver_resolved"
+          ],
+          "id": "draft_ir",
+          "phase": "compute"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "draft_ir"
+          ],
+          "id": "save",
+          "phase": "write",
+          "tool": "workflow.save"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "save"
+          ],
+          "id": "verify",
+          "phase": "postcheck",
+          "tool": "oa.todo.list"
+        }
+      ],
+      "submit": false
+    },
+    "workflow.leave.replace_submit": {
+      "domain": "workflow",
+      "intent": "leave",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "id": "applicant",
+          "phase": "read",
+          "tool": "user.get_info"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "applicant"
+          ],
+          "id": "source_lookup",
+          "phase": "read",
+          "tool": "oa.done.list"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "source_lookup"
+          ],
+          "id": "delete_source",
+          "phase": "write",
+          "tool": "workflow.delete"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "delete_source"
+          ],
+          "id": "catalog",
+          "phase": "read",
+          "tool": "workflow.catalog"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "delete_source"
+          ],
+          "id": "schema",
+          "phase": "read",
+          "tool": "workflow.schema"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "catalog",
+            "schema"
+          ],
+          "id": "leave_form",
+          "phase": "compute"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "leave_form"
+          ],
+          "id": "approver_search",
+          "phase": "read",
+          "tool": "workflow.search_person"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "approver_search"
+          ],
+          "id": "approver_resolved",
+          "phase": "compute"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "approver_resolved"
+          ],
+          "id": "draft_ir",
+          "phase": "compute"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "draft_ir"
+          ],
+          "id": "save",
+          "phase": "write",
+          "tool": "workflow.save"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "save"
+          ],
+          "id": "verify",
+          "phase": "postcheck",
+          "tool": "oa.done.list"
+        }
+      ],
+      "submit": true
+    },
+    "workflow.leave.submit": {
+      "extends": "workflow.leave.draft",
+      "replace_nodes": {
+        "verify": {
+          "cost": 1,
+          "depends_on": [
+            "save"
+          ],
+          "id": "verify",
+          "phase": "postcheck",
+          "tool": "oa.done.list"
+        }
+      },
+      "submit": true
+    }
+  }
+}

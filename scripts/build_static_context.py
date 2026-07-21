@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SPLIT = ROOT / "contest" / "train"
 DEFAULT_VAL_SPLIT = ROOT / "contest" / "val"
 DEFAULT_OUTPUT = ROOT / "submission" / "static_context"
+POLICY_TEMPLATE_DIR = ROOT / "submission" / "static_context"
 
 EXPENSE_WORKFLOW_ID = "34747"
 
@@ -799,6 +800,8 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
     meetingrooms_index = build_meetingrooms_index(meetingroom_data)
     capabilities_index = build_capabilities_index()
     expense_examples_index = build_expense_examples_index(cases_dir)
+    workflow_skills_index = load_json(POLICY_TEMPLATE_DIR / "workflow_skills.index.json")
+    outcome_policies_index = load_json(POLICY_TEMPLATE_DIR / "outcome_policies.index.json")
 
     manifest = {
         "schema_version": "static-context-v1",
@@ -816,6 +819,8 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
             "workflows": len(workflow_data.get("workflow_catalog") or []),
             "rooms": len(room_items(meetingroom_data)),
             "expense_examples": int((expense_examples_index.get("counts") or {}).get("memories") or 0),
+            "workflow_skills": len(workflow_skills_index.get("skills") or {}),
+            "outcome_policies": len(outcome_policies_index.get("rules") or []),
         },
         "files": {
             "tools": "tools.index.json",
@@ -823,6 +828,8 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
             "meetingrooms": "meetingrooms.index.json",
             "capabilities": "capabilities.index.json",
             "expense_examples": "expense_examples.index.json",
+            "workflow_skills": "workflow_skills.index.json",
+            "outcome_policies": "outcome_policies.index.json",
             "prompt_cards": "prompt_cards/",
         },
     }
@@ -834,6 +841,8 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
     write_json(output_dir / "meetingrooms.index.json", meetingrooms_index)
     write_json(output_dir / "capabilities.index.json", capabilities_index)
     write_json(output_dir / "expense_examples.index.json", expense_examples_index)
+    write_json(output_dir / "workflow_skills.index.json", workflow_skills_index)
+    write_json(output_dir / "outcome_policies.index.json", outcome_policies_index)
     cards_dir = output_dir / "prompt_cards"
     cards_dir.mkdir(parents=True, exist_ok=True)
     for filename, content in PROMPT_CARDS.items():

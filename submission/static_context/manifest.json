@@ -2,19 +2,23 @@
   "counts": {
     "capabilities": 16,
     "expense_examples": 57,
+    "outcome_policies": 6,
     "rooms": 139,
     "tools": 22,
+    "workflow_skills": 5,
     "workflows": 2
   },
   "files": {
     "capabilities": "capabilities.index.json",
     "expense_examples": "expense_examples.index.json",
     "meetingrooms": "meetingrooms.index.json",
+    "outcome_policies": "outcome_policies.index.json",
     "prompt_cards": "prompt_cards/",
     "tools": "tools.index.json",
+    "workflow_skills": "workflow_skills.index.json",
     "workflows": "workflows.index.json"
   },
-  "generated_at": "2026-07-21T02:03:05.775081+00:00",
+  "generated_at": "2026-07-21T08:08:50.812012+00:00",
   "schema_version": "static-context-v1",
   "sources": {
     "expense_examples": {

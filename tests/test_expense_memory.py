@@ -62,6 +62,17 @@ class ExpenseMemoryBuildTest(unittest.TestCase):
         state.workflow.slots = {"source_text": query, "expense": expense}
         self.assertEqual(agent._expense_memory_project_search_args(state, expense), {"project_name": "智能办公平台"})
 
+    def test_project_alias_memory_prefers_more_specific_formal_name(self) -> None:
+        agent = MyAgent(type("Env", (), {})())
+        query = "渠道布展升级印刷项目需要一批招商折页，预算9000，直接提交。"
+        expense = agent._heuristic_expense(query)
+        expense["source_text"] = query
+        state = RuntimeState({"user_query": query, "step_budget": 10}, set(), 10)
+        state.workflow.needed = True
+        state.workflow.intent = "expense_material"
+        state.workflow.slots = {"source_text": query, "expense": expense}
+        self.assertEqual(agent._expense_memory_project_search_args(state, expense), {"project_name": "布展升级印刷"})
+
     def test_project_structure_word_is_last_resort(self) -> None:
         agent = MyAgent(type("Env", (), {})())
         query = "项目是星火质量工程平台，申请测试设备8000元。"
@@ -107,6 +118,33 @@ class ExpenseMemoryBuildTest(unittest.TestCase):
             "total_amount": "20000.00",
         }
         self.assertEqual(agent._expense_request_shape(state, expense, []), "single_item_total")
+
+    def test_generic_quantified_item_requires_package_memory(self) -> None:
+        agent = MyAgent(type("Env", (), {})())
+        query = "知识服务项目要买一批设备，总预算2万元，直接提交。"
+        expense = agent._heuristic_expense(query)
+        expense["source_text"] = query
+        state = RuntimeState({"user_query": query, "step_budget": 10}, set(), 10)
+        state.workflow.slots = {"source_text": query, "expense": expense, "submit": True}
+        options = [
+            {"label": "电脑及其配件", "value": "computer"},
+            {"label": "打印机、扫描仪及其配件", "value": "printer"},
+            {"label": "测试设备", "value": "test_device"},
+        ]
+        self.assertEqual(agent._expense_request_shape(state, expense, options), "business_package")
+
+    def test_exact_subclass_with_total_is_not_treated_as_package(self) -> None:
+        agent = MyAgent(type("Env", (), {})())
+        query = "知识服务项目要买1套测试设备，预算8000元，直接提交。"
+        expense = agent._heuristic_expense(query)
+        expense["source_text"] = query
+        state = RuntimeState({"user_query": query, "step_budget": 10}, set(), 10)
+        state.workflow.slots = {"source_text": query, "expense": expense, "submit": True}
+        options = [
+            {"label": "电脑及其配件", "value": "computer"},
+            {"label": "测试设备", "value": "test_device"},
+        ]
+        self.assertEqual(agent._expense_request_shape(state, expense, options), "single_item_total")
 
 
 if __name__ == "__main__":
