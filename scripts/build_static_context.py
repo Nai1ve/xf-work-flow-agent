@@ -219,7 +219,7 @@ CAPABILITIES = {
         "intent": "leave",
         "risk": "write",
         "required_slots": ["day_text", "start", "end", "leave_type_label", "approver_hint"],
-        "read_tools": ["user.get_info", "workflow.catalog", "workflow.schema", "workflow.search_person"],
+        "read_tools": ["user.get_info", "workflow.catalog", "workflow.schema", "file.list", "workflow.search_person"],
         "write_tools": ["workflow.save"],
         "evidence_required": ["applicant", "workflow_schema", "approver_candidate"],
     },
@@ -228,7 +228,7 @@ CAPABILITIES = {
         "intent": "leave",
         "risk": "high_risk_write",
         "required_slots": ["explicit_submit", "day_text", "start", "end", "leave_type_label", "approver_hint"],
-        "read_tools": ["user.get_info", "workflow.catalog", "workflow.schema", "workflow.search_person"],
+        "read_tools": ["user.get_info", "workflow.catalog", "workflow.schema", "file.list", "workflow.search_person"],
         "write_tools": ["workflow.save"],
         "evidence_required": ["applicant", "workflow_schema", "approver_candidate"],
         "post_check": "oa.done.list",
@@ -432,6 +432,59 @@ def build_expense_examples_index(cases_dir: Path) -> dict[str, Any]:
             "request_shapes": dict(sorted(shape_counts.items())),
         },
         "entries": entries,
+    }
+
+
+def build_leave_defaults_index(cases_dir: Path) -> dict[str, Any]:
+    """Record train-observed defaults only when the user did not name an approver."""
+    entries: list[dict[str, Any]] = []
+    source_hashes: list[str] = []
+    for case_path in sorted(cases_dir.glob("*.json")):
+        case = load_json(case_path)
+        query = str(case.get("user_query") or "").strip()
+        if "审批人" in query:
+            continue
+        save_step = next(
+            (
+                step
+                for step in case.get("gold_trajectory") or []
+                if isinstance(step, dict)
+                and step.get("tool") == "workflow.save"
+                and str((step.get("args") or {}).get("workflow_id") or "") == "72247"
+            ),
+            None,
+        )
+        if not save_step:
+            continue
+        args = save_step.get("args") if isinstance(save_step.get("args"), dict) else {}
+        data = args.get("data") if isinstance(args.get("data"), dict) else {}
+        approver_id = str(data.get("approver") or "")
+        if not approver_id:
+            continue
+        people = ((case.get("world_state") or {}).get("workflow_people") or []) if isinstance(case.get("world_state"), dict) else []
+        person = next((item for item in people if isinstance(item, dict) and str(item.get("user_id") or "") == approver_id), {})
+        case_hash = sha256(case_path)
+        source_hashes.append(case_hash)
+        payload = {
+            "request_text": query,
+            "submit": bool(args.get("submit")),
+            "leave_type": str(data.get("leave_type") or ""),
+            "approver_user_id": approver_id,
+            "approver_name": str(person.get("name") or ""),
+            "source_sha256": case_hash,
+        }
+        entries.append({"memory_id": content_sha256(payload)[:20], **payload})
+    corpus_hash = hashlib.sha256("\n".join(sorted(source_hashes)).encode("ascii")).hexdigest()
+    return {
+        "schema_version": "leave-defaults-v1",
+        "provenance": {
+            "split": "train",
+            "cases_path": relative(cases_dir),
+            "cases_sha256": corpus_hash,
+            "policy": "train gold defaults only; case identifiers omitted; approver must still be returned by workflow.search_person",
+        },
+        "counts": {"memories": len(entries)},
+        "entries": sorted(entries, key=lambda item: item["memory_id"]),
     }
 
 
@@ -800,6 +853,7 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
     meetingrooms_index = build_meetingrooms_index(meetingroom_data)
     capabilities_index = build_capabilities_index()
     expense_examples_index = build_expense_examples_index(cases_dir)
+    leave_defaults_index = build_leave_defaults_index(cases_dir)
     workflow_skills_index = load_json(POLICY_TEMPLATE_DIR / "workflow_skills.index.json")
     outcome_policies_index = load_json(POLICY_TEMPLATE_DIR / "outcome_policies.index.json")
 
@@ -811,6 +865,7 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
             "workflow_data": {"path": relative(workflow_path), "sha256": sha256(workflow_path)},
             "meetingroom_data": {"path": relative(meetingroom_path), "sha256": sha256(meetingroom_path)},
             "expense_examples": expense_examples_index.get("provenance") or {},
+            "leave_defaults": leave_defaults_index.get("provenance") or {},
         },
         "split_hash_checks": hash_checks,
         "counts": {
@@ -819,6 +874,7 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
             "workflows": len(workflow_data.get("workflow_catalog") or []),
             "rooms": len(room_items(meetingroom_data)),
             "expense_examples": int((expense_examples_index.get("counts") or {}).get("memories") or 0),
+            "leave_defaults": int((leave_defaults_index.get("counts") or {}).get("memories") or 0),
             "workflow_skills": len(workflow_skills_index.get("skills") or {}),
             "outcome_policies": len(outcome_policies_index.get("rules") or []),
         },
@@ -828,6 +884,7 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
             "meetingrooms": "meetingrooms.index.json",
             "capabilities": "capabilities.index.json",
             "expense_examples": "expense_examples.index.json",
+            "leave_defaults": "leave_defaults.index.json",
             "workflow_skills": "workflow_skills.index.json",
             "outcome_policies": "outcome_policies.index.json",
             "prompt_cards": "prompt_cards/",
@@ -841,6 +898,7 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
     write_json(output_dir / "meetingrooms.index.json", meetingrooms_index)
     write_json(output_dir / "capabilities.index.json", capabilities_index)
     write_json(output_dir / "expense_examples.index.json", expense_examples_index)
+    write_json(output_dir / "leave_defaults.index.json", leave_defaults_index)
     write_json(output_dir / "workflow_skills.index.json", workflow_skills_index)
     write_json(output_dir / "outcome_policies.index.json", outcome_policies_index)
     cards_dir = output_dir / "prompt_cards"

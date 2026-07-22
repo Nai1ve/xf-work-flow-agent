@@ -66,6 +66,7 @@ LIMIT="${LIMIT:-}"
 CASES="${CASES:-}"
 RUN_ID="${RUN_ID:-$(date '+%Y%m%d_%H%M%S')}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-reports/runs/$RUN_ID}"
+RUNTIME_LOG_PATH="${RUNTIME_LOG_PATH:-${TASK_GRAPH_LOG_PATH:-$OUTPUT_ROOT/runtime_calls.jsonl}}"
 BUILD_STATIC_CONTEXT="${BUILD_STATIC_CONTEXT:-1}"
 STATIC_CONTEXT_DIR="${STATIC_CONTEXT_DIR:-submission/static_context}"
 STATIC_SPLIT_DIR="${STATIC_SPLIT_DIR:-}"
@@ -77,6 +78,9 @@ REFRESH_TREE="${REFRESH_TREE:-1}"
 
 [[ -f "$AGENT" ]] || fail "Agent file not found: $AGENT"
 mkdir -p "$OUTPUT_ROOT"
+mkdir -p "$(dirname "$RUNTIME_LOG_PATH")"
+: > "$RUNTIME_LOG_PATH"
+export TASK_GRAPH_LOG_PATH="$RUNTIME_LOG_PATH"
 
 if [[ -f submission/config.local.json && -z "${AGENT_USE_LOCAL_CONFIG:-}" ]]; then
   export AGENT_USE_LOCAL_CONFIG=1
@@ -86,6 +90,7 @@ log "Python: $PYTHON"
 log "Agent: $AGENT"
 log "Splits: $SPLITS"
 log "Output: $OUTPUT_ROOT"
+log "Runtime call log: $RUNTIME_LOG_PATH"
 
 for split in $SPLITS; do
   require_split "$split"
@@ -187,6 +192,14 @@ if [[ "${#result_paths[@]}" -gt 1 ]]; then
     --output-dir "$OUTPUT_ROOT" \
     --label combined_results \
     > "$OUTPUT_ROOT/combined_summary.stdout"
+fi
+
+if [[ -s "$RUNTIME_LOG_PATH" ]]; then
+  log "Writing runtime timing and API-call summary"
+  "$PYTHON" scripts/summarize_runtime_timing.py \
+    "$RUNTIME_LOG_PATH" \
+    --output "$OUTPUT_ROOT/runtime_timing_summary.json" \
+    > "$OUTPUT_ROOT/runtime_timing_summary.stdout"
 fi
 
 log "Done. Artifacts are under $OUTPUT_ROOT"

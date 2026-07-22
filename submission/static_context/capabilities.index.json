@@ -325,6 +325,7 @@
         "user.get_info",
         "workflow.catalog",
         "workflow.schema",
+        "file.list",
         "workflow.search_person"
       ],
       "required_slots": [
@@ -352,6 +353,7 @@
         "user.get_info",
         "workflow.catalog",
         "workflow.schema",
+        "file.list",
         "workflow.search_person"
       ],
       "required_slots": [

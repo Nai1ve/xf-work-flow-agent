@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from statistics import mean, median
 from typing import Any
@@ -51,6 +51,8 @@ def read_events(paths: list[Path]) -> list[dict[str, Any]]:
 
 def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     finishes = [item for item in events if item.get("event") == "finish"]
+    starts = [item for item in events if item.get("event") == "start"]
+    llm_starts = [item for item in events if item.get("event") == "llm_call_start"]
     llm_calls = [item for item in events if item.get("event") == "llm_call"]
     tools = [item for item in events if item.get("event") in {"tool", "tool_cache", "reply"}]
     read_plans = [item for item in events if item.get("event") == "read_plan"]
@@ -58,6 +60,7 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     read_tasks = [item for item in events if item.get("event") == "read_task"]
 
     by_llm_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_llm_purpose: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in llm_calls:
         key = "|".join(
             [
@@ -67,6 +70,37 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
             ]
         )
         by_llm_key[key].append(item)
+        by_llm_purpose[str(item.get("purpose") or item.get("context_pack_type") or "unspecified")].append(item)
+
+    by_tool: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in tools:
+        by_tool[str(item.get("tool") or item.get("event") or "unknown")].append(item)
+
+    completed_call_ids = {str(item.get("call_id") or "") for item in llm_calls if item.get("call_id")}
+    incomplete_calls = [item for item in llm_starts if str(item.get("call_id") or "") not in completed_call_ids]
+    error_classes = Counter(str(item.get("error_class") or "unknown") for item in llm_calls if not item.get("success"))
+
+    usage_fields = ["prompt_tokens", "completion_tokens", "total_tokens"]
+
+    def usage_values(field: str) -> list[float]:
+        return [
+            float((item.get("usage") or {}).get(field) or 0)
+            for item in llm_calls
+            if isinstance(item.get("usage"), dict)
+        ]
+
+    calls_by_case: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in llm_calls:
+        calls_by_case[str(item.get("case_id") or "")].append(item)
+
+    network_contexts: list[dict[str, Any]] = []
+    seen_network_contexts: set[str] = set()
+    for item in starts:
+        network = item.get("network") if isinstance(item.get("network"), dict) else {}
+        key = json.dumps(network, ensure_ascii=False, sort_keys=True)
+        if network and key not in seen_network_contexts:
+            seen_network_contexts.add(key)
+            network_contexts.append(network)
 
     def ledger_value(item: dict[str, Any], key: str) -> float:
         summary = item.get("ledger_summary") if isinstance(item.get("ledger_summary"), dict) else {}
@@ -97,14 +131,47 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
             "ledger_candidate_decisions": stats([ledger_value(item, "candidate_decisions") for item in finishes]),
             "non_llm_elapsed_seconds": stats([float(item.get("non_llm_elapsed_seconds") or 0) for item in finishes]),
             "steps_used": stats([float(item.get("steps_used") or 0) for item in finishes]),
+            "details": [
+                {
+                    "case_id": str(item.get("case_id") or ""),
+                    "elapsed_seconds": float(item.get("elapsed_seconds") or 0),
+                    "llm_elapsed_seconds": float(item.get("llm_elapsed_seconds") or 0),
+                    "tool_elapsed_seconds": float(item.get("tool_elapsed_seconds") or 0),
+                    "steps_used": int(item.get("steps_used") or 0),
+                    "llm_calls": len(calls_by_case.get(str(item.get("case_id") or ""), [])),
+                    "llm_failures": sum(
+                        1 for call in calls_by_case.get(str(item.get("case_id") or ""), []) if not call.get("success")
+                    ),
+                }
+                for item in finishes
+            ],
         },
         "llm_calls": {
+            "started": len(llm_starts),
             "count": len(llm_calls),
+            "incomplete": len(incomplete_calls),
+            "incomplete_call_ids": [str(item.get("call_id") or "") for item in incomplete_calls],
             "success": sum(1 for item in llm_calls if item.get("success")),
             "failure": sum(1 for item in llm_calls if not item.get("success")),
+            "error_classes": dict(sorted(error_classes.items())),
+            "seed_fallbacks": sum(1 for item in llm_calls if item.get("seed_fallback")),
+            "response_json_invalid": sum(1 for item in llm_calls if item.get("success") and not item.get("response_json_valid")),
             "elapsed_seconds": stats([float(item.get("elapsed_seconds") or 0) for item in llm_calls]),
             "prompt_chars": stats([float(item.get("prompt_chars") or 0) for item in llm_calls]),
             "context_chars": stats([float(item.get("context_chars") or 0) for item in llm_calls]),
+            "request_bytes": stats([float(item.get("request_bytes") or 0) for item in llm_calls]),
+            "response_bytes": stats([float(item.get("response_bytes") or 0) for item in llm_calls]),
+            "usage": {field: stats(usage_values(field)) for field in usage_fields},
+            "by_purpose": {
+                key: {
+                    "count": len(items),
+                    "success": sum(1 for item in items if item.get("success")),
+                    "failure": sum(1 for item in items if not item.get("success")),
+                    "elapsed_seconds": stats([float(item.get("elapsed_seconds") or 0) for item in items]),
+                    "prompt_chars": stats([float(item.get("prompt_chars") or 0) for item in items]),
+                }
+                for key, items in sorted(by_llm_purpose.items())
+            },
             "by_profile_model_context": {
                 key: {
                     "count": len(items),
@@ -120,6 +187,14 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
         "actions": {
             "count": len(tools),
             "elapsed_seconds": stats([float(item.get("elapsed_seconds") or 0) for item in tools]),
+            "by_tool": {
+                key: {
+                    "count": len(items),
+                    "failure": sum(1 for item in items if isinstance(item.get("result"), dict) and item["result"].get("error")),
+                    "elapsed_seconds": stats([float(item.get("elapsed_seconds") or 0) for item in items]),
+                }
+                for key, items in sorted(by_tool.items())
+            },
         },
         "read_plan": {
             "plans": len(read_plans),
@@ -132,6 +207,7 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
             "ready_task_count": stats([float(item.get("ready_count") or 0) for item in read_plans]),
             "parallel_batches": sum(1 for item in read_batches if item.get("parallel_requested")),
         },
+        "network_contexts": network_contexts,
     }
 
 

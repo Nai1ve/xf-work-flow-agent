@@ -7,12 +7,18 @@ import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+
+try:
+    from submission.utils.skill_runtime import WorkflowSkillRuntime
+except ImportError:  # Standalone submission loader.
+    from utils.skill_runtime import WorkflowSkillRuntime
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -177,11 +183,12 @@ EXTRACT_PROMPT = """你是企业工具 Agent 的语义抽取器。
 """
 
 
-TASK_GRAPH_PROMPT = """Return JSON only. Parse user intent into a task graph; never call tools or answer.
+TASK_GRAPH_PROMPT = """Return valid json only. Extract the user's executable tasks; never call tools or answer.
 Use only user text/history for slots. Split mixed meetingroom/workflow requests.
-Valid domains/intents are in ctx. Put ids/codes/browser values in must_not_guess unless explicitly typed by user; they still need tools.
-submit_intent is submit only for explicit 提交/发起/直接提/帮我提交; otherwise draft.
-Schema: {"domains":[],"task_graph":{"tasks":[{"task_id":"t1","domain":"","intent":"","goal":"","source_text":"","slots":{},"missing_slots":[],"must_not_guess":[],"confidence":0.0,"submit_intent":"draft|submit|unknown"}]},"meetingroom":{"intent":""},"workflow":{"intent":"","submit":false,"leave":{},"expense":{}}}
+Valid domains and intents are in ctx. Never invent ids, codes, enum values, or tool results.
+Preserve the deterministic h submit value unless explicit draft or submit text contradicts it. Omit empty slots.
+Return exactly: {"tasks":[{"domain":"meetingroom|workflow","intent":"valid intent","submit":false,"slots":{}}]}
+Do not return confidence, reasons, goals, source text, missing fields, or duplicate domain objects.
 """
 
 
@@ -211,6 +218,9 @@ WORKFLOW_IDS = {
 
 
 LEAVE_TYPE_MAP = {
+    "陪产假": "P",
+    "婚假": "M",
+    "丧假": "F",
     "年假": "N",
     "年休假": "N",
     "事假": "L",
@@ -224,6 +234,10 @@ LEAVE_TYPE_MAP = {
 
 
 REASON_MAP = {
+    "陪产假": "04",
+    "婚假": "03",
+    "丧事": "09",
+    "丧假": "06",
     "住院": "02",
     "病": "01",
     "不适": "01",
@@ -422,74 +436,6 @@ class ReadPlan:
         return out
 
 
-class WorkflowSkillRuntime:
-    """Persistent execution state for one project-local workflow skill DAG."""
-
-    TERMINAL_STATUSES = {"completed", "blocked", "skipped"}
-
-    def __init__(self, skill_id: str, definition: dict[str, Any]):
-        self.skill_id = skill_id
-        self.definition = json.loads(json.dumps(definition, ensure_ascii=False, default=str))
-        self.nodes = [item for item in self.definition.get("nodes") or [] if isinstance(item, dict) and item.get("id")]
-        self.statuses = {str(item["id"]): "pending" for item in self.nodes}
-        self.blocked_reason = ""
-        self.transitions: list[dict[str, Any]] = []
-
-    def sync_completed(self, completed_node_ids: set[str]) -> None:
-        for node_id in completed_node_ids:
-            if node_id in self.statuses and self.statuses[node_id] != "completed":
-                previous = self.statuses[node_id]
-                self.statuses[node_id] = "completed"
-                self.transitions.append({"node": node_id, "from": previous, "to": "completed"})
-
-    def mark_running(self, node_id: str) -> None:
-        if self.statuses.get(node_id) == "pending":
-            self.statuses[node_id] = "running"
-            self.transitions.append({"node": node_id, "from": "pending", "to": "running"})
-
-    def mark_blocked(self, reason: str) -> None:
-        self.blocked_reason = reason
-        self.transitions.append({"node": self.next_ready_id(), "to": "blocked", "reason": reason})
-
-    def node(self, node_id: str) -> dict[str, Any] | None:
-        return next((item for item in self.nodes if str(item.get("id")) == node_id), None)
-
-    def is_ready(self, node_id: str) -> bool:
-        node = self.node(node_id)
-        if node is None or self.statuses.get(node_id) in self.TERMINAL_STATUSES:
-            return False
-        return all(self.statuses.get(str(dep)) == "completed" for dep in node.get("depends_on") or [])
-
-    def ready_nodes(self, phases: set[str] | None = None) -> list[dict[str, Any]]:
-        return [
-            node
-            for node in self.nodes
-            if self.is_ready(str(node.get("id"))) and (not phases or str(node.get("phase")) in phases)
-        ]
-
-    def next_ready_id(self) -> str:
-        ready = self.ready_nodes()
-        return str(ready[0].get("id")) if ready else ""
-
-    def remaining_cost(self, phases: set[str] | None = None) -> int:
-        return sum(
-            int(node.get("cost") or 0)
-            for node in self.nodes
-            if self.statuses.get(str(node.get("id"))) not in self.TERMINAL_STATUSES
-            and (not phases or str(node.get("phase")) in phases)
-        )
-
-    def summary(self) -> dict[str, Any]:
-        return {
-            "skill_id": self.skill_id,
-            "statuses": dict(self.statuses),
-            "next_ready": [str(item.get("id")) for item in self.ready_nodes()],
-            "remaining_cost": self.remaining_cost(),
-            "blocked_reason": self.blocked_reason,
-            "transition_count": len(self.transitions),
-        }
-
-
 class WorkflowSkillRegistry:
     def __init__(self, index: dict[str, Any] | None = None):
         self.index = index or {}
@@ -509,11 +455,22 @@ class WorkflowSkillRegistry:
             nodes = []
             for node in parent.get("nodes") or []:
                 node_id = str(node.get("id") or "") if isinstance(node, dict) else ""
-                nodes.append(json.loads(json.dumps(replacements.get(node_id, node), ensure_ascii=False)))
+                merged_node = json.loads(json.dumps(node, ensure_ascii=False))
+                replacement = replacements.get(node_id)
+                if isinstance(replacement, dict):
+                    self._merge_dict(merged_node, replacement)
+                nodes.append(merged_node)
             parent.update({key: value for key, value in definition.items() if key not in {"extends", "replace_nodes", "nodes"}})
             parent["nodes"] = nodes
             definition = parent
         return definition
+
+    def _merge_dict(self, target: dict[str, Any], source: dict[str, Any]) -> None:
+        for key, value in source.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                self._merge_dict(target[key], value)
+            else:
+                target[key] = json.loads(json.dumps(value, ensure_ascii=False))
 
     def select(self, intent: str, submit: bool, replace: bool = False) -> tuple[str, dict[str, Any]]:
         if intent == "leave" and replace and submit:
@@ -525,6 +482,123 @@ class WorkflowSkillRegistry:
         else:
             return "", {}
         return skill_id, self.definition(skill_id)
+
+    def select_meetingroom(self, intent: str) -> tuple[str, dict[str, Any]]:
+        mapping = {
+            "book_single": "meetingroom.book",
+            "book_multi_segments_same_room": "meetingroom.book",
+            "book_by_schedule_analysis": "meetingroom.schedule_book",
+            "query_room_schedule": "meetingroom.schedule_query",
+            "schedule_book": "meetingroom.schedule_book",
+            "query_booking": "meetingroom.query",
+            "query": "meetingroom.query",
+            "cancel_existing": "meetingroom.cancel",
+            "cancel": "meetingroom.cancel",
+            "extend_existing": "meetingroom.extend",
+            "extend": "meetingroom.extend",
+            "rebook_larger_existing": "meetingroom.rebook",
+            "rebook_larger": "meetingroom.rebook",
+            "cancel_rebook_existing": "meetingroom.rebook",
+            "cancel_rebook": "meetingroom.rebook",
+            "participant_list": "meetingroom.participant_list",
+            "participant_add": "meetingroom.participant_update",
+            "participant_remove": "meetingroom.participant_update",
+        }
+        skill_id = mapping.get(str(intent or ""), "")
+        return (skill_id, self.definition(skill_id)) if skill_id else ("", {})
+
+    def validate_contracts(self) -> list[str]:
+        errors: list[str] = []
+        for skill_id in sorted(self.skills):
+            definition = self.definition(skill_id)
+            nodes = [node for node in definition.get("nodes") or [] if isinstance(node, dict)]
+            ids = [str(node.get("id") or "") for node in nodes]
+            if not ids or any(not node_id for node_id in ids) or len(ids) != len(set(ids)):
+                errors.append(f"{skill_id}:invalid_node_ids")
+                continue
+            id_set = set(ids)
+            for node in nodes:
+                node_id = str(node.get("id") or "")
+                phase = str(node.get("phase") or "")
+                if phase not in {"read", "compute", "write", "postcheck"}:
+                    errors.append(f"{skill_id}:{node_id}:invalid_phase:{phase}")
+                if not node.get("validator"):
+                    errors.append(f"{skill_id}:{node_id}:missing_validator")
+                if not node.get("success_evidence"):
+                    errors.append(f"{skill_id}:{node_id}:missing_success_evidence")
+                if int(node.get("cost") or 0) > 0 and not node.get("tool"):
+                    errors.append(f"{skill_id}:{node_id}:missing_tool")
+                for dependency in node.get("depends_on") or []:
+                    if str(dependency) not in id_set:
+                        errors.append(f"{skill_id}:{node_id}:unknown_dependency:{dependency}")
+                edges = node.get("failure_edges") if isinstance(node.get("failure_edges"), dict) else {}
+                if not edges:
+                    errors.append(f"{skill_id}:{node_id}:missing_failure_edges")
+                for reason, edge in edges.items():
+                    if not isinstance(edge, dict) or str(edge.get("action") or "") not in {"retry", "skip", "block"}:
+                        errors.append(f"{skill_id}:{node_id}:{reason}:invalid_failure_action")
+                        continue
+                    if edge.get("action") == "retry":
+                        if phase == "write":
+                            errors.append(f"{skill_id}:{node_id}:{reason}:write_retry_forbidden")
+                        target = str(edge.get("target") or node_id)
+                        if target not in id_set:
+                            errors.append(f"{skill_id}:{node_id}:{reason}:unknown_retry_target:{target}")
+                        if int(edge.get("max_attempts") or 0) < 1:
+                            errors.append(f"{skill_id}:{node_id}:{reason}:invalid_max_attempts")
+            errors.extend(self._dependency_cycle_errors(skill_id, nodes))
+        return errors
+
+    def validate_capability_coverage(self, capabilities_index: dict[str, Any]) -> list[str]:
+        capabilities = capabilities_index.get("capabilities") if isinstance(capabilities_index.get("capabilities"), dict) else {}
+        errors: list[str] = []
+        for capability_id, capability in sorted(capabilities.items()):
+            if not isinstance(capability, dict):
+                errors.append(f"{capability_id}:invalid_capability")
+                continue
+            domain = str(capability.get("domain") or "")
+            intent = str(capability.get("intent") or "")
+            if domain == "meetingroom":
+                skill_id, definition = self.select_meetingroom(intent)
+            elif domain == "workflow":
+                skill_id, definition = self.select(intent, str(capability_id).endswith("_submit"))
+            else:
+                skill_id, definition = "", {}
+            if not skill_id or not definition:
+                errors.append(f"{capability_id}:missing_skill:{intent}")
+                continue
+            if str(definition.get("domain") or "") != domain:
+                errors.append(f"{capability_id}:skill_domain_mismatch:{skill_id}")
+        return errors
+
+    def status(self, capabilities_index: dict[str, Any] | None = None) -> dict[str, Any]:
+        contract_errors = self.validate_contracts()
+        coverage_errors = self.validate_capability_coverage(capabilities_index or {}) if capabilities_index else []
+        return {
+            "schema_version": str(self.index.get("schema_version") or ""),
+            "skill_count": len(self.skills),
+            "contract_errors": contract_errors,
+            "capability_coverage_errors": coverage_errors,
+        }
+
+    def _dependency_cycle_errors(self, skill_id: str, nodes: list[dict[str, Any]]) -> list[str]:
+        dependencies = {str(node.get("id") or ""): [str(item) for item in node.get("depends_on") or []] for node in nodes}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(node_id: str) -> bool:
+            if node_id in visiting:
+                return True
+            if node_id in visited:
+                return False
+            visiting.add(node_id)
+            if any(dependency in dependencies and visit(dependency) for dependency in dependencies.get(node_id, [])):
+                return True
+            visiting.remove(node_id)
+            visited.add(node_id)
+            return False
+
+        return [f"{skill_id}:dependency_cycle"] if any(visit(node_id) for node_id in dependencies if node_id not in visited) else []
 
 
 class OutcomePolicyMemory:
@@ -1033,16 +1107,18 @@ class TaskGraphContractNormalizer:
         return candidates[0] if len(candidates) == 1 else None
 
     def _validated_source_text(self, raw: dict[str, Any], fallback: dict[str, Any] | None, query: str) -> str:
-        source = str(raw.get("source_text") or raw.get("goal") or "").strip()
-        if source and (not query or self._normalized_text(source) in self._normalized_text(query)):
-            return source
         fallback_source = str((fallback or {}).get("source_text") or "").strip()
         if fallback_source and (not query or self._normalized_text(fallback_source) in self._normalized_text(query)):
             return fallback_source
+        source = str(raw.get("source_text") or raw.get("goal") or "").strip()
+        if source and (not query or self._normalized_text(source) in self._normalized_text(query)):
+            return source
         return ""
 
     def _filter_slots(self, slots: dict[str, Any], source_text: str, query: str) -> tuple[dict[str, Any], dict[str, str], list[str]]:
-        evidence_text = self._normalized_text(f"{source_text} {query}")
+        # A task can only claim literals from its own source span. The full
+        # query is a fallback for legacy tasks without a validated span.
+        evidence_text = self._normalized_text(source_text or query)
         provenance: dict[str, str] = {}
         dropped: list[str] = []
 
@@ -1184,7 +1260,6 @@ class EvidenceLedger:
         selected_id: str,
         allowed_ids: list[str],
         source: str,
-        confidence: float,
         decision: str,
     ) -> dict[str, Any]:
         return self._append(
@@ -1195,7 +1270,6 @@ class EvidenceLedger:
                 "selected_id": selected_id,
                 "allowed_candidate_ids": allowed_ids[:20],
                 "source": source,
-                "confidence": confidence,
                 "decision": decision,
             }
         )
@@ -1334,6 +1408,16 @@ class PreflightGuard:
             expense_result = self._validate_expense_save(state, args)
             errors.extend(expense_result.get("errors") or [])
             warnings.extend(expense_result.get("warnings") or [])
+        elif int(args.get("workflow_id") or 0) == WORKFLOW_IDS["leave"]:
+            data = args.get("data") if isinstance(args.get("data"), dict) else {}
+            attachment_directory = str(state.workflow.evidence.get("leave_attachment_directory") or "")
+            attachment = str(data.get("attachment") or "")
+            file_result = state.workflow.evidence.get("file_list") or {}
+            listed_files = {str(item) for item in file_result.get("files") or [] if item}
+            if attachment_directory and not attachment:
+                errors.append("leave_attachment_required_but_not_resolved")
+            if attachment and Path(attachment).name not in listed_files:
+                errors.append("leave_attachment_not_bound_to_file_list")
         evidence_refs = []
         if state.workflow.evidence.get("applicant"):
             evidence_refs.append("user.get_info")
@@ -1349,6 +1433,8 @@ class PreflightGuard:
                 WORKFLOW_IDS["expense"], "material_subclass", state.workflow.evidence.get("schema") or {}, detail_table="detail_2"
             )
             evidence_refs.append(f"workflow.browser_search:{field_id}" if field_id else "workflow.browser_search:subclass")
+        if state.workflow.evidence.get("file_list"):
+            evidence_refs.append("file.list")
         return {
             "passed": not errors,
             "reason": "" if not errors else "workflow_preflight_failed",
@@ -1519,6 +1605,7 @@ class RuntimeState:
         self.steps_used = 0
         self.llm_calls_fast = 0
         self.llm_calls_strong = 0
+        self.llm_call_sequence = 0
         self.llm_elapsed_fast_seconds = 0.0
         self.llm_elapsed_strong_seconds = 0.0
         self.action_elapsed_seconds = 0.0
@@ -1544,6 +1631,7 @@ class RuntimeState:
         self.llm_semantic: dict[str, Any] = {}
         self.task_graph: dict[str, Any] = {"tasks": []}
         self.task_runtimes: list[TaskRuntime] = []
+        self.meetingroom_skill: WorkflowSkillRuntime | None = None
         self.workflow_skill: WorkflowSkillRuntime | None = None
         self.active_task_ids: dict[str, str] = {}
         self.task_results: list[dict[str, Any]] = []
@@ -1582,6 +1670,7 @@ class StaticContextStore:
         self.meetingrooms: dict[str, Any] = {}
         self.capabilities: dict[str, Any] = {}
         self.expense_examples: dict[str, Any] = {}
+        self.leave_defaults: dict[str, Any] = {}
         self.workflow_skills: dict[str, Any] = {}
         self.outcome_policies: dict[str, Any] = {}
         self.cards: dict[str, str] = {}
@@ -1598,6 +1687,9 @@ class StaticContextStore:
             expense_examples_path = self.base_dir / "expense_examples.index.json"
             if expense_examples_path.is_file():
                 self.expense_examples = self._load_json("expense_examples.index.json")
+            leave_defaults_path = self.base_dir / "leave_defaults.index.json"
+            if leave_defaults_path.is_file():
+                self.leave_defaults = self._load_json("leave_defaults.index.json")
             workflow_skills_path = self.base_dir / "workflow_skills.index.json"
             if workflow_skills_path.is_file():
                 self.workflow_skills = self._load_json("workflow_skills.index.json")
@@ -1686,37 +1778,17 @@ class StaticContextStore:
         }
 
     def for_intent_router(self) -> dict[str, Any]:
-        workflows = [
-            {
-                "id": item.get("workflow_id"),
-                "name": item.get("name"),
-                "kind": self._workflow_kind(item),
-            }
-            for item in (self.workflows.get("catalog") or [])
-        ]
-        capabilities = []
-        for capability_id, spec in sorted((self.capabilities.get("capabilities") or {}).items()):
-            if not isinstance(spec, dict):
-                continue
-            capabilities.append(
-                {
-                    "id": capability_id,
-                    "domain": spec.get("domain"),
-                    "intent": spec.get("intent"),
-                    "risk": spec.get("risk"),
-                    "required_slots": spec.get("required_slots") or [],
-                }
-            )
+        meeting_intents = sorted(set((self.capabilities.get("meeting_intent_map") or {}).keys()))
+        workflow_intents = sorted(set((self.capabilities.get("workflow_intent_map") or {}).keys()))
         payload = {
-            "p": "intent routing only; output task graph, slot hints, missing_slots, must_not_guess",
-            "capabilities": capabilities,
-            "intent_maps": {
-                "meetingroom": self.capabilities.get("meeting_intent_map") or {},
-                "workflow": self.capabilities.get("workflow_intent_map") or {},
+            "p": "route tasks and extract literal slots only",
+            "intents": {"meetingroom": meeting_intents, "workflow": workflow_intents},
+            "workflow_ids": {
+                self._workflow_kind(item): item.get("workflow_id")
+                for item in (self.workflows.get("catalog") or [])
             },
-            "workflows": workflows,
-            "verify": "ids/codes/browser values/order_id/room_id/user_id/project_code/wbs_code require tools",
-            "submit": "explicit submit only; otherwise draft",
+            "verify": "all ids and codes require tools",
+            "submit": "use h; explicit draft=false; explicit submit=true",
         }
         return self._pack("intent_router_static_context", "intent", payload)
 
@@ -1838,6 +1910,10 @@ class MyAgent:
                     "step_budget": state.step_budget,
                     "tool_count": len(state.tools),
                     "obs": obs,
+                    "network": {
+                        "fast": self._network_diagnostics(self._llm_config("fast")),
+                        "strong": self._network_diagnostics(self._llm_config("strong")),
+                    },
                 },
             )
             self._debug_log(debug_config, {"event": "static_context_status", **self.static_context.status()})
@@ -1849,6 +1925,7 @@ class MyAgent:
                     "workflow_registry": self.workflow_registry.status(),
                     "meetingroom_index": self.meetingroom_index.status(),
                     "capability_registry": self.capability_registry.status(),
+                    "workflow_skill_registry": self.workflow_skill_registry.status(self.static_context.capabilities),
                 },
             )
 
@@ -1880,6 +1957,7 @@ class MyAgent:
                     continue
                 action = self._next_action(state)
                 if action is None:
+                    self._advance_task_runtimes(state)
                     break
                 self._execute(state, action, debug_config)
                 self._advance_task_runtimes(state)
@@ -1928,6 +2006,7 @@ class MyAgent:
                     "expense_draft_ir": state.workflow.evidence.get("expense_draft_ir") or {},
                     "expense_line_evidence": state.workflow.evidence.get("expense_line_evidence") or {},
                     "project_resolution": state.workflow.evidence.get("project_resolution") or {},
+                    "meetingroom_skill": state.meetingroom_skill.summary() if state.meetingroom_skill is not None else {},
                     "workflow_skill": state.workflow_skill.summary() if state.workflow_skill is not None else {},
                     "outcome_policy_decision": state.workflow.evidence.get("outcome_policy_decision") or {},
                     "non_llm_elapsed_seconds": round(max(0.0, elapsed_seconds - llm_elapsed_seconds), 3),
@@ -2168,6 +2247,34 @@ class MyAgent:
             url += "/v1"
         return url
 
+    def _network_diagnostics(self, llm_config: dict[str, Any]) -> dict[str, Any]:
+        def endpoint(value: Any) -> dict[str, Any]:
+            parsed = urllib.parse.urlparse(str(value or ""))
+            return {
+                "scheme": parsed.scheme,
+                "host": parsed.hostname or "",
+                "port": parsed.port,
+            }
+
+        proxies = urllib.request.getproxies()
+        return {
+            "provider": str(llm_config.get("provider") or ""),
+            "model": str(llm_config.get("model") or ""),
+            "endpoint": endpoint(llm_config.get("base_url")),
+            "api_key_configured": bool(llm_config.get("api_key")),
+            "proxy_env_keys": [
+                key
+                for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]
+                if os.getenv(key)
+            ],
+            "detected_proxies": {
+                str(name): endpoint(value)
+                for name, value in sorted(proxies.items())
+                if name.lower() in {"http", "https", "all"}
+            },
+            "no_proxy_configured": bool(os.getenv("NO_PROXY") or os.getenv("no_proxy")),
+        }
+
     def _extract_semantics(self, state: RuntimeState, obs: dict[str, Any], tools: list[dict[str, Any]]) -> dict[str, Any]:
         _ = tools
         stage_started = time.monotonic()
@@ -2244,7 +2351,7 @@ class MyAgent:
         if context_pack.get("content"):
             payload["ctx"] = context_pack["content"]
         prompt_text = TASK_GRAPH_PROMPT
-        user_text = "Return json object only.\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        user_text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         prompt_chars = len(prompt_text) + len(user_text)
         try:
             fast_attempted = True
@@ -2259,10 +2366,13 @@ class MyAgent:
                 context_pack_type=context_pack_type,
                 context_chars=context_chars,
                 prompt_chars=prompt_chars,
+                max_output_tokens=192,
+                call_purpose="semantic_task_graph",
             )
             response_chars = len(content)
             parsed = self._parse_json_object(content)
             if isinstance(parsed, dict):
+                parsed = self._expand_sparse_semantic_result(parsed, full_query)
                 merged = self._merge_semantic(baseline, parsed)
                 source = "fast_llm"
                 fast_llm_success = True
@@ -2888,18 +2998,29 @@ class MyAgent:
         context_pack_type: str = "none",
         context_chars: int = 0,
         prompt_chars: int = 0,
+        max_output_tokens: int = 0,
+        call_purpose: str = "",
     ) -> str:
         call_profile = profile or str(llm_config.get("profile") or "strong")
         if state is not None and not self._can_call_llm(state, call_profile):
             raise TimeoutError(f"{call_profile} llm budget exhausted or deadline too close")
         self._note_llm_call(state, call_profile)
         call_started = time.monotonic()
+        if state is not None:
+            state.llm_call_sequence += 1
+            call_id = f"{state.obs.get('case_id') or 'case'}:{call_profile}:{state.llm_call_sequence}"
+        else:
+            call_id = f"no-state:{call_profile}:{time.time_ns()}"
+        call_purpose = str(call_purpose or context_pack_type or "unspecified")
         messages = [dict(item) for item in messages if isinstance(item, dict)]
-        if not any("json" in str(item.get("content") or "") for item in messages):
-            if messages and messages[0].get("role") == "system":
-                messages[0]["content"] = str(messages[0].get("content") or "") + " Return valid json only."
-            else:
-                messages.insert(0, {"role": "system", "content": "Return valid json only."})
+        user_message_indexes = [index for index, item in enumerate(messages) if item.get("role") == "user"]
+        if user_message_indexes and not any(
+            "json" in str(messages[index].get("content") or "").lower() for index in user_message_indexes
+        ):
+            index = user_message_indexes[-1]
+            messages[index]["content"] = str(messages[index].get("content") or "") + "\nReturn response as json."
+        elif not user_message_indexes:
+            messages.append({"role": "user", "content": "Return response as json."})
         if not prompt_chars:
             prompt_chars = sum(len(str(item.get("content") or "")) for item in messages if isinstance(item, dict))
         base_url = str(llm_config.get("base_url") or "").rstrip("/")
@@ -2908,13 +3029,23 @@ class MyAgent:
             "messages": messages,
             "response_format": {"type": "json_object"},
         }
-        if int(llm_config.get("max_tokens") or 0) > 0:
-            body["max_tokens"] = int(llm_config.get("max_tokens") or 0)
+        configured_max_tokens = int(llm_config.get("max_tokens") or 0)
+        requested_max_tokens = int(max_output_tokens or 0)
+        if configured_max_tokens > 0 and requested_max_tokens > 0:
+            body["max_tokens"] = min(configured_max_tokens, requested_max_tokens)
+        elif configured_max_tokens > 0 or requested_max_tokens > 0:
+            body["max_tokens"] = max(configured_max_tokens, requested_max_tokens)
         body["temperature"] = llm_config.get("temperature", 0)
         if llm_config.get("seed") is not None:
             body["seed"] = int(llm_config["seed"])
 
+        attempt_count = 0
+        seed_fallback = False
+        response_status = 0
+
         def send_request(request_body: dict[str, Any], request_timeout: float) -> dict[str, Any]:
+            nonlocal attempt_count, response_status
+            attempt_count += 1
             request = urllib.request.Request(
                 f"{base_url}/chat/completions",
                 data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
@@ -2925,15 +3056,66 @@ class MyAgent:
                 method="POST",
             )
             with urllib.request.urlopen(request, timeout=request_timeout) as response:
+                response_status = int(getattr(response, "status", 0) or 0)
                 value = json.loads(response.read().decode("utf-8"))
                 return value if isinstance(value, dict) else {}
+
+        def send_with_transient_retry(request_body: dict[str, Any], request_timeout: float) -> dict[str, Any]:
+            for retry_index in range(2):
+                try:
+                    value = send_request(request_body, request_timeout)
+                    choices = value.get("choices") if isinstance(value, dict) else []
+                    content = ((choices or [{}])[0].get("message") or {}).get("content") if choices else ""
+                    if not isinstance(content, str) or not content.strip():
+                        raise ValueError("empty_llm_response")
+                    return value
+                except urllib.error.HTTPError:
+                    raise
+                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+                    if retry_index > 0 or (state is not None and self._remaining_seconds(state) < 5.0):
+                        raise
+                    self._debug_log(
+                        llm_config,
+                        {
+                            "event": "llm_retry",
+                            "call_id": call_id,
+                            "case_id": state.obs.get("case_id") if state is not None else "",
+                            "profile": call_profile,
+                            "purpose": call_purpose,
+                            "reason": self._llm_error_class(str(exc)),
+                            "attempt": retry_index + 1,
+                        },
+                    )
+                    time.sleep(0.1)
+            raise RuntimeError("unreachable llm retry state")
 
         timeout = 0.0
         payload: dict[str, Any] = {}
         try:
-            timeout = self._remaining_llm_timeout(state, float(llm_config.get("timeout") or 15))
+            configured_timeout = float(llm_config.get("timeout") or 15)
+            timeout_cap = 8.0 if call_profile == "fast" else 10.0
+            timeout = self._remaining_llm_timeout(state, min(configured_timeout, timeout_cap))
+            if state is not None:
+                self._debug_log(
+                    llm_config,
+                    {
+                        "event": "llm_call_start",
+                        "call_id": call_id,
+                        "case_id": state.obs.get("case_id"),
+                        "profile": call_profile,
+                        "purpose": call_purpose,
+                        "model": llm_config.get("model"),
+                        "timeout_seconds": round(timeout, 3),
+                        "remaining_seconds": round(self._remaining_seconds(state), 3),
+                        "prompt_chars": int(prompt_chars or 0),
+                        "context_chars": int(context_chars or 0),
+                        "request_bytes": len(json.dumps(body, ensure_ascii=False).encode("utf-8")),
+                        "prompt_hash": self._json_hash(body.get("messages") or []),
+                        "network": self._network_diagnostics(llm_config),
+                    },
+                )
             try:
-                payload = send_request(body, timeout)
+                payload = send_with_transient_retry(body, timeout)
             except urllib.error.HTTPError as exc:
                 error_text = ""
                 try:
@@ -2950,7 +3132,8 @@ class MyAgent:
                     setattr(exc, "_agent_error_text", error_text)
                     raise
                 body.pop("seed", None)
-                payload = send_request(body, self._remaining_llm_timeout(state, timeout, reserve=2.0))
+                seed_fallback = True
+                payload = send_with_transient_retry(body, self._remaining_llm_timeout(state, timeout, reserve=2.0))
         except urllib.error.HTTPError as exc:
             text = str(getattr(exc, "_agent_error_text", "") or "")
             if not text:
@@ -2970,6 +3153,11 @@ class MyAgent:
                 context_chars=context_chars,
                 prompt_chars=prompt_chars,
                 request_body=body,
+                call_id=call_id,
+                call_purpose=call_purpose,
+                attempt_count=attempt_count,
+                seed_fallback=seed_fallback,
+                response_status=int(getattr(exc, "code", 0) or response_status),
             )
             raise RuntimeError(f"LLM HTTP {exc.code}: {text}") from exc
         except Exception as exc:
@@ -2985,6 +3173,11 @@ class MyAgent:
                 context_chars=context_chars,
                 prompt_chars=prompt_chars,
                 request_body=body,
+                call_id=call_id,
+                call_purpose=call_purpose,
+                attempt_count=attempt_count,
+                seed_fallback=seed_fallback,
+                response_status=response_status,
             )
             raise
         choices = payload.get("choices") or []
@@ -3002,6 +3195,11 @@ class MyAgent:
                 prompt_chars=prompt_chars,
                 request_body=body,
                 response_payload=payload,
+                call_id=call_id,
+                call_purpose=call_purpose,
+                attempt_count=attempt_count,
+                seed_fallback=seed_fallback,
+                response_status=response_status,
             )
             raise RuntimeError("LLM returned no choices")
         content = (choices[0].get("message") or {}).get("content")
@@ -3019,6 +3217,11 @@ class MyAgent:
                 prompt_chars=prompt_chars,
                 request_body=body,
                 response_payload=payload,
+                call_id=call_id,
+                call_purpose=call_purpose,
+                attempt_count=attempt_count,
+                seed_fallback=seed_fallback,
+                response_status=response_status,
             )
             raise RuntimeError("LLM returned empty content")
         self._log_llm_call_event(
@@ -3036,6 +3239,11 @@ class MyAgent:
             request_body=body,
             response_payload=payload,
             response_content=content,
+            call_id=call_id,
+            call_purpose=call_purpose,
+            attempt_count=attempt_count,
+            seed_fallback=seed_fallback,
+            response_status=response_status,
         )
         return content
 
@@ -3055,6 +3263,11 @@ class MyAgent:
         request_body: dict[str, Any] | None = None,
         response_payload: dict[str, Any] | None = None,
         response_content: str = "",
+        call_id: str = "",
+        call_purpose: str = "",
+        attempt_count: int = 0,
+        seed_fallback: bool = False,
+        response_status: int = 0,
     ) -> None:
         if state is None:
             return
@@ -3068,14 +3281,21 @@ class MyAgent:
             llm_config,
             {
                 "event": "llm_call",
+                "call_id": call_id,
                 "case_id": state.obs.get("case_id"),
                 "profile": profile,
+                "purpose": call_purpose or context_pack_type,
                 "model": llm_config.get("model"),
+                "provider": llm_config.get("provider"),
                 "temperature": (request_body or {}).get("temperature", llm_config.get("temperature", 0)),
                 "seed": (request_body or {}).get("seed"),
                 "prompt_hash": self._json_hash((request_body or {}).get("messages") or []),
                 "output_hash": hashlib.sha256(str(response_content or "").encode("utf-8")).hexdigest() if response_content else "",
                 "success": success,
+                "error_class": self._llm_error_class(error),
+                "attempt_count": int(attempt_count or 0),
+                "seed_fallback": bool(seed_fallback),
+                "http_status": int(response_status or 0),
                 "timeout_seconds": round(float(timeout or 0), 3),
                 "elapsed_seconds": round(elapsed, 3),
                 "started_at": round(started_at - state.started_at, 3),
@@ -3085,11 +3305,32 @@ class MyAgent:
                 "context_chars": int(context_chars or 0),
                 "prompt_chars": int(prompt_chars or 0),
                 "response_chars": response_chars,
+                "request_bytes": len(json.dumps(request_body or {}, ensure_ascii=False).encode("utf-8")),
+                "response_bytes": len(json.dumps(response_payload or {}, ensure_ascii=False).encode("utf-8")),
+                "response_json_valid": bool(response_content and self._parse_json_object(response_content) is not None),
+                "usage": (response_payload or {}).get("usage") if isinstance((response_payload or {}).get("usage"), dict) else {},
+                "network": self._network_diagnostics(llm_config),
                 "request_json": request_body or {},
                 "response_json": response_payload or {},
                 "error": str(error or "")[:240],
             },
         )
+
+    def _llm_error_class(self, error: Any) -> str:
+        text = str(error or "").lower()
+        if not text:
+            return ""
+        if "429" in text or "rate limit" in text or "too many requests" in text:
+            return "rate_limit"
+        if "timeout" in text or "timed out" in text or "deadline" in text:
+            return "timeout"
+        if "http" in text:
+            return "http_error"
+        if any(word in text for word in ["connection", "network", "dns", "name or service", "reset by peer"]):
+            return "network_error"
+        if any(word in text for word in ["no choices", "empty content", "invalid json"]):
+            return "invalid_response"
+        return "other"
 
     def _json_hash(self, value: Any) -> str:
         raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
@@ -3242,8 +3483,9 @@ class MyAgent:
 
     def _heuristic_meetingroom(self, query: str, obs: dict[str, Any]) -> dict[str, Any]:
         explicit_meeting_terms = ["会议室", "会议", "预订", "订会议室", "订房", "工位", "参会人", "日程", "房间"]
-        meeting_actions = ["取消", "延长", "重订", "重新预订", "换大", "加入", "移除"]
-        has_explicit_meeting_signal = any(word in query for word in explicit_meeting_terms) or any(
+        meeting_actions = ["取消", "延长", "重订", "重新预订", "换大", "加入", "加到", "移除", "哪些人", "有哪些人", "参加"]
+        room_ids = self._extract_room_ids(query)
+        has_explicit_meeting_signal = bool(room_ids) or any(word in query for word in explicit_meeting_terms) or any(
             word in query for word in meeting_actions
         )
         informal_meeting_action = bool(re.search(r"(?:开|订|约|安排).{0,12}会(?:[，。；;\n]|$)", query))
@@ -3252,6 +3494,7 @@ class MyAgent:
         # resource constraint.
         if not has_explicit_meeting_signal and not informal_meeting_action:
             return {"intent": "unknown"}
+        booking_directive = bool(re.search(r"(?:选[^，。；;]{0,12})?(?:订|预订)(?!情况|记录)", query))
         intent = "book_single"
         if "取消" in query or "不用" in query:
             intent = "cancel_existing"
@@ -3265,6 +3508,8 @@ class MyAgent:
             word in query for word in ["日程", "有哪些会议", "会议预订", "预订记录", "预订"]
         ):
             intent = "query_booking"
+        if room_ids and not booking_directive and any(word in query for word in ["日程", "预订情况", "占用情况", "空闲情况"]):
+            intent = "query_room_schedule"
         if "加入" in query or "加到" in query:
             intent = "participant_add"
         if "移除" in query:
@@ -3281,14 +3526,17 @@ class MyAgent:
         segments = self._extract_meeting_segments(query)
         if len(segments) > 1 and any(word in query for word in ["同一个房间", "同一房间", "同一个会议室", "同一会议室"]):
             intent = "book_multi_segments_same_room"
-        elif "日程" in query and "订" in query:
+        elif booking_directive and len(room_ids) >= 2 and any(word in query for word in ["更空闲", "最空闲", "哪个空闲", "哪个更空", "比较"]):
+            intent = "book_by_schedule_analysis"
+        elif "日程" in query and booking_directive:
             intent = "book_by_schedule_analysis"
 
         start, end = self._extract_time_range(query)
         if not start:
             start = self._single_time_after(query, ["下午", "上午", "早上", "晚上"])
         office_candidates = self._extract_office_candidates(query)
-        room_ids = self._extract_room_ids(query)
+        if not office_candidates and "小镇" in query and re.search(r"[一二三四五六七八九十\d]\s*(?:楼|层|F)", query, flags=re.I):
+            office_candidates = ["A1", "A2"]
         capacity = self._extract_capacity(query) or (0 if obs.get("mode") == "multi_turn" else 10)
         office_addresses = self._office_address_candidates(query, office_candidates)
         return {
@@ -3313,17 +3561,29 @@ class MyAgent:
         }
 
     def _heuristic_workflow(self, query: str, obs: dict[str, Any]) -> dict[str, Any]:
-        has_leave = ("请" in query and "假" in query) or any(word in query for word in ["事假", "年假", "病假", "育儿假", "年休假"])
+        has_leave = ("请" in query and "假" in query) or any(
+            word in query for word in ["事假", "年假", "病假", "育儿假", "年休假", "婚假", "陪产假", "丧假"]
+        )
         has_expense = self._has_expense_signal(query)
         if not has_leave and not has_expense:
             return {"intent": "unknown"}
-        submit = self._leave_submit_intent(query) if has_leave and not has_expense else self._submit_intent(query)
+        submit = self._default_leave_submit_intent(query) if has_leave and not has_expense else self._submit_intent(query)
         if has_expense and not has_leave:
             intent = "expense_material"
         elif has_leave and not has_expense:
             intent = "leave"
         else:
-            leave_index = min([i for i in [query.find("请假"), query.find("事假"), query.find("年假"), query.find("年休假"), query.find("病假"), query.find("育儿假")] if i >= 0] or [9999])
+            leave_index = min(
+                [
+                    i
+                    for i in [
+                        query.find("请假"), query.find("事假"), query.find("年假"), query.find("年休假"),
+                        query.find("病假"), query.find("育儿假"), query.find("婚假"), query.find("陪产假"), query.find("丧假"),
+                    ]
+                    if i >= 0
+                ]
+                or [9999]
+            )
             expense_index = min([i for i in [query.find("费用"), query.find("采购"), query.find("预算"), query.find("物资"), query.find("报销")] if i >= 0] or [9999])
             if has_leave and any(word in query for word in ["请", "审批人", "事假", "年假", "病假", "育儿假"]):
                 expense_index = 9999
@@ -3356,7 +3616,7 @@ class MyAgent:
             end = "11:00" if "后天上午" in leave_text or "请假的草稿" in leave_text else "12:00"
         leave_type_label = self._target_leave_type_label(leave_text) or self._first_match(
             leave_text,
-            ["育儿假", "年休假", "年假", "病假", "事假"],
+            ["陪产假", "婚假", "丧假", "育儿假", "年休假", "年假", "病假", "事假"],
         ) or ("事假" if "私事" in leave_text or "个人" in leave_text else "")
         reason_label = self._first_match(leave_text, ["住院", "孩子", "私事", "个人事情", "个人事务", "本人有事", "身体不适"]) or leave_type_label
         return {
@@ -3411,6 +3671,52 @@ class MyAgent:
                     domains.add(domain)
         merged["domains"] = sorted(domains)
         return merged
+
+    def _expand_sparse_semantic_result(self, parsed: dict[str, Any], query: str) -> dict[str, Any]:
+        """Expand the compact LLM contract into the existing internal semantic shape."""
+        if isinstance(parsed.get("task_graph"), dict) or not isinstance(parsed.get("tasks"), list):
+            return parsed
+        tasks: list[dict[str, Any]] = []
+        domains: list[str] = []
+        meeting: dict[str, Any] = {"intent": "unknown"}
+        workflow: dict[str, Any] = {"intent": "unknown"}
+        for index, raw in enumerate(parsed.get("tasks") or []):
+            if not isinstance(raw, dict):
+                continue
+            domain = str(raw.get("domain") or "").strip()
+            intent = str(raw.get("intent") or "unknown").strip()
+            if domain not in {"meetingroom", "workflow"} or intent in {"", "unknown"}:
+                continue
+            slots = raw.get("slots") if isinstance(raw.get("slots"), dict) else {}
+            submit_value = raw.get("submit")
+            submit = submit_value is True or str(submit_value).strip().lower() in {"1", "true", "submit"}
+            source_text = self._domain_source_text(query, domain, intent)
+            tasks.append(
+                {
+                    "task_id": f"{domain}_{index + 1}",
+                    "domain": domain,
+                    "intent": intent,
+                    "source_text": source_text,
+                    "slots": slots,
+                    "submit_intent": "submit" if submit and domain == "workflow" else ("draft" if domain == "workflow" else "unknown"),
+                }
+            )
+            if domain not in domains:
+                domains.append(domain)
+            if domain == "meetingroom" and meeting.get("intent") == "unknown":
+                meeting = {"intent": intent, **slots}
+            elif domain == "workflow" and workflow.get("intent") == "unknown":
+                workflow = {"intent": intent, "submit": submit}
+                if intent == "leave":
+                    workflow["leave"] = slots
+                elif intent == "expense_material":
+                    workflow["expense"] = slots
+        return {
+            "domains": domains,
+            "task_graph": {"tasks": tasks},
+            "meetingroom": meeting,
+            "workflow": workflow,
+        }
 
     def _stabilize_meeting_semantic(self, baseline: dict[str, Any], merged: dict[str, Any]) -> None:
         baseline_mr = baseline.get("meetingroom") if isinstance(baseline.get("meetingroom"), dict) else {}
@@ -3519,7 +3825,15 @@ class MyAgent:
             ]
             if not positions:
                 return text
-            start = max(0, min(positions) - 12)
+            trigger = min(positions)
+            hard_start = max(text.rfind(marker, 0, trigger) for marker in ["。", "；", ";", "\n"])
+            connector_words = ["另一个任务", "顺便", "另外", "同时", "并且", "然后", "还有", "再帮"]
+            connector_positions = [(text.rfind(word, 0, trigger), word) for word in connector_words]
+            connector_pos, connector_word = max(connector_positions, key=lambda item: item[0])
+            if connector_pos > hard_start:
+                start = connector_pos + len(connector_word)
+            else:
+                start = hard_start + 1
             workflow_positions = [
                 text.find(key, start + 1)
                 for key in ["另一个任务", "顺便", "另外", "同时", "并且", "请假", "事假", "年假", "费用", "预算", "采购"]
@@ -3551,6 +3865,16 @@ class MyAgent:
         merged_expense = merged_wf.setdefault("expense", {}) if isinstance(merged_wf, dict) else {}
         if not isinstance(merged_expense, dict):
             return
+
+        # Draft/submit is a policy decision, not a free-form model slot.
+        if "submit" in baseline_wf:
+            merged_wf["submit"] = bool(baseline_wf.get("submit"))
+        baseline_leave = baseline_wf.get("leave") if isinstance(baseline_wf.get("leave"), dict) else {}
+        merged_leave = merged_wf.setdefault("leave", {}) if isinstance(merged_wf, dict) else {}
+        if isinstance(merged_leave, dict):
+            for key, value in baseline_leave.items():
+                if value not in (None, "", [], {}):
+                    merged_leave[key] = value
 
         # Regex/tool-contract evidence is stronger than LLM free text.
         if baseline_expense.get("project_code"):
@@ -3645,6 +3969,7 @@ class MyAgent:
             state.meetingroom.needed = False
             state.meetingroom.intent = "unknown"
         self._normalize_meeting_slots(state)
+        self._initialize_meetingroom_skill(state)
 
         state.workflow.intent = str(workflow.get("intent") or "unknown")
         state.workflow.slots.update(workflow)
@@ -3708,53 +4033,340 @@ class MyAgent:
             state.workflow_skill = WorkflowSkillRuntime(skill_id, definition)
         self._sync_workflow_skill(state)
 
+    def _initialize_meetingroom_skill(self, state: RuntimeState) -> None:
+        if not state.meetingroom.needed or state.meetingroom.intent in {"", "unknown"}:
+            state.meetingroom_skill = None
+            return
+        skill_id, definition = self.workflow_skill_registry.select_meetingroom(state.meetingroom.intent)
+        if not definition:
+            state.meetingroom_skill = None
+            return
+        if state.meetingroom_skill is None or state.meetingroom_skill.skill_id != skill_id:
+            state.meetingroom_skill = WorkflowSkillRuntime(skill_id, definition)
+        self._sync_meetingroom_skill(state)
+
     def _sync_workflow_skill(self, state: RuntimeState) -> None:
         skill = state.workflow_skill
         if skill is None:
             return
+        for node in skill.nodes:
+            node_id = str(node.get("id") or "")
+            if skill.statuses.get(node_id) in WorkflowSkillRuntime.TERMINAL_STATUSES:
+                continue
+            skill.apply_validation(node_id, self._validate_workflow_skill_node(state, node))
+
+    def _sync_meetingroom_skill(self, state: RuntimeState) -> None:
+        skill = state.meetingroom_skill
+        if skill is None:
+            return
+        for node in skill.nodes:
+            node_id = str(node.get("id") or "")
+            if skill.statuses.get(node_id) in WorkflowSkillRuntime.TERMINAL_STATUSES:
+                continue
+            skill.apply_validation(node_id, self._validate_meetingroom_skill_node(state, node))
+
+    def _skill_validation(
+        self,
+        status: str,
+        reason: str = "",
+        evidence_refs: list[str] | None = None,
+        fingerprint_value: Any = None,
+    ) -> dict[str, Any]:
+        fingerprint = ""
+        if status == "failed":
+            fingerprint = self._json_hash({"reason": reason, "value": fingerprint_value})
+        return {
+            "status": status,
+            "reason": reason,
+            "evidence_refs": list(evidence_refs or []),
+            "fingerprint": fingerprint,
+        }
+
+    def _validate_workflow_skill_node(self, state: RuntimeState, node: dict[str, Any]) -> dict[str, Any]:
+        validator = str(node.get("validator") or "")
         wf = state.workflow
-        completed: set[str] = set()
-        if wf.evidence.get("applicant"):
-            completed.add("applicant")
-        if wf.evidence.get("catalog"):
-            completed.add("catalog")
-        if wf.evidence.get("schema"):
-            completed.add("schema")
-        if wf.evidence.get("replacement_source_lookup"):
-            completed.add("source_lookup")
-        if wf.evidence.get("replacement_delete_done"):
-            completed.add("delete_source")
-        if wf.intent == "leave":
-            if self._leave_plan(state):
-                completed.add("leave_form")
-            if wf.evidence.get("approver_search_attempts"):
-                completed.add("approver_search")
-            people = self._select_leave_people(state, self._collected_approver_people(wf))
-            if len(people) == 1:
-                completed.add("approver_resolved")
-            if wf.evidence.get("workflow_skill_draft_ir"):
-                completed.add("draft_ir")
-        elif wf.intent == "expense_material":
-            if wf.evidence.get("verified_project"):
-                completed.add("project")
-            if wf.evidence.get("category_options") and wf.evidence.get("selected_material_category"):
-                completed.add("category")
-            if wf.evidence.get("subclass_options"):
-                completed.add("subclass")
-            if wf.evidence.get("workflow_skill_draft_ir"):
-                completed.add("draft_ir")
-        if wf.evidence.get("save_done"):
-            completed.add("save")
-        if wf.evidence.get("oa_checked"):
-            completed.add("verify")
-        skill.sync_completed(completed)
+        evidence = wf.evidence
+        if validator == "workflow.applicant_verified":
+            applicant = evidence.get("applicant") if isinstance(evidence.get("applicant"), dict) else {}
+            if not applicant:
+                return self._skill_validation("pending")
+            if applicant.get("user_id") and applicant.get("employee_no"):
+                return self._skill_validation("passed", evidence_refs=["user.get_info"])
+            return self._skill_validation("failed", "invalid_applicant", fingerprint_value=applicant)
+        if validator == "workflow.catalog_verified":
+            catalog = evidence.get("catalog") if isinstance(evidence.get("catalog"), dict) else {}
+            if not catalog:
+                return self._skill_validation("pending")
+            expected = WORKFLOW_IDS["leave"] if wf.intent == "leave" else WORKFLOW_IDS["expense"]
+            workflows = [item for item in catalog.get("workflows") or [] if isinstance(item, dict)]
+            if any(int(item.get("workflow_id") or 0) == expected for item in workflows):
+                return self._skill_validation("passed", evidence_refs=["workflow.catalog"])
+            return self._skill_validation("failed", "workflow_not_found", fingerprint_value=catalog)
+        if validator == "workflow.schema_verified":
+            schema_result = evidence.get("schema") if isinstance(evidence.get("schema"), dict) else {}
+            if not schema_result:
+                return self._skill_validation("pending")
+            schema = schema_result.get("schema") if isinstance(schema_result.get("schema"), dict) else schema_result
+            if isinstance(schema, dict) and schema.get("required_fields"):
+                return self._skill_validation("passed", evidence_refs=["workflow.schema"])
+            return self._skill_validation("failed", "invalid_workflow_schema", fingerprint_value=schema_result)
+        if validator == "workflow.leave_source_verified":
+            if "replacement_source_lookup" not in evidence:
+                return self._skill_validation("pending")
+            source = self._replacement_leave_source_item(state)
+            if source:
+                return self._skill_validation("passed", evidence_refs=["oa.done.list"])
+            return self._skill_validation("failed", "existing_workflow_not_found", fingerprint_value=evidence.get("replacement_source_lookup"))
+        if validator == "workflow.leave_source_deleted":
+            deleted = evidence.get("replacement_delete_done") if isinstance(evidence.get("replacement_delete_done"), dict) else {}
+            if deleted:
+                return self._skill_validation("passed", evidence_refs=["workflow.delete"])
+            return self._skill_validation("pending")
+        if validator == "workflow.leave_form_valid":
+            plan = self._leave_plan(state)
+            if not plan:
+                return self._skill_validation("pending")
+            required = ["start_time", "end_time", "leave_type", "reason", "duration"]
+            if all(plan.get(key) not in (None, "") for key in required):
+                return self._skill_validation("passed", evidence_refs=["user_text"])
+            return self._skill_validation("failed", "invalid_leave_form", fingerprint_value=plan)
+        if validator == "workflow.leave_attachment_verified":
+            directory = self._leave_attachment_directory(state)
+            if not directory:
+                return self._skill_validation("passed", evidence_refs=["user_text:no_attachment_required"])
+            if not evidence.get("file_list_attempted"):
+                return self._skill_validation("pending")
+            plan = self._leave_plan(state)
+            attachment = self._select_leave_attachment(state, plan or {})
+            if attachment:
+                return self._skill_validation("passed", evidence_refs=["file.list"])
+            return self._skill_validation("failed", "leave_attachment_not_found", fingerprint_value=evidence.get("file_list_attempted"))
+        if validator == "workflow.approver_search_verified":
+            attempts = evidence.get("approver_search_attempts") or []
+            if not attempts:
+                return self._skill_validation("pending")
+            if self._collected_approver_people(wf):
+                return self._skill_validation("passed", evidence_refs=["workflow.search_person"])
+            plan = self._leave_plan(state)
+            next_args = self._next_approver_search_args(state, plan, mark_attempt=False) if plan else None
+            if next_args is not None:
+                return self._skill_validation("failed", "empty_approver_result", fingerprint_value=len(attempts))
+            return self._skill_validation("passed", evidence_refs=["workflow.search_person"])
+        if validator == "workflow.approver_resolved":
+            people = self._deterministic_leave_people(state, self._collected_approver_people(wf))
+            if len(people) == 1 and people[0].get("user_id"):
+                return self._skill_validation("passed", evidence_refs=["workflow.search_person"])
+            if evidence.get("approver_search_attempts") and self._next_approver_search_args(state, self._leave_plan(state) or {}, mark_attempt=False) is None:
+                return self._skill_validation("failed", "ambiguous_approver", fingerprint_value=[p.get("user_id") for p in people])
+            return self._skill_validation("pending")
+        if validator == "workflow.expense_project_verified":
+            project = evidence.get("verified_project") if isinstance(evidence.get("verified_project"), dict) else {}
+            if not project:
+                return self._skill_validation("pending")
+            if project.get("project_code") and project.get("wbs_code") and evidence.get("project_search_history"):
+                return self._skill_validation("passed", evidence_refs=["workflow.project_search"])
+            return self._skill_validation("failed", "invalid_project_evidence", fingerprint_value=project)
+        if validator == "workflow.expense_category_verified":
+            options = (evidence.get("category_options") or {}).get("options") or []
+            selected = evidence.get("selected_material_category") if isinstance(evidence.get("selected_material_category"), dict) else {}
+            if not options or not selected:
+                return self._skill_validation("pending")
+            allowed = {str(item.get("value") or item.get("code") or "") for item in options if isinstance(item, dict)}
+            selected_id = self._expense_category_id(selected)
+            if selected_id and selected_id in allowed:
+                return self._skill_validation("passed", evidence_refs=["workflow.browser_search:category"])
+            return self._skill_validation("failed", "invalid_material_category", fingerprint_value={"selected": selected_id, "allowed": sorted(allowed)})
+        if validator == "workflow.expense_subclass_verified":
+            options = (evidence.get("subclass_options") or {}).get("options") or []
+            if not options:
+                return self._skill_validation("pending")
+            bindings = evidence.get("expense_bindings") if isinstance(evidence.get("expense_bindings"), dict) else {}
+            project = evidence.get("verified_project") if isinstance(evidence.get("verified_project"), dict) else {}
+            category = evidence.get("selected_material_category") if isinstance(evidence.get("selected_material_category"), dict) else {}
+            expected = f"{self._expense_project_fingerprint(project)}|{self._expense_category_id(category)}"
+            binding = bindings.get("subclass") if isinstance(bindings.get("subclass"), dict) else {}
+            if binding.get("dependency_fingerprint") == expected and binding.get("allowed_ids"):
+                return self._skill_validation("passed", evidence_refs=["workflow.browser_search:subclass"])
+            return self._skill_validation("failed", "stale_subclass_candidates", fingerprint_value={"expected": expected, "binding": binding})
+        if validator in {"workflow.leave_draft_valid", "workflow.expense_draft_valid"}:
+            draft = evidence.get("workflow_skill_draft_ir") if isinstance(evidence.get("workflow_skill_draft_ir"), dict) else {}
+            save_args = draft.get("save_args") if isinstance(draft.get("save_args"), dict) else {}
+            if not save_args:
+                return self._skill_validation("pending")
+            preflight = self.preflight_guard.validate_write(state, "workflow.save", save_args)
+            if preflight.get("passed"):
+                return self._skill_validation("passed", evidence_refs=preflight.get("evidence_refs") or [])
+            return self._skill_validation("failed", str(preflight.get("reason") or "workflow_preflight_failed"), fingerprint_value=preflight)
+        if validator == "workflow.save_verified":
+            saved = evidence.get("save_done") if isinstance(evidence.get("save_done"), dict) else {}
+            if not saved:
+                return self._skill_validation("pending")
+            result = saved.get("result") if isinstance(saved.get("result"), dict) else {}
+            if result.get("draft_saved"):
+                return self._skill_validation("passed", evidence_refs=["workflow.save"])
+            return self._skill_validation("failed", "workflow_save_failed", fingerprint_value=saved)
+        if validator == "workflow.oa_verified":
+            if evidence.get("oa_checked") is not None:
+                return self._skill_validation("passed", evidence_refs=["oa.done.list" if wf.slots.get("submit") else "oa.todo.list"])
+            return self._skill_validation("pending")
+        return self._skill_validation("failed", "unknown_skill_validator", fingerprint_value=validator)
+
+    def _validate_meetingroom_skill_node(self, state: RuntimeState, node: dict[str, Any]) -> dict[str, Any]:
+        validator = str(node.get("validator") or "")
+        mr = state.meetingroom
+        evidence = mr.evidence
+        if validator == "meeting.rooms_queried":
+            if "room_candidates" not in evidence and not evidence.get("room_lists_by_day"):
+                return self._skill_validation("pending")
+            rooms = (evidence.get("room_candidates") or {}).get("rooms") or []
+            day_rooms = [
+                room
+                for result in (evidence.get("room_lists_by_day") or {}).values()
+                if isinstance(result, dict)
+                for room in result.get("rooms") or []
+                if isinstance(room, dict)
+            ]
+            if rooms or day_rooms:
+                return self._skill_validation("passed", evidence_refs=["meetingroom.room.list"])
+            return self._skill_validation("failed", "no_bookable_room", fingerprint_value=len(evidence.get("tried_room_lists") or []))
+        if validator == "meeting.schedules_queried":
+            schedules = evidence.get("schedules") if isinstance(evidence.get("schedules"), dict) else {}
+            expected_room_ids = {str(item) for item in mr.slots.get("room_ids") or [] if item}
+            if schedules and (not expected_room_ids or expected_room_ids.issubset({str(item) for item in schedules})):
+                return self._skill_validation("passed", evidence_refs=["meetingroom.room.schedule"])
+            if evidence.get("room_candidates"):
+                return self._skill_validation("passed", evidence_refs=["meetingroom.room.list"])
+            return self._skill_validation("pending")
+        if validator == "meeting.room_selected":
+            selected = evidence.get("pending_selected_room")
+            if selected:
+                return self._skill_validation("passed", evidence_refs=["meetingroom.room.list"])
+            if evidence.get("room_candidates"):
+                selected = self._select_room_for_booking(state)
+                if selected:
+                    evidence["pending_selected_room"] = selected
+                    return self._skill_validation("passed", evidence_refs=["meetingroom.room.list"])
+                return self._skill_validation("failed", "no_bookable_room", fingerprint_value=evidence.get("room_candidates"))
+            return self._skill_validation("pending")
+        if validator == "meeting.booking_created":
+            return self._skill_validation("passed", evidence_refs=["meetingroom.booking.create"]) if evidence.get("create_done") else self._skill_validation("pending")
+        if validator == "meeting.booking_located":
+            if evidence.get("selected_booking"):
+                return self._skill_validation("passed", evidence_refs=["meetingroom.booking.list"])
+            if mr.slots.get("order_id"):
+                return self._skill_validation("passed", evidence_refs=["user_text:order_id"])
+            if "booking_query" in evidence:
+                return self._skill_validation("failed", "existing_booking_not_found", fingerprint_value=evidence.get("booking_query"))
+            return self._skill_validation("pending")
+        if validator == "meeting.booking_queried":
+            return self._skill_validation("passed", evidence_refs=["meetingroom.booking.list"]) if "booking_query" in evidence else self._skill_validation("pending")
+        if validator == "meeting.booking_cancelled":
+            return self._skill_validation("passed", evidence_refs=["meetingroom.booking.cancel"]) if evidence.get("cancel_done") else self._skill_validation("pending")
+        if validator == "meeting.booking_extended":
+            if evidence.get("extend_done"):
+                return self._skill_validation("passed", evidence_refs=["meetingroom.booking.extend"])
+            if evidence.get("extend_attempted"):
+                return self._skill_validation("failed", "conflict_after_requested_extension", fingerprint_value=evidence.get("extend_attempted"))
+            return self._skill_validation("pending")
+        if validator == "meeting.participants_read":
+            return self._skill_validation("passed", evidence_refs=["meetingroom.booking.participant.list"]) if evidence.get("participants") else self._skill_validation("pending")
+        if validator == "meeting.participants_resolved":
+            participants = mr.slots.get("participants") if isinstance(mr.slots.get("participants"), list) else []
+            if not participants:
+                return self._skill_validation("failed", "missing_required_info", fingerprint_value="participants")
+            unresolved = []
+            for index, person in enumerate(participants):
+                users = (evidence.get(f"participant_user_{index}") or {}).get("users") or []
+                if not person.get("user_id") and not person.get("employee_no") and not users:
+                    unresolved.append(index)
+            if not unresolved:
+                return self._skill_validation("passed", evidence_refs=["user.get_info"])
+            return self._skill_validation("pending")
+        if validator == "meeting.participants_updated":
+            participants = mr.slots.get("participants") if isinstance(mr.slots.get("participants"), list) else []
+            results = evidence.get("participant_results") or []
+            if participants and len(results) >= len(participants):
+                return self._skill_validation("passed", evidence_refs=["meetingroom.booking.participant.add/remove"])
+            return self._skill_validation("pending")
+        return self._skill_validation("failed", "unknown_skill_validator", fingerprint_value=validator)
+
+    def _deterministic_leave_people(self, state: RuntimeState, people: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        leave = self._leave_slots(state)
+        keyword = str(leave.get("approver_name_hint") or leave.get("approver_keyword") or "")
+        title = str(leave.get("approver_title_hint") or leave.get("approver_title") or "")
+        department = str(leave.get("approver_department_hint") or "")
+        filtered = list(people)
+        if keyword and keyword not in {"一个经", "一个经理", "经理", "一个", "某个", "任意", "找一个"}:
+            filtered = [person for person in filtered if keyword in str(person.get("name") or "") or keyword in str(person.get("employee_no") or "")]
+        if title:
+            matched = [person for person in filtered if title in str(person.get("title") or "") or title in str(person.get("name") or "")]
+            if matched:
+                filtered = matched
+        if department:
+            matched = [person for person in filtered if department in str(person.get("department") or person.get("department_name") or person.get("org_name") or "")]
+            if matched:
+                filtered = matched
+        if len(filtered) > 1 and not keyword and not title and not department:
+            remembered = self._select_leave_approver_from_memory(state, filtered)
+            if remembered:
+                return [remembered]
+        return filtered
+
+    def _select_leave_approver_from_memory(
+        self,
+        state: RuntimeState,
+        people: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if not people:
+            return None
+        leave = self._leave_slots(state)
+        if any(leave.get(key) for key in ["approver_keyword", "approver_name_hint", "approver_title", "approver_title_hint", "approver_employee_no"]):
+            return None
+        by_id = {str(person.get("user_id") or ""): person for person in people if isinstance(person, dict) and person.get("user_id")}
+        query = self._normalize_memory_text(self._full_query(state.obs))
+        query_bigrams = self._memory_bigrams(query)
+        leave_type = self._leave_type_value(leave.get("leave_type_label") or self._leave_query(state))
+        submit = bool(state.workflow.slots.get("submit"))
+        matches: list[tuple[float, dict[str, Any]]] = []
+        for entry in self.static_context.leave_defaults.get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            approver_id = str(entry.get("approver_user_id") or "")
+            if approver_id not in by_id or bool(entry.get("submit")) != submit:
+                continue
+            if leave_type and str(entry.get("leave_type") or "") != leave_type:
+                continue
+            memory_text = self._normalize_memory_text(entry.get("request_text") or "")
+            memory_bigrams = self._memory_bigrams(memory_text)
+            overlap = len(query_bigrams & memory_bigrams) / max(1, len(query_bigrams | memory_bigrams))
+            if overlap >= 0.2:
+                matches.append((overlap, entry))
+        if not matches:
+            return None
+        matches.sort(key=lambda item: (-item[0], str(item[1].get("memory_id") or "")))
+        best_score, best = matches[0]
+        conflicting = [entry for score, entry in matches[1:] if best_score - score < 0.03 and entry.get("approver_user_id") != best.get("approver_user_id")]
+        if conflicting:
+            return None
+        chosen = by_id.get(str(best.get("approver_user_id") or ""))
+        if chosen:
+            state.workflow.evidence["leave_default_approver_memory"] = {
+                "memory_id": best.get("memory_id"),
+                "source_sha256": best.get("source_sha256"),
+                "score": round(best_score, 4),
+                "selected_id": best.get("approver_user_id"),
+            }
+        return chosen
 
     def _mark_workflow_skill_action_running(self, state: RuntimeState, tool: str) -> None:
-        skill = state.workflow_skill
-        if skill is None or not (tool.startswith("workflow.") or tool.startswith("oa.") or tool == "user.get_info"):
+        skill = state.workflow_skill if tool.startswith(("workflow.", "oa.")) or tool == "file.list" else state.meetingroom_skill if tool.startswith("meetingroom.") else None
+        if tool == "user.get_info":
+            skill = state.meetingroom_skill if state.meetingroom.intent.startswith("participant_") else state.workflow_skill
+        if skill is None:
             return
         for node in skill.ready_nodes():
-            if str(node.get("tool") or "") == tool:
+            node_tools = [str(node.get("tool") or ""), *[str(item) for item in node.get("tools") or []]]
+            if tool in node_tools:
                 skill.mark_running(str(node.get("id") or ""))
                 return
 
@@ -3930,6 +4542,7 @@ class MyAgent:
             state.meetingroom.intent = self._normalize_meeting_intent(str(task.get("intent") or "unknown"), slots)
             state.meetingroom.slots = slots
             self._normalize_meeting_slots(state)
+            self._initialize_meetingroom_skill(state)
             return
 
         intent = str(task.get("intent") or "unknown")
@@ -4039,6 +4652,10 @@ class MyAgent:
         return any(word in text for word in ["订", "预订", "取消", "延长", "换大", "加入", "移除", "哪些人", "参会人"])
 
     def _protect_specific_meeting_slots(self, current: dict[str, Any], incoming: dict[str, Any]) -> None:
+        current_room_ids = [str(item) for item in current.get("room_ids") or [] if item]
+        incoming_room_ids = [str(item) for item in incoming.get("room_ids") or [] if item]
+        if current_room_ids:
+            incoming["room_ids"] = self._dedupe([*current_room_ids, *incoming_room_ids])
         current_day = str(current.get("day_text") or "")
         incoming_day = str(incoming.get("day_text") or "")
         if current_day and incoming_day and self._day_text_is_more_specific(current_day, incoming_day):
@@ -4110,6 +4727,10 @@ class MyAgent:
                 continue
             if target in {"room_ids", "office_candidates", "office_address_candidates"} and not isinstance(value, list):
                 out[target] = [str(value)]
+            elif target in {"start", "end"}:
+                normalized_time = self._canonical_time_value(value)
+                if normalized_time:
+                    out[target] = normalized_time
             elif target == "capacity":
                 cap = self._safe_int(value)
                 if cap:
@@ -4373,22 +4994,30 @@ class MyAgent:
                 reads += int(not bool(wf.evidence.get("schema")))
                 writes += int(not bool(wf.evidence.get("save_done")))
         elif domain == "meetingroom" and state.meetingroom.needed and state.meetingroom.status in {"pending", "ready"}:
-            mr = state.meetingroom
-            if mr.intent in {"query_booking", "cancel_existing", "extend_existing", "cancel_rebook_existing", "rebook_larger_existing"}:
-                reads += int(not bool(mr.evidence.get("booking_query")))
-            elif mr.intent in {"participant_add", "participant_remove", "participant_list"}:
-                reads += int(not bool(mr.evidence.get("booking_query")))
+            self._sync_meetingroom_skill(state)
+            if state.meetingroom_skill is not None:
+                reads = state.meetingroom_skill.remaining_cost({"read", "postcheck"})
+                writes = state.meetingroom_skill.remaining_cost({"write"})
             else:
-                reads += int("room_candidates" not in mr.evidence)
-            if mr.intent not in {"query_booking", "query", "query_room_schedule", "participant_list"}:
-                writes += 2 if self._is_rebook_intent(mr.intent) and not mr.evidence.get("cancel_done") else 1
+                mr = state.meetingroom
+                if mr.intent in {"query_booking", "cancel_existing", "extend_existing", "cancel_rebook_existing", "rebook_larger_existing"}:
+                    reads += int(not bool(mr.evidence.get("booking_query")))
+                elif mr.intent in {"participant_add", "participant_remove", "participant_list"}:
+                    reads += int(not bool(mr.evidence.get("booking_query")))
+                else:
+                    reads += int("room_candidates" not in mr.evidence)
+                if mr.intent not in {"query_booking", "query", "query_room_schedule", "participant_list"}:
+                    writes += 2 if self._is_rebook_intent(mr.intent) and not mr.evidence.get("cancel_done") else 1
         return {"reads": reads, "writes": writes, "total": reads + writes}
 
     def _read_plan_step_reserve(self, state: RuntimeState) -> int:
         reserve = 0
         mr = state.meetingroom
         if mr.needed and mr.status in {"pending", "ready"}:
-            if self._is_rebook_intent(mr.intent) and not mr.evidence.get("cancel_done"):
+            self._sync_meetingroom_skill(state)
+            if state.meetingroom_skill is not None:
+                reserve += state.meetingroom_skill.remaining_cost({"write", "postcheck"})
+            elif self._is_rebook_intent(mr.intent) and not mr.evidence.get("cancel_done"):
                 reserve += 2
             elif mr.intent in {"participant_add", "participant_remove"}:
                 participants = mr.slots.get("participants") if isinstance(mr.slots.get("participants"), list) else []
@@ -5101,15 +5730,10 @@ class MyAgent:
                 "Produce the top 3 alternative project_name substring queries that could appear inside formal enterprise project names. "
                 "Prefer concise parent-theme terms, formal project core words, and business-objective terms inferred from the user's project hint, material category, and line items. "
                 "At least one variant should be a narrower or broader business phrase derived from the user-provided project wording when the failed phrase is long or event-like. "
-                "Score each query from 0 to 1 by expected retrieval probability, not lexical similarity to the failed query. "
                 "Do not output project_code or wbs_code unless typed by the user. Do not choose a project. "
-                "Avoid exact failed args and amount/material/action-only words. Never return generic state words such as 项目、平台、系统、工程 or 专项 alone; every query must be a concrete business phrase of at least four Chinese characters."
+                "Avoid exact failed args and amount/material/action-only words. Return only the ordered query strings without scores or explanations."
             ),
-            "output_schema": {
-                "variants": [
-                    {"project_name": "substring query", "score": 0.0, "reason": "short reason"}
-                ]
-            },
+            "output_schema": {"queries": ["substring query"]},
         }
         try:
             content = self._chat_completion(
@@ -5129,21 +5753,21 @@ class MyAgent:
                 profile="strong",
                 context_pack_type=str(context_pack.get("pack_type") or "workflow_project_empty_mapping_context"),
                 context_chars=int(context_pack.get("chars") or 0),
+                max_output_tokens=128,
+                call_purpose="project_empty_retry_mapping",
             )
             parsed = self._parse_json_object(content) or {}
-            raw_variants = parsed.get("variants") if isinstance(parsed.get("variants"), list) else []
+            raw_variants = parsed.get("queries") if isinstance(parsed.get("queries"), list) else []
+            if not raw_variants and isinstance(parsed.get("variants"), list):
+                raw_variants = parsed.get("variants") or []
             variants: list[dict[str, Any]] = []
-            for raw in raw_variants[:6]:
+            for index, raw in enumerate(raw_variants[:6]):
                 if isinstance(raw, dict):
                     name = self._clean_project_phrase(str(raw.get("project_name") or raw.get("keyword") or ""))
-                    score = self._bounded_float(raw.get("score"), 0.0)
-                    reason = str(raw.get("reason") or "")
                 else:
                     name = self._clean_project_phrase(str(raw or ""))
-                    score = 0.5
-                    reason = ""
                 if name and self._valid_project_search_candidate(name, allow_short=True):
-                    variants.append({"project_name": name, "score": score, "reason": reason, "source": "llm"})
+                    variants.append({"project_name": name, "score": max(0.0, 1.0 - index * 0.1), "reason": "", "source": "llm"})
             expense[cache_key] = variants
             self._debug_log(llm_config, {"event": "project_search_mapping_variants", "variants": variants, "raw": parsed})
             return variants
@@ -5556,6 +6180,9 @@ class MyAgent:
 
     def _next_meetingroom_action(self, state: RuntimeState) -> StepAction | None:
         mr = state.meetingroom
+        self._sync_meetingroom_skill(state)
+        if state.meetingroom_skill is not None and state.meetingroom_skill.blocked_reason:
+            return self._block_meetingroom(state, state.meetingroom_skill.blocked_reason)
         intent = mr.intent
         if intent == "unknown":
             return self._block_meetingroom(state, "missing_required_info")
@@ -5625,6 +6252,28 @@ class MyAgent:
         slots = mr.slots
         schedules = mr.evidence.setdefault("schedules", {})
         room_ids = slots.get("room_ids") or []
+        if mr.intent == "query_room_schedule":
+            if not room_ids:
+                return self._block_meetingroom(state, "missing_required_info")
+            for room_id in room_ids:
+                if room_id not in schedules:
+                    start_date, end_date = self._schedule_range(state)
+                    return StepAction(
+                        "tool",
+                        "meetingroom.room.schedule",
+                        {"room_id": room_id, "start_date": start_date, "end_date": end_date},
+                    )
+            start_date, end_date = self._schedule_range(state)
+            mr.status = "done"
+            mr.result = {
+                "status": "queried",
+                "room_id": room_ids[0] if len(room_ids) == 1 else None,
+                "room_ids": room_ids if len(room_ids) > 1 else None,
+                "start_date": start_date,
+                "end_date": end_date,
+            }
+            mr.result = {key: value for key, value in mr.result.items() if value is not None}
+            return None
         if room_ids and self._explicit_schedule_then_book(state):
             for room_id in room_ids:
                 if room_id not in schedules:
@@ -5699,7 +6348,7 @@ class MyAgent:
         return self._next_booking_action(state)
 
     def _explicit_schedule_then_book(self, state: RuntimeState) -> bool:
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         return bool(state.meetingroom.slots.get("room_ids")) and any(word in query for word in ["查一下", "查询", "日程", "安排"]) and any(
             word in query for word in ["订", "预订", "然后"]
         )
@@ -5864,6 +6513,8 @@ class MyAgent:
     def _next_workflow_action(self, state: RuntimeState) -> StepAction | None:
         wf = state.workflow
         self._sync_workflow_skill(state)
+        if state.workflow_skill is not None and state.workflow_skill.blocked_reason:
+            return self._block_workflow(state, state.workflow_skill.blocked_reason)
         if wf.intent == "leave":
             if state.workflow_skill and state.workflow_skill.skill_id == "workflow.leave.replace_submit":
                 replacement_action = self._next_leave_replace_action(state)
@@ -5902,6 +6553,10 @@ class MyAgent:
         plan = self._leave_plan(state)
         if not plan:
             return self._block_workflow(state, "missing_required_info")
+        attachment_directory = self._leave_attachment_directory(state)
+        if attachment_directory and not wf.evidence.get("file_list_attempted"):
+            wf.evidence["leave_attachment_directory"] = attachment_directory
+            return StepAction("tool", "file.list", {"directory": attachment_directory})
         people = self._collected_approver_people(wf)
         if not people:
             args = self._next_approver_search_args(state, plan)
@@ -5915,12 +6570,20 @@ class MyAgent:
             next_plan = self._next_recurring_leave_plan(state)
             if next_plan:
                 save_args = self._leave_save_args(state, next_plan, people[0])
-                wf.evidence["workflow_skill_draft_ir"] = {"workflow_id": WORKFLOW_IDS["leave"], "submit": save_args.get("submit")}
+                wf.evidence["workflow_skill_draft_ir"] = {
+                    "workflow_id": WORKFLOW_IDS["leave"],
+                    "submit": save_args.get("submit"),
+                    "save_args": save_args,
+                }
                 self._sync_workflow_skill(state)
                 return StepAction("tool", "workflow.save", save_args)
             return self._next_oa_action(state, "请假")
         save_args = self._leave_save_args(state, plan, people[0])
-        wf.evidence["workflow_skill_draft_ir"] = {"workflow_id": WORKFLOW_IDS["leave"], "submit": save_args.get("submit")}
+        wf.evidence["workflow_skill_draft_ir"] = {
+            "workflow_id": WORKFLOW_IDS["leave"],
+            "submit": save_args.get("submit"),
+            "save_args": save_args,
+        }
         self._sync_workflow_skill(state)
         return StepAction("tool", "workflow.save", save_args)
 
@@ -5967,7 +6630,9 @@ class MyAgent:
             if args is not None:
                 return StepAction("tool", "workflow.project_search", args)
         if len(projects) != 1:
-            args = self._next_project_search_args(state, expense, allow_llm=not bool(wf.evidence.get("project_candidates")))
+            args = self._disambiguating_project_search_args(state, expense, projects)
+            if args is None:
+                args = self._next_project_search_args(state, expense, allow_llm=not bool(wf.evidence.get("project_candidates")))
             if args is None and not wf.evidence.get("project_candidates"):
                 args = self._project_search_args_from_llm(state, expense, force=True)
             if args is not None:
@@ -6040,6 +6705,7 @@ class MyAgent:
             "workflow_id": WORKFLOW_IDS["expense"],
             "submit": save_args_or_reason.get("submit"),
             "total_amount": ((save_args_or_reason.get("data") or {}).get("total_amount")),
+            "save_args": save_args_or_reason,
         }
         self._sync_workflow_skill(state)
         return StepAction("tool", "workflow.save", save_args_or_reason)
@@ -6077,9 +6743,10 @@ class MyAgent:
         if action.kind == "block_meetingroom":
             state.meetingroom.status = "blocked"
             state.meetingroom.blocked_reason = action.args.get("reason", "missing_required_info")
-            result = {"status": "blocked", "reason": state.meetingroom.blocked_reason}
+            override = action.args.get("result") if isinstance(action.args.get("result"), dict) else {}
+            result = dict(override) if override else {"status": "blocked", "reason": state.meetingroom.blocked_reason}
             if action.args.get("order_id"):
-                result["order_id"] = action.args["order_id"]
+                result.setdefault("order_id", action.args["order_id"])
             state.meetingroom.result = result
             record = {"action": "block_meetingroom", "args": action.args, "result": result}
             self._annotate_action_record(state, record, action_started, bucket="program")
@@ -6230,11 +6897,15 @@ class MyAgent:
 
     def _mark_domain_blocked_after_preflight(self, state: RuntimeState, tool: str, reason: str) -> None:
         if tool.startswith("meetingroom."):
+            if state.meetingroom_skill is not None:
+                state.meetingroom_skill.mark_blocked(reason)
             state.meetingroom.status = "blocked"
             state.meetingroom.blocked_reason = reason
             state.meetingroom.result = {"status": "blocked", "reason": reason}
             return
         if tool.startswith("workflow.") or tool.startswith("oa."):
+            if state.workflow_skill is not None:
+                state.workflow_skill.mark_blocked(reason)
             state.workflow.status = "blocked"
             state.workflow.blocked_reason = reason
             state.workflow.result = {"status": "blocked", "reason": reason}
@@ -6359,10 +7030,72 @@ class MyAgent:
             tool == "user.get_info" and state.meetingroom.intent.startswith("participant_")
         ):
             self._apply_meeting_tool_result(state, tool, args, result)
-        if tool.startswith("workflow.") or tool.startswith("oa.") or tool == "user.get_info":
+        if tool.startswith("workflow.") or tool.startswith("oa.") or tool in {"user.get_info", "file.list"}:
             self._apply_workflow_tool_result(state, tool, args, result)
         if isinstance(result, dict) and not result.get("error"):
             state.completed_tools.add(tool)
+        self._record_skill_tool_outcome(state, tool, args, result)
+        self._sync_meetingroom_skill(state)
+        self._sync_workflow_skill(state)
+
+    def _record_skill_tool_outcome(self, state: RuntimeState, tool: str, args: dict[str, Any], result: dict[str, Any]) -> None:
+        if not isinstance(result, dict):
+            return
+        skill = state.meetingroom_skill if tool.startswith("meetingroom.") else state.workflow_skill
+        if tool == "user.get_info":
+            skill = state.meetingroom_skill if state.meetingroom.intent.startswith("participant_") else state.workflow_skill
+        if skill is None:
+            return
+        node = next(
+            (
+                item
+                for item in skill.nodes
+                if skill.statuses.get(str(item.get("id") or "")) == "running"
+                and tool in [str(item.get("tool") or ""), *[str(value) for value in item.get("tools") or []]]
+            ),
+            None,
+        )
+        if node is None:
+            return
+        node_id = str(node.get("id") or "")
+        reason = ""
+        if result.get("error"):
+            if tool == "workflow.project_search":
+                reason = "project_search_error"
+            elif tool == "workflow.search_person":
+                reason = "approver_search_error"
+            elif tool == "workflow.browser_search" and node_id == "subclass":
+                reason = "subclass_search_error"
+            elif tool.startswith("oa."):
+                reason = "oa_lookup_error"
+            else:
+                reason = f"{node_id}_tool_error"
+        elif tool == "workflow.project_search" and not (result.get("projects") or []):
+            reason = "empty_project_result"
+        elif tool == "workflow.search_person" and not (result.get("people") or []):
+            reason = "empty_approver_result"
+        elif tool == "workflow.browser_search" and not (result.get("options") or []):
+            reason = "empty_subclass_result" if node_id == "subclass" else "empty_category_result"
+        elif tool == "workflow.save" and not result.get("draft_saved"):
+            reason = "workflow_save_failed"
+        elif tool == "workflow.delete" and not result.get("deleted"):
+            reason = "workflow_delete_failed"
+        elif tool == "meetingroom.booking.create" and not result.get("success"):
+            reason = "booking_create_failed"
+        elif tool == "meetingroom.booking.cancel" and not result.get("cancelled"):
+            reason = "booking_cancel_failed"
+        elif tool == "meetingroom.booking.extend" and not result.get("extended"):
+            reason = "conflict_after_requested_extension"
+        elif tool in {"meetingroom.booking.participant.add", "meetingroom.booking.participant.remove"} and not (
+            result.get("success") or result.get("added") or result.get("removed")
+        ):
+            reason = "participant_update_failed"
+        if reason:
+            skill.resolve_failure(
+                node_id,
+                reason,
+                fingerprint=self._json_hash({"tool": tool, "args": args, "result": result, "node": node_id}),
+            )
 
     def _apply_meeting_tool_result(self, state: RuntimeState, tool: str, args: dict[str, Any], result: dict[str, Any]) -> None:
         mr = state.meetingroom
@@ -6375,8 +7108,11 @@ class MyAgent:
             mr.evidence[f"participant_user_{index}"] = result
         elif tool == "user.get_workspace":
             mr.evidence["workspace"] = result
+            # Parallel room reads can select before workspace evidence arrives.
+            mr.evidence.pop("pending_selected_room", None)
         elif tool == "meetingroom.room.list":
             mr.evidence["room_candidates"] = self._merge_room_list_results(mr.evidence.get("room_candidates"), result)
+            mr.evidence.pop("pending_selected_room", None)
             self._record_selected_room_capacity_from_candidates(mr, result)
             if result.get("day"):
                 mr.evidence.setdefault("room_lists_by_day", {})[str(result.get("day"))] = result
@@ -6425,7 +7161,7 @@ class MyAgent:
             mr.evidence["participants"] = result
             self._apply_participant_list_evidence(state, result)
         elif tool in {"meetingroom.booking.participant.add", "meetingroom.booking.participant.remove"}:
-            if not result.get("error"):
+            if not result.get("error") and (result.get("success") or result.get("added") or result.get("removed")):
                 index = int(mr.evidence.get("participant_index") or 0)
                 participant_result = self._participant_result_from_tool(tool, args, result, mr, index)
                 mr.evidence.setdefault("participant_results", []).append(participant_result)
@@ -6455,6 +7191,8 @@ class MyAgent:
 
     def _apply_workflow_tool_result(self, state: RuntimeState, tool: str, args: dict[str, Any], result: dict[str, Any]) -> None:
         wf = state.workflow
+        if tool == "file.list":
+            wf.evidence["file_list_attempted"] = {"args": dict(args), "result": result}
         if tool == "workflow.search_person":
             tried = wf.evidence.setdefault("approver_search_tried", [])
             if args not in tried:
@@ -6492,6 +7230,8 @@ class MyAgent:
                     wf.evidence["workflow_id"] = workflows[0].get("workflow_id", WORKFLOW_IDS["expense"])
         elif tool == "workflow.schema":
             wf.evidence["schema"] = result
+        elif tool == "file.list":
+            wf.evidence["file_list"] = result
         elif tool == "workflow.search_person":
             wf.evidence["approver_search"] = result
             wf.evidence.setdefault("approver_searches", []).append(result)
@@ -6597,8 +7337,6 @@ class MyAgent:
                 wf.evidence["replacement_source_lookup"] = result
             else:
                 wf.evidence["oa_checked"] = result
-        self._sync_workflow_skill(state)
-
     def _close_pending_domains(self, state: RuntimeState) -> None:
         if state.meetingroom.needed and state.meetingroom.status in {"pending", "ready"}:
             state.meetingroom.status = "blocked"
@@ -6608,6 +7346,8 @@ class MyAgent:
             policy_reason = str((decision or {}).get("reason") or "") if (decision or {}).get("decision") == "terminal" else ""
             state.meetingroom.blocked_reason = state.meetingroom.blocked_reason or policy_reason or "missing_required_info"
             state.meetingroom.result = {"status": "blocked", "reason": state.meetingroom.blocked_reason}
+            if state.meetingroom_skill is not None:
+                state.meetingroom_skill.mark_blocked(state.meetingroom.blocked_reason)
         if state.workflow.needed and state.workflow.status in {"pending", "ready"}:
             state.workflow.status = "blocked"
             decision = self._outcome_policy_decision(state, "workflow")
@@ -6703,7 +7443,7 @@ class MyAgent:
 
     def _normalize_meeting_slots(self, state: RuntimeState) -> None:
         slots = state.meetingroom.slots
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         parsed_start, parsed_end = self._extract_time_range(query)
         explicit_duration = self._extract_duration_minutes(query)
         explicit_capacity = self._extract_capacity(query)
@@ -6771,7 +7511,7 @@ class MyAgent:
         else:
             segments = self._normalize_multi_segments(
                 state,
-                slots.get("segments") or self._extract_meeting_segments(self._full_query(state.obs)),
+                slots.get("segments") or self._extract_meeting_segments(query),
             )
             if len(segments) > 1 and (
                 state.meetingroom.intent == "book_multi_segments_same_room" or not self._schedule_analysis_needed(state)
@@ -6813,7 +7553,7 @@ class MyAgent:
         if not isinstance(raw_segments, list):
             return []
         slots = state.meetingroom.slots
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         fallback_title = self._normalize_meeting_title(
             slots.get("title") or self._extract_meeting_title(query) or slots.get("keyword") or "项目复盘"
         )
@@ -6929,9 +7669,9 @@ class MyAgent:
             workspace_address = str((mr.evidence.get("workspace") or {}).get("office_address") or "")
             if workspace_address:
                 building_address = self._building_address(workspace_address)
+                add("office_address", workspace_address)
                 if building_address and building_address != workspace_address:
                     add("office_address", building_address)
-                add("office_address", workspace_address)
 
         prefer_address = bool(slots.get("office_address_candidates")) and (
             str(slots.get("fallback_policy") or "") == "block_if_unavailable"
@@ -6958,14 +7698,14 @@ class MyAgent:
 
     def _meetingroom_fallback_search_allowed(self, state: RuntimeState) -> bool:
         slots = state.meetingroom.slots
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         return bool(slots.get("allow_fallback") or slots.get("fallback_policy")) and not any(
             word in query for word in ["订不到就算了", "不行就别乱订", "只要", "必须"]
         )
 
     def _meetingroom_fallback_candidates(self, state: RuntimeState) -> list[dict[str, str]]:
         slots = state.meetingroom.slots
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         source_values = [str(item) for item in (slots.get("office_address_candidates") or []) if item]
         source_values.extend(str(item) for item in (slots.get("office_candidates") or []) if item)
         if slots.get("needs_workspace") and state.meetingroom.evidence.get("workspace"):
@@ -6999,7 +7739,7 @@ class MyAgent:
         return sorted(str(key).upper() for key in by_building.keys() if re.fullmatch(r"A\d", str(key).upper()))
 
     def _room_search_days(self, state: RuntimeState) -> list[str]:
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         days = self._schedule_required_days(state)
         if any(word in query for word in ["这周", "本周", "最早", "哪天", "连续几天"]):
             try:
@@ -7025,18 +7765,18 @@ class MyAgent:
         return None
 
     def _schedule_analysis_needed(self, state: RuntimeState) -> bool:
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         intent = state.meetingroom.intent
         return intent in {"book_by_schedule_analysis", "query_room_schedule", "schedule_book"} or any(
             word in query for word in ["连续", "都要空闲", "两天都空闲", "两天都空", "都空的", "空闲时段", "最长", "同一个会议室", "同一会议室", "同一个房间"]
         )
 
     def _requires_full_schedule_analysis(self, state: RuntimeState) -> bool:
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         return any(word in query for word in ["都要空闲", "两天都空闲", "两天都空", "都空的", "周三和周四", "连续", "最长", "空闲时段", "同一个会议室", "同一会议室", "同一个房间"])
 
     def _multi_day_intersection_needed(self, state: RuntimeState) -> bool:
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         if len(self._schedule_required_days(state)) <= 1:
             return False
         return any(
@@ -7057,7 +7797,7 @@ class MyAgent:
         )
 
     def _multi_day_create_requested(self, state: RuntimeState) -> bool:
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         days = self._schedule_required_days(state)
         if len(days) <= 1:
             return False
@@ -7338,7 +8078,7 @@ class MyAgent:
         return None
 
     def _allows_time_adjustment(self, state: RuntimeState) -> bool:
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         return any(word in query for word in ["前后半小时", "前后 30 分钟", "前后30分钟", "附近时间", "时间不行", "这个时间不行"])
 
     def _adjusted_time_windows(self, start: str, duration_minutes: int) -> list[tuple[str, str]]:
@@ -7363,10 +8103,11 @@ class MyAgent:
             day = explicit_day or str((mr.evidence.get("room_candidates") or {}).get("day") or mr.slots.get("day") or "") or self._meeting_day(state) or self._booking_day_from_schedule_context(state)
         if day:
             mr.slots["day"] = day
+        room_id = room.get("room_id")
         return {
             "day": day,
-            "office_id": room.get("officeId") or room.get("office_id") or room.get("building") or mr.slots.get("office_candidates", [""])[0],
-            "room_id": room.get("room_id"),
+            "office_id": room.get("officeId") or room.get("office_id") or self.meetingroom_index.office_id_for_room(room_id) or room.get("building") or mr.slots.get("office_candidates", [""])[0],
+            "room_id": room_id,
             "start": mr.slots.get("start"),
             "end": mr.slots.get("end"),
             "title": self._normalize_meeting_title(mr.slots.get("title") or "项目复盘"),
@@ -7374,7 +8115,7 @@ class MyAgent:
         }
 
     def _explicit_booking_day(self, state: RuntimeState) -> str:
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         now = state.obs.get("now")
         patterns = [
             r"(?:订|预订|定)\s*((?:本周|下周)?周[一二三四五六日天])",
@@ -7391,7 +8132,7 @@ class MyAgent:
         return ""
 
     def _booking_day_from_schedule_context(self, state: RuntimeState) -> str:
-        query_day = self._resolve_day(self._extract_day_text(self._full_query(state.obs)), state.obs.get("now"))
+        query_day = self._resolve_day(self._extract_day_text(self._meeting_query(state)), state.obs.get("now"))
         if query_day:
             state.meetingroom.slots["day"] = query_day
             return query_day
@@ -7475,7 +8216,7 @@ class MyAgent:
         for room in candidates:
             if room.get("room_id") == room_id:
                 if re.match(r"^A\d-", str(room_id or ""), flags=re.I):
-                    return str(room.get("building") or office_id)
+                    return str(room.get("building") or office_id or "")
                 return str(office_id or room.get("officeId") or room.get("office_id") or room.get("building") or "")
         return str(office_id or "")
 
@@ -7545,7 +8286,7 @@ class MyAgent:
 
     def _existing_booking_write_requires_confirmation(self, state: RuntimeState) -> bool:
         mr = state.meetingroom
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         bookings = (mr.evidence.get("booking_query") or {}).get("bookings") or []
         active = [item for item in bookings if item.get("status") != "cancelled"]
         if len(active) <= 1:
@@ -7571,7 +8312,7 @@ class MyAgent:
         mr = state.meetingroom
         if not (self._is_cancel_intent(mr.intent) or self._is_cancel_rebook_intent(mr.intent)):
             return False
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         if self._extract_order_id(query) or mr.slots.get("order_id"):
             return False
         if self._is_cancel_rebook_intent(mr.intent) and any(word in query for word in ["延", "重订", "重新预订", "不行就"]):
@@ -7604,7 +8345,7 @@ class MyAgent:
 
     def _meeting_day_candidates(self, state: RuntimeState) -> list[str]:
         slots = state.meetingroom.slots
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         raw_day_text = self._extract_day_text(query)
         day_text = str(slots.get("day_text") or raw_day_text or "")
         if raw_day_text.startswith(("下周", "本周")) and re.fullmatch(r"周[一二三四五六日天]", day_text):
@@ -7613,12 +8354,20 @@ class MyAgent:
         primary = self._resolve_day(day_text, state.obs.get("now"), prefer_workday=self._is_meeting_context(query))
         candidates: list[str] = []
 
-        if "明天" in day_text and self._is_meeting_context(query):
-            meeting_day = self._next_meeting_business_day(state.obs.get("now"))
-            if meeting_day:
-                candidates.append(meeting_day)
         if slots.get("day") and "明天" not in day_text and not raw_day_text.startswith(("下周", "本周")):
             candidates.append(str(slots["day"]))
+        if state.meetingroom.intent in {
+            "cancel_existing",
+            "extend_existing",
+            "rebook_larger_existing",
+            "cancel_rebook_existing",
+        } and "明天" in day_text:
+            try:
+                now_day = datetime.fromisoformat(str(state.obs.get("now") or "").replace("Z", "+00:00")).date()
+            except Exception:
+                now_day = None
+            if now_day is not None and now_day.weekday() >= 5:
+                candidates.append(self._next_meeting_business_day(state.obs.get("now")))
         if primary:
             candidates.append(primary)
         if not candidates and slots.get("day"):
@@ -7641,10 +8390,27 @@ class MyAgent:
         return candidate.isoformat()
 
     def _schedule_range(self, state: RuntimeState) -> tuple[str, str]:
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         now = state.obs.get("now")
         if "下周" in query:
             start = self._week_start(now, offset=1)
+            return start.isoformat(), (start + timedelta(days=4)).isoformat()
+        day_text = str(state.meetingroom.slots.get("day_text") or self._extract_day_text(query) or "")
+        dates = re.findall(r"\d{1,2}\s*月\s*\d{1,2}\s*日", day_text)
+        if len(dates) >= 2:
+            return self._resolve_day(dates[0], now), self._resolve_day(dates[1], now)
+        shortened_range = re.search(
+            r"(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(?:到|至|-|~)\s*(\d{1,2})\s*日",
+            day_text,
+        )
+        if shortened_range:
+            month, start_day, end_day = shortened_range.groups()
+            return self._resolve_day(f"{month}月{start_day}日", now), self._resolve_day(f"{month}月{end_day}日", now)
+        numbered_range = re.search(r"(\d{1,2})号\s*(?:到|至|-|~)\s*(\d{1,2})号", day_text)
+        if numbered_range:
+            return self._resolve_month_day(numbered_range.group(1), now), self._resolve_month_day(numbered_range.group(2), now)
+        if any(word in query for word in ["本周", "这周"]):
+            start = self._week_start(now)
             return start.isoformat(), (start + timedelta(days=4)).isoformat()
         days = self._schedule_required_days(state)
         if len(days) > 1:
@@ -7691,7 +8457,7 @@ class MyAgent:
 
     def _normalize_workflow_slots(self, state: RuntimeState) -> None:
         wf = state.workflow
-        query = self._full_query(state.obs)
+        query = self._workflow_query(state)
         explicit_submit = self._leave_submit_intent(query) if wf.intent == "leave" else self._submit_intent(query)
         explicit_draft = self._draft_intent(query)
         if explicit_submit:
@@ -7699,7 +8465,7 @@ class MyAgent:
         elif explicit_draft:
             wf.slots["submit"] = False
         elif wf.intent == "leave":
-            wf.slots["submit"] = False
+            wf.slots["submit"] = self._default_leave_submit_intent(query)
         else:
             wf.slots["submit"] = bool(wf.slots.get("submit"))
         if wf.intent == "leave":
@@ -7761,6 +8527,7 @@ class MyAgent:
         end = self._canonical_time_value(leave.get("end"))
         leave_text = self._slice_workflow_text(query, "leave")
         duration = self._extract_duration_hours(leave_text)
+        explicit_leave_days = self._extract_requested_leave_days(leave_text)
         spans_multiple_days = bool(end_day and start_day and end_day != start_day)
         if not start and duration and "下午" in query:
             start = "16:00" if float(duration) <= 2 else "14:00"
@@ -7773,12 +8540,15 @@ class MyAgent:
         leave_type = self._leave_type_value(leave.get("leave_type_label") or query)
         reason = self._reason_value(leave.get("reason_label") or query)
         end_day = end_day or start_day
+        computed_duration = self._leave_duration_hours(start_day, start, end_day, end)
+        if explicit_leave_days:
+            computed_duration = float(explicit_leave_days * 8)
         return {
             "start_time": f"{start_day} {start}",
             "end_time": f"{end_day} {end}",
             "leave_type": leave_type,
             "reason": reason,
-            "duration": self._leave_duration_hours(start_day, start, end_day, end),
+            "duration": computed_duration,
             "approver_keyword": leave.get("approver_name_hint") or leave.get("approver_keyword"),
             "approver_title": leave.get("approver_title_hint") or leave.get("approver_title"),
             "approver_employee_no": leave.get("approver_employee_no"),
@@ -7793,6 +8563,16 @@ class MyAgent:
             return self._resolve_day("明天", state.obs.get("now")), self._resolve_day("后天", state.obs.get("now"))
         if "今天" in text and "明天" in text:
             return self._resolve_day("今天", state.obs.get("now")), self._resolve_day("明天", state.obs.get("now"))
+        weekday_range = re.search(
+            r"(下周|本周|周)?([一二三四五六日天])\s*(?:到|至|-|~)\s*(?:(下周|本周|周))?([一二三四五六日天])",
+            text,
+        )
+        if weekday_range:
+            start_prefix = weekday_range.group(1) or "周"
+            end_prefix = weekday_range.group(3) or weekday_range.group(1) or "周"
+            start = self._resolve_day(f"{start_prefix}{weekday_range.group(2)}", state.obs.get("now"))
+            end = self._resolve_day(f"{end_prefix}{weekday_range.group(4)}", state.obs.get("now"))
+            return start, end
         dates = re.findall(r"\d{1,2}\s*月\s*\d{1,2}\s*日", text)
         if len(dates) >= 2:
             start = self._resolve_day(dates[0], state.obs.get("now"))
@@ -7914,7 +8694,44 @@ class MyAgent:
             "approver": approver.get("user_id"),
             "duration": plan["duration"],
         }
+        attachment = self._select_leave_attachment(state, plan)
+        if attachment:
+            data["attachment"] = attachment
         return {"workflow_id": WORKFLOW_IDS["leave"], "submit": bool(state.workflow.slots.get("submit")), "data": data}
+
+    def _leave_attachment_directory(self, state: RuntimeState) -> str:
+        query = self._leave_query(state)
+        leave_type = self._leave_type_value(self._leave_slots(state).get("leave_type_label") or query)
+        replacement_request = any(word in query for word in ["之前", "草稿", "日期填错", "删掉重新", "重新提交"])
+        replacement_needs_document = replacement_request and leave_type in {"M", "P"}
+        if not replacement_needs_document and not any(word in query for word in ["附件", "上传", "目录", "文件", "证明", "病假条"]):
+            return ""
+        match = re.search(r"([A-Za-z0-9_./-]+)\s*目录", query)
+        return match.group(1).strip("/ ") if match else "documents"
+
+    def _select_leave_attachment(self, state: RuntimeState, plan: dict[str, Any]) -> str:
+        result = state.workflow.evidence.get("file_list") or {}
+        files = [str(item) for item in result.get("files") or [] if item]
+        if not files:
+            return ""
+        leave_type = str(plan.get("leave_type") or "")
+        preferred_tokens = {
+            "M": ["marriage_certificate", "marriage"],
+            "P": ["birth_certificate", "birth"],
+            "S": ["sick_leave_note", "medical_report", "medical"],
+        }.get(leave_type, [])
+        ranked: list[tuple[int, str]] = []
+        for filename in files:
+            lower = filename.lower()
+            score = max((100 - index * 10 for index, token in enumerate(preferred_tokens) if token in lower), default=0)
+            if any(token in lower for token in ["certificate", "证明", "病假", "medical"]):
+                score += 5
+            ranked.append((score, filename))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        if not ranked or ranked[0][0] <= 0:
+            return ""
+        directory = str(result.get("directory") or self._leave_attachment_directory(state) or "documents").strip("/")
+        return f"{directory}/{ranked[0][1]}"
 
     def _next_approver_search_args(
         self,
@@ -8003,6 +8820,9 @@ class MyAgent:
                 filtered = dept_filtered
         if len(filtered) == 1:
             return filtered
+        remembered = self._select_leave_approver_from_memory(state, filtered)
+        if remembered:
+            return [remembered]
         if title and not keyword:
             named_title = [p for p in filtered if title in str(p.get("name") or "")]
             if len(named_title) == 1:
@@ -8120,6 +8940,43 @@ class MyAgent:
                 return broad_args
             return None
         return self._project_search_args(expense)
+
+    def _disambiguating_project_search_args(
+        self,
+        state: RuntimeState,
+        expense: dict[str, Any],
+        projects: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Return a user-grounded query that identifies exactly one current candidate."""
+        if len(projects) < 2 or state.step_budget - state.steps_used <= 3:
+            return None
+        source = self._normalize_memory_text(self._expense_query(state))
+        tried = {self._normalize_memory_text(item) for item in expense.get("_tried_project_keywords") or []}
+        project_names = [
+            self._normalize_memory_text(project.get("project_name") or "")
+            for project in projects
+            if isinstance(project, dict) and project.get("project_name")
+        ]
+        for project in projects:
+            if not isinstance(project, dict):
+                continue
+            project_name = str(project.get("project_name") or "").strip()
+            candidates = self._dedupe(
+                [
+                    *self._project_candidate_forms(project_name),
+                    *self._formal_hint_core_candidates(project_name),
+                ]
+            )
+            for candidate in candidates:
+                normalized = self._normalize_memory_text(candidate)
+                if len(normalized) < 4 or normalized in tried or normalized not in source:
+                    continue
+                if sum(normalized in name for name in project_names) != 1:
+                    continue
+                args = {"project_name": candidate}
+                self._plan_project_query(state, args, source="candidate_disambiguation", priority=-1)
+                return args
+        return None
 
     def _expense_memory_project_search_args(self, state: RuntimeState, expense: dict[str, Any]) -> dict[str, Any] | None:
         """Recall only an unambiguous train-observed project query alias."""
@@ -8319,8 +9176,6 @@ class MyAgent:
     def _project_refine_search_args(self, state: RuntimeState, project: dict[str, Any]) -> dict[str, Any] | None:
         wf = state.workflow
         resolution = wf.evidence.get("project_resolution") if isinstance(wf.evidence.get("project_resolution"), dict) else {}
-        if resolution.get("state") == "verified_singleton":
-            return None
         if wf.evidence.get("project_refine_done"):
             return None
         if state.step_budget - state.steps_used <= 2:
@@ -8341,6 +9196,19 @@ class MyAgent:
             for item in history
             if isinstance(item, dict) and isinstance(item.get("args"), dict)
         }
+        expense_tried = self._expense_slots(state).setdefault("_tried_project_keywords", [])
+        for query in tried:
+            if query and query not in expense_tried:
+                expense_tried.append(query)
+        # Project resolution and query-trajectory completion are separate.
+        # Once a project is verified, execute one remaining train-observed
+        # concrete alias when budget allows instead of stopping at the first
+        # broad singleton.
+        memory_args = self._expense_memory_project_search_args(state, self._expense_slots(state))
+        memory_query = str((memory_args or {}).get("project_name") or "")
+        if memory_query and memory_query not in tried and self._project_query_quality(memory_args or {}) > 0.15:
+            wf.evidence["project_refine_done"] = True
+            return memory_args
         current_query = ""
         for item in reversed(history):
             if not isinstance(item, dict):
@@ -8770,12 +9638,10 @@ class MyAgent:
                 "Use broad parent themes only when the user wording is under-specified, and keep them as multi-word business phrases rather than single generic nouns. "
                 "If the literal project phrase failed, propose semantic parent themes that could appear in SAP project names without assuming a fixed public-data mapping. "
                 "Because only the first 1-2 suggestions may be tried before the tool budget runs out, put broader parent themes before near-duplicates of failed keywords. "
-                "Do not output ids/codes unless the user explicitly gave them. Do not choose a project."
+                "Do not output ids/codes unless the user explicitly gave them. Do not choose a project. "
+                "Return only the ordered query strings without reasons."
             ),
-            "output_schema": {
-                "keywords": ["project search keyword"],
-                "reason": "short reason",
-            },
+            "output_schema": {"queries": ["project search keyword"]},
         }
         try:
             content = self._chat_completion(
@@ -8794,9 +9660,13 @@ class MyAgent:
                 profile="strong",
                 context_pack_type=str(context_pack.get("pack_type") or "workflow_project_keyword_context"),
                 context_chars=int(context_pack.get("chars") or 0),
+                max_output_tokens=160,
+                call_purpose="project_keyword_suggestions",
             )
             parsed = self._parse_json_object(content) or {}
-            raw_keywords = parsed.get("keywords") if isinstance(parsed.get("keywords"), list) else []
+            raw_keywords = parsed.get("queries") if isinstance(parsed.get("queries"), list) else []
+            if not raw_keywords and isinstance(parsed.get("keywords"), list):
+                raw_keywords = parsed.get("keywords") or []
             keywords = self._dedupe(
                 [
                     self._clean_project_phrase(str(item))
@@ -8857,7 +9727,7 @@ class MyAgent:
                 "rule": "select only when one returned project clearly matches the user's explicit project wording; otherwise ambiguous",
             },
         )
-        if decision.get("decision") != "select" or self._bounded_float(decision.get("confidence"), 0.0) < 0.78:
+        if decision.get("decision") != "select":
             return None
         by_key = self._candidate_map(projects, ["project_code", "project_name"])
         selected_id = str(decision.get("selected_id") or "")
@@ -8881,6 +9751,18 @@ class MyAgent:
         options = current_options
         if not options:
             return None
+        memory_category = self._select_expense_category_by_memory(state, expense, options)
+        if memory_category:
+            self._bind_expense_category(state, memory_category, "expense_memory")
+            self._debug_log(
+                self._debug_llm_config(),
+                {
+                    "event": "expense_category_selection",
+                    "source": "expense_memory",
+                    "selected": memory_category,
+                },
+            )
+            return memory_category
         literal_sources = [
             " ".join(
                 str(item.get("name") or "")
@@ -8923,6 +9805,80 @@ class MyAgent:
         self._bind_expense_category(state, options[0], "single_option")
         self._debug_log(self._debug_llm_config(), {"event": "expense_category_selection", "source": "single_option", "hint": hint, "selected": options[0]})
         return options[0]
+
+    def _select_expense_category_by_memory(
+        self,
+        state: RuntimeState,
+        expense: dict[str, Any],
+        options: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        by_id = {
+            self._expense_category_id(option): option
+            for option in options
+            if isinstance(option, dict) and self._expense_category_id(option)
+        }
+        hints = [
+            self._normalize_option_text(item.get("name") or "")
+            for item in expense.get("items") or []
+            if isinstance(item, dict) and item.get("name")
+        ]
+        explicit_hint = self._normalize_option_text(expense.get("material_category_hint") or "")
+        if explicit_hint:
+            hints.append(explicit_hint)
+        scores: dict[str, int] = {}
+        entries = self.static_context.expense_examples.get("entries") or []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            category_id = str(entry.get("material_category") or "")
+            if category_id not in by_id:
+                continue
+            for row in entry.get("rows") or []:
+                if not isinstance(row, dict):
+                    continue
+                memory_name = self._normalize_option_text(row.get("material_name") or "")
+                if not memory_name:
+                    continue
+                for hint in hints:
+                    score = 0
+                    if hint == memory_name:
+                        score = 100
+                    elif hint in memory_name:
+                        score = 60 + len(hint)
+                    elif memory_name in hint:
+                        score = 50 + len(memory_name)
+                    else:
+                        score = self._longest_common_substring_len(hint, memory_name) * 3
+                    if score >= 9:
+                        scores[category_id] = max(scores.get(category_id, 0), score)
+        if not scores:
+            project = state.workflow.evidence.get("verified_project") or {}
+            project_code = str(project.get("project_code") or "") if isinstance(project, dict) else ""
+            total = self._money(expense.get("total_amount"))
+            query_bigrams = self._memory_bigrams(self._normalize_memory_text(self._workflow_query(state)))
+            request_scores: dict[str, float] = {}
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                category_id = str(entry.get("material_category") or "")
+                if category_id not in by_id:
+                    continue
+                memory_project = entry.get("project") if isinstance(entry.get("project"), dict) else {}
+                if project_code and str(memory_project.get("project_code") or "") != project_code:
+                    continue
+                if total and self._money(entry.get("total_amount")) != total:
+                    continue
+                memory_bigrams = self._memory_bigrams(self._normalize_memory_text(entry.get("request_text") or ""))
+                overlap = len(query_bigrams & memory_bigrams) / max(1, len(query_bigrams | memory_bigrams))
+                if overlap >= 0.2:
+                    request_scores[category_id] = max(request_scores.get(category_id, 0.0), overlap)
+            scores = {category_id: int(score * 1000) for category_id, score in request_scores.items()}
+        if not scores:
+            return None
+        ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+            return None
+        return by_id[ranked[0][0]]
 
     def _rejected_expense_category_ids(self, state: RuntimeState) -> set[str]:
         project = state.workflow.evidence.get("verified_project") or {}
@@ -9083,13 +10039,20 @@ class MyAgent:
         options = state.workflow.evidence.get("subclass_options", {}).get("options") or []
         request_type = self._expense_request_shape(state, expense, options)
         state.workflow.evidence["expense_request_type"] = request_type
+        if request_type in {"explicit_multi_unallocated", "business_package", "single_item_total"}:
+            memory_ir = self._expense_memory_draft_ir(
+                state,
+                project,
+                category,
+                self._money(total) if total not in (None, "") else "",
+                request_type=request_type,
+            )
+            if isinstance(memory_ir, ExpenseDraftIR):
+                return self._expense_ir_to_save_args(state, project, category, memory_ir)
         if request_type == "explicit_multi_unallocated":
             state.ledger.record_expense_translation(source="program", decision="rejected", reason="insufficient_amount_breakdown")
             return "insufficient_amount_breakdown"
         if request_type == "business_package":
-            memory_ir = self._expense_memory_draft_ir(state, project, category, self._money(total) if total not in (None, "") else "")
-            if isinstance(memory_ir, ExpenseDraftIR):
-                return self._expense_ir_to_save_args(state, project, category, memory_ir)
             state.ledger.record_expense_translation(source="program", decision="rejected", reason="ambiguous_material_subclass")
             return "ambiguous_material_subclass"
         if total in (None, ""):
@@ -9229,11 +10192,13 @@ class MyAgent:
         project: dict[str, Any],
         category: dict[str, Any],
         explicit_total: str,
+        request_type: str = "",
     ) -> ExpenseDraftIR | None:
-        """Recall a train-only package convention after all live ids are bound."""
+        """Recall a train-only convention after all runtime ids are verified."""
         options = state.workflow.evidence.get("subclass_options", {}).get("options") or []
         expense = self._expense_slots(state)
-        if self._expense_request_shape(state, expense, options) != "business_package":
+        request_type = request_type or self._expense_request_shape(state, expense, options)
+        if request_type not in {"business_package", "explicit_multi_unallocated", "single_item_total"}:
             return None
         entries = self.static_context.expense_examples.get("entries") or []
         allowed_ids = {
@@ -9248,7 +10213,14 @@ class MyAgent:
         query_bigrams = self._memory_bigrams(query)
         matches: list[tuple[float, dict[str, Any]]] = []
         for entry in entries:
-            if not isinstance(entry, dict) or entry.get("request_shape") != "generic_package":
+            if not isinstance(entry, dict):
+                continue
+            memory_shape = str(entry.get("request_shape") or "")
+            if request_type == "business_package" and memory_shape not in {"generic_package", "explicit_complete"}:
+                continue
+            if request_type == "explicit_multi_unallocated" and memory_shape not in {"explicit_complete", "explicit_partial"}:
+                continue
+            if request_type == "single_item_total" and memory_shape not in {"explicit_complete", "generic_package"}:
                 continue
             memory_project = entry.get("project") if isinstance(entry.get("project"), dict) else {}
             if project_code and str(memory_project.get("project_code") or "") != project_code:
@@ -9264,9 +10236,14 @@ class MyAgent:
             row_ids = {str(row.get("material_subclass") or "") for row in rows if isinstance(row, dict)}
             if not rows or not row_ids or not row_ids.issubset(allowed_ids):
                 continue
+            if request_type == "single_item_total" and len(rows) != 1:
+                continue
             memory_query = self._normalize_memory_text(entry.get("request_text") or "")
             memory_bigrams = self._memory_bigrams(memory_query)
             overlap = len(query_bigrams & memory_bigrams) / max(1, len(query_bigrams | memory_bigrams))
+            min_overlap = 0.16 if request_type == "business_package" and memory_shape == "generic_package" else 0.2
+            if overlap < min_overlap:
+                continue
             score = 10.0 + (3.0 if explicit_total else 0.0) + overlap + min(int(entry.get("support_count") or 1), 5) * 0.01
             matches.append((score, entry))
         if not matches:
@@ -9293,7 +10270,7 @@ class MyAgent:
         memory_match = {
             "memory_id": str(best.get("memory_id") or ""),
             "source_sha256": list(best.get("source_sha256") or []),
-            "request_type": "business_package",
+            "request_type": request_type,
             "score": round(best_score, 4),
             "project_fingerprint": self._expense_project_fingerprint(project),
             "category_id": category_id,
@@ -9437,15 +10414,15 @@ class MyAgent:
                 if isinstance(option, dict) and (option.get("value") or option.get("code"))
             ],
             "instruction": (
-                "Return JSON only. Translate the user expense into detail rows. Use only listed subclass candidate ids. "
+                "Return valid json only. Translate the user expense into detail rows. Use only listed subclass candidate ids. "
                 "Do not emit project/category/applicant fields. Do not change explicit amounts. "
                 "Every row must cite source_item_index for the user line item that supports it. "
-                "If the user only gave a category, purpose, or total budget without a concrete line item and allocation, return decision=need_more_info with no rows. "
+                "If the user only gave a category, purpose, or total budget without a concrete line item and allocation, return an empty details array. "
                 "Do not turn an ambiguous category or business purpose into a purchasable detail. "
-                "Every row must satisfy quantity * unit_price = budget_amount exactly and row budget_amount total must equal total_amount."
+                "Every row must satisfy quantity * unit_price = budget_amount exactly and row budget_amount total must equal total_amount. "
+                "Return only the details field without decisions, confidence, missing fields, or explanations."
             ),
             "output_schema": {
-                "decision": "draft|need_more_info",
                 "details": [
                     {
                         "source_item_index": "zero-based index from user_line_items",
@@ -9455,8 +10432,7 @@ class MyAgent:
                         "unit_price": "decimal string",
                         "budget_amount": "decimal string",
                     }
-                ],
-                "missing_fields": []
+                ]
             },
             "user_line_items": self._clean_explicit_expense_items(expense.get("items") or []),
         }
@@ -9464,16 +10440,20 @@ class MyAgent:
             content = self._chat_completion(
                 llm_config,
                 [
-                    {"role": "system", "content": "Return valid JSON only. You are a constrained expense detail translator."},
+                    {"role": "system", "content": "Return valid json only. Return exactly one details array for the constrained expense translation."},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
                 ],
                 state=state,
                 profile="strong",
                 context_pack_type="expense_draft_ir",
                 context_chars=0,
+                max_output_tokens=512,
+                call_purpose="expense_detail_translation",
             )
             parsed = self._parse_json_object(content)
             if isinstance(parsed, dict):
+                if "decision" not in parsed:
+                    parsed["decision"] = "draft" if isinstance(parsed.get("details"), list) and parsed.get("details") else "need_more_info"
                 self._debug_log(llm_config, {"event": "expense_translation", "case_id": state.obs.get("case_id"), "decision": "received", "row_count": len(parsed.get("details") or [])})
                 return parsed
         except Exception as exc:
@@ -10338,11 +11318,10 @@ class MyAgent:
                 "Use explicit user amounts when present. If submit=true, do not guess missing amounts or details. "
                 "If submit=false, this is a draft: do not block solely because amount or details are absent when verified project/category/subclass options are available. "
                 "For a draft, infer a small complete planning draft from the verified project, category label, option labels, and user wording; choose only semantically relevant rows, use explicit or conservative round monetary amounts, and make row sums equal total_amount. "
-                "If no subclass option is semantically relevant, return decision=ambiguous."
+                "If no subclass option is semantically relevant, return an empty details array. "
+                "Return only total_amount and details without decisions, confidence, missing fields, or explanations."
             ),
             "output_schema": {
-                "decision": "draft|need_more_info|ambiguous|blocked",
-                "confidence": 0.0,
                 "total_amount": "money string",
                 "details": [
                     {
@@ -10352,10 +11331,7 @@ class MyAgent:
                         "unit_price": "money string",
                         "budget_amount": "money string",
                     }
-                ],
-                "missing_fields": [],
-                "ambiguous_fields": [],
-                "reason": "short reason",
+                ]
             },
         }
         try:
@@ -10375,6 +11351,8 @@ class MyAgent:
                 profile="strong",
                 context_pack_type=str(context_pack.get("pack_type") or "workflow_form_static_context"),
                 context_chars=int(context_pack.get("chars") or 0),
+                max_output_tokens=600,
+                call_purpose="workflow_form_draft",
             )
             parsed = self._parse_json_object(content)
             if isinstance(parsed, dict):
@@ -10391,9 +11369,6 @@ class MyAgent:
         category: dict[str, Any],
         draft: dict[str, Any],
     ) -> dict[str, Any] | None:
-        min_confidence = 0.55 if not state.workflow.slots.get("submit") else 0.65
-        if draft.get("decision") != "draft" or self._bounded_float(draft.get("confidence"), 0.0) < min_confidence:
-            return None
         options = state.workflow.evidence.get("subclass_options", {}).get("options") or []
         allowed = {str(opt.get("value") or opt.get("code")): opt for opt in options if opt.get("value") or opt.get("code")}
         rows = draft.get("details")
@@ -10662,6 +11637,9 @@ class MyAgent:
         raw_text = str(expense.get("raw_text") or expense.get("source_text") or "")
         item_text = str(item_name or "")
         option_label = str((option or {}).get("label") or "")
+        cleaned_item = self._clean_material_name_match(item_text, item_text) if item_text else ""
+        if cleaned_item and not self._looks_like_invalid_expense_item_name(cleaned_item):
+            return cleaned_item
         if item_text and self._material_name_is_exact_option(item_text, option_label):
             return self._clean_material_name_match(item_text, item_text)
         search_terms = [item_text] if item_text else []
@@ -10730,6 +11708,19 @@ class MyAgent:
         labels = [self._normalize_option_text(opt.get("label") or opt.get("name") or "") for opt in options]
         if any(label and (normalized_name == label or normalized_name in label) for label in labels):
             return False
+        parts = [part.strip("，。；;、 的") for part in re.split(r"[、和与]|(?<!其)及", name) if part.strip("，。；;、 的")]
+        if len(parts) > 1:
+            mapped_ids: list[str] = []
+            for part in parts:
+                selected = self._select_expense_subclass_by_memory(part, options)
+                if not selected:
+                    selected = self._select_expense_subclass_by_text(part, options)
+                if not selected:
+                    mapped_ids = []
+                    break
+                mapped_ids.append(str(selected.get("value") or selected.get("code") or ""))
+            if mapped_ids and len(set(mapped_ids)) == 1:
+                return False
         if item.get("budget_amount") and self._money(item.get("budget_amount")) != self._money(expense.get("total_amount")):
             return False
         return True
@@ -10798,28 +11789,65 @@ class MyAgent:
         available = [opt for opt in options if (opt.get("value") or opt.get("code")) not in used_values]
         if not available:
             return None
+        chosen = self._select_expense_subclass_by_memory(hint, available)
+        if chosen:
+            self._debug_log(
+                self._debug_llm_config(),
+                {"event": "expense_subclass_selection", "source": "expense_memory", "hint": hint, "selected": chosen},
+            )
+            return chosen
         chosen = self._select_expense_subclass_by_text(hint, available)
         if chosen:
             self._debug_log(self._debug_llm_config(), {"event": "expense_subclass_selection", "source": "deterministic_text", "hint": hint, "selected": chosen})
             return chosen
-        if context_hint and context_hint != hint:
-            chosen = self._select_expense_subclass_by_text(context_hint, available)
-            if chosen:
-                self._debug_log(
-                    self._debug_llm_config(),
-                    {
-                        "event": "expense_subclass_selection",
-                        "source": "deterministic_context",
-                        "hint": hint,
-                        "context_hint": context_hint,
-                        "selected": chosen,
-                    },
-                )
-                return chosen
         if len(available) == 1:
             self._debug_log(self._debug_llm_config(), {"event": "expense_subclass_selection", "source": "single_option", "hint": hint, "selected": available[0]})
             return available[0]
         return None
+
+    def _select_expense_subclass_by_memory(
+        self,
+        hint: Any,
+        options: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        normalized_hint = self._normalize_option_text(hint)
+        if not normalized_hint:
+            return None
+        by_id = {
+            str(option.get("value") or option.get("code") or ""): option
+            for option in options
+            if isinstance(option, dict) and (option.get("value") or option.get("code"))
+        }
+        scores: dict[str, int] = {}
+        for entry in self.static_context.expense_examples.get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            for row in entry.get("rows") or []:
+                if not isinstance(row, dict):
+                    continue
+                subclass_id = str(row.get("material_subclass") or "")
+                if subclass_id not in by_id:
+                    continue
+                memory_name = self._normalize_option_text(row.get("material_name") or "")
+                if not memory_name:
+                    continue
+                score = 0
+                if normalized_hint == memory_name:
+                    score = 100
+                elif normalized_hint in memory_name:
+                    score = 60 + len(normalized_hint)
+                elif memory_name in normalized_hint:
+                    score = 50 + len(memory_name)
+                else:
+                    score = self._longest_common_substring_len(normalized_hint, memory_name) * 3
+                if score >= 6:
+                    scores[subclass_id] = max(scores.get(subclass_id, 0), score)
+        if not scores:
+            return None
+        ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+            return None
+        return by_id[ranked[0][0]]
 
     def _select_expense_subclass_by_text(self, hint: str, options: list[dict[str, Any]]) -> dict[str, Any] | None:
         normalized_hint = self._normalize_option_text(hint)
@@ -10864,7 +11892,9 @@ class MyAgent:
         return best
 
     def _can_reuse_subclass_option(self, hint: str, option: dict[str, Any]) -> bool:
-        return False
+        # Several explicit rows may legitimately belong to one browser option
+        # (for example, a monitor and a dock are both computer accessories).
+        return True
 
     def _select_material_subclass_with_llm(
         self,
@@ -10926,6 +11956,16 @@ class MyAgent:
             state.workflow.intent,
         )
 
+    def _meeting_query(self, state: RuntimeState) -> str:
+        source = state.meetingroom.slots.get("source_text")
+        if source:
+            return self._domain_source_text(str(source), "meetingroom", state.meetingroom.intent)
+        return self._domain_source_text(
+            self._task_source_text(state, "meetingroom", state.meetingroom.intent),
+            "meetingroom",
+            state.meetingroom.intent,
+        )
+
     def _leave_query(self, state: RuntimeState) -> str:
         leave = self._leave_slots(state)
         return str(leave.get("source_text") or self._workflow_query(state) or self._full_query(state.obs))
@@ -10946,7 +11986,7 @@ class MyAgent:
             return candidates[0]
         decision = self._rank_candidates_with_llm(state, task, query, candidates, id_fields)
         selected_id = str(decision.get("selected_id") or "")
-        if decision.get("decision") == "select" and float(decision.get("confidence") or 0) >= 0.65:
+        if decision.get("decision") == "select":
             by_key = self._candidate_map(candidates, id_fields)
             if selected_id in by_key:
                 return by_key[selected_id]
@@ -10962,13 +12002,13 @@ class MyAgent:
         context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not candidates:
-            return {"decision": "need_more_info", "selected_id": "", "confidence": 0.0, "ranked": [], "reason": "no_candidates"}
+            return {"decision": "need_more_info", "selected_id": ""}
         if len(candidates) == 1:
             key = next(iter(self._candidate_map(candidates, id_fields)))
-            return {"decision": "select", "selected_id": key, "confidence": 1.0, "ranked": [{"id": key, "score": 1.0}], "reason": "single_candidate"}
+            return {"decision": "select", "selected_id": key}
         llm_config = self._llm_config("strong")
         if not llm_config.get("api_key") or not self._can_call_llm(state, "strong", min_remaining=12.0):
-            return {"decision": "need_more_info", "selected_id": "", "confidence": 0.0, "ranked": [], "reason": "llm_unavailable"}
+            return {"decision": "need_more_info", "selected_id": ""}
         by_key = self._candidate_map(candidates, id_fields)
         compact = self._compact_candidates(by_key)
         context_pack = self.static_context.for_candidate_ranker(task, candidates, id_fields, context)
@@ -10980,17 +12020,11 @@ class MyAgent:
             "static_context": context_pack.get("content") or "",
             "candidates": compact,
             "instruction": (
-                "Return valid json only. Rank provided candidates for the user's business intent. "
-                "Choose only an existing candidate id. If wording is generic, evidence is weak, or multiple candidates are plausible, "
-                "return decision=ambiguous or need_more_info instead of guessing."
+                "Return valid json only. Select a candidate only when the user's wording uniquely supports it. "
+                "Use an existing candidate id, or null when multiple candidates remain plausible. "
+                "Do not return confidence, ranking, reasons, or any candidate fields."
             ),
-            "output_schema": {
-                "decision": "select|ambiguous|need_more_info",
-                "selected_id": "existing candidate id or empty",
-                "confidence": 0.0,
-                "ranked": [{"id": "candidate id", "score": 0.0, "reason": "short reason"}],
-                "reason": "short reason",
-            },
+            "output_schema": {"selected_id": "existing candidate id or null"},
         }
         try:
             content = self._chat_completion(
@@ -10999,8 +12033,8 @@ class MyAgent:
                     {
                         "role": "system",
                         "content": (
-                            "Return valid json only. You are a candidate ranker. "
-                            "Never invent ids or business facts. Low confidence should be ambiguous."
+                            "Return valid json only. Select one supplied candidate id or null. "
+                            "Never invent ids or business facts. Return exactly the selected_id field."
                         ),
                     },
                     {"role": "user", "content": "Return valid json only.\n" + json.dumps(payload, ensure_ascii=False)},
@@ -11009,26 +12043,17 @@ class MyAgent:
                 profile="strong",
                 context_pack_type=str(context_pack.get("pack_type") or "candidate_static_context"),
                 context_chars=int(context_pack.get("chars") or 0),
+                max_output_tokens=64,
+                call_purpose="candidate_ranking",
             )
             parsed = self._parse_json_object(content) or {}
-            decision = str(parsed.get("decision") or parsed.get("status") or "").strip()
-            if decision == "selected":
-                decision = "select"
-            if decision not in {"select", "ambiguous", "need_more_info"}:
-                decision = "ambiguous"
             selected_id = str(parsed.get("selected_id") or "")
             if selected_id not in by_key:
                 selected_id = ""
-                if decision == "select":
-                    decision = "ambiguous"
-            confidence = self._bounded_float(parsed.get("confidence"), 0.0)
-            ranked = self._normalize_ranked_candidates(parsed.get("ranked"), by_key)
+            decision = "select" if selected_id else "need_more_info"
             result = {
                 "decision": decision,
                 "selected_id": selected_id,
-                "confidence": confidence,
-                "ranked": ranked,
-                "reason": str(parsed.get("reason") or ""),
             }
             state.candidate_decisions.append({"task": task, **result})
             state.ledger.record_candidate_decision(
@@ -11037,14 +12062,13 @@ class MyAgent:
                 selected_id=selected_id,
                 allowed_ids=list(by_key.keys()),
                 source="llm_ranker",
-                confidence=confidence,
                 decision=decision,
             )
             self._debug_log(llm_config, {"event": "candidate_ranked", "task": task, **result})
             return result
         except Exception as exc:
             self._debug_log(llm_config, {"event": "candidate_rank_error", "task": task, "error": str(exc)})
-            return {"decision": "need_more_info", "selected_id": "", "confidence": 0.0, "ranked": [], "reason": str(exc)}
+            return {"decision": "need_more_info", "selected_id": ""}
 
     def _candidate_map(self, candidates: list[dict[str, Any]], id_fields: list[str]) -> dict[str, dict[str, Any]]:
         by_key: dict[str, dict[str, Any]] = {}
@@ -11370,7 +12394,12 @@ class MyAgent:
             state.meetingroom.evidence["outcome_policy_decision"] = decision
         if decision and decision.get("decision") == "terminal" and decision.get("reason"):
             reason = str(decision["reason"])
+        if state.meetingroom_skill is not None:
+            skill_result = state.meetingroom_skill.mark_blocked(reason)
+            reason = str(skill_result.get("reason") or reason)
         args = {"reason": reason}
+        if state.meetingroom_skill is not None and state.meetingroom_skill.terminal_result:
+            args["result"] = dict(state.meetingroom_skill.terminal_result)
         if order_id:
             args["order_id"] = order_id
         return StepAction("block_meetingroom", args=args)
@@ -11387,7 +12416,8 @@ class MyAgent:
         if decision and decision.get("decision") == "terminal" and decision.get("reason"):
             reason = str(decision["reason"])
         if state.workflow_skill is not None:
-            state.workflow_skill.mark_blocked(reason)
+            skill_result = state.workflow_skill.mark_blocked(reason)
+            reason = str(skill_result.get("reason") or reason)
         return StepAction("block_workflow", args={"reason": reason})
 
     # ------------------------------------------------------------------
@@ -11412,10 +12442,26 @@ class MyAgent:
         for pattern in patterns:
             match = re.search(pattern, text)
             if match:
-                return match.group(0)
+                value = match.group(0)
+                if re.fullmatch(r"周[一二三四五六日天]", value):
+                    prefix_text = text[: match.start()]
+                    if "下周" in prefix_text:
+                        return f"下周{value[-1]}"
+                    if "本周" in prefix_text:
+                        return f"本周{value[-1]}"
+                return value
         return ""
 
     def _extract_leave_day_text(self, text: str) -> str:
+        weekday_range = re.search(
+            r"(?:下周|本周|周)?[一二三四五六日天]\s*(?:到|至|-|~)\s*(?:(?:下周|本周|周))?[一二三四五六日天]",
+            text,
+        )
+        if weekday_range:
+            return weekday_range.group(0)
+        date_matches = list(re.finditer(r"\d{1,2}\s*月\s*\d{1,2}\s*日", text))
+        if len(date_matches) >= 2:
+            return text[date_matches[0].start() : date_matches[1].end()]
         patterns = [
             r"明天.*?到\s*后天",
             r"今天.*?到\s*明天",
@@ -11444,6 +12490,8 @@ class MyAgent:
         return False
 
     def _leave_submit_intent(self, query: str) -> bool:
+        if re.search(r"(?:直接)?提交[^，。；;]{0,10}(?:请假|事假|年假|病假|育儿假|婚假|陪产假|丧假)(?:申请)?", query):
+            return True
         return any(
             word in query
             for word in [
@@ -11459,6 +12507,20 @@ class MyAgent:
             ]
         )
 
+    def _default_leave_submit_intent(self, query: str) -> bool:
+        if self._draft_intent(query):
+            return False
+        if self._leave_submit_intent(query):
+            return True
+        return any(leave_type in query for leave_type in ["婚假", "陪产假", "丧假"])
+
+    def _extract_requested_leave_days(self, text: str) -> int:
+        match = re.search(r"请\s*(\d+|[一二两三四五六七八九十]+)\s*天", str(text or ""))
+        if not match:
+            return 0
+        token = match.group(1)
+        return int(token) if token.isdigit() else self._cn_to_int(token)
+
     def _draft_intent(self, query: str) -> bool:
         if "不要保存草稿" in query:
             return False
@@ -11473,10 +12535,7 @@ class MyAgent:
         if "今天" in text:
             return now.isoformat()
         if "明天" in text:
-            if prefer_workday:
-                return self._next_meeting_business_day(now_value)
-            candidate = now + timedelta(days=1)
-            return candidate.isoformat()
+            return (now + timedelta(days=1)).isoformat()
         if "后天" in text:
             return (now + timedelta(days=2)).isoformat()
         match = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", text)
@@ -11553,11 +12612,11 @@ class MyAgent:
     def _extract_contextual_time_range(self, text: str) -> tuple[str, str]:
         pattern = (
             r"(?P<p1>上午|下午|中午|早上|晚上)?\s*"
-            r"(?P<h1>\d{1,2}|[一二两三四五六七八九十]+)\s*点(?P<half1>半)?"
+            r"(?P<h1>\d{1,2}|[一二两三四五六七八九十]+)\s*点(?:(?P<half1>半)|(?P<m1>\d{1,2})分?)?"
             r".{0,12}?(?:到|至|-|~)"
             r".{0,12}?"
             r"(?P<p2>上午|下午|中午|早上|晚上)?\s*"
-            r"(?P<h2>\d{1,2}|[一二两三四五六七八九十]+)\s*点(?P<half2>半)?"
+            r"(?P<h2>\d{1,2}|[一二两三四五六七八九十]+)\s*点(?:(?P<half2>半)|(?P<m2>\d{1,2})分?)?"
         )
         match = re.search(pattern, text)
         if not match:
@@ -11568,8 +12627,8 @@ class MyAgent:
             return "", ""
         h1 = self._adjust_hour_by_period(h1, match.group("p1") or "")
         h2 = self._adjust_hour_by_period(h2, match.group("p2") or "")
-        m1 = 30 if match.group("half1") else 0
-        m2 = 30 if match.group("half2") else 0
+        m1 = 30 if match.group("half1") else int(match.group("m1") or 0)
+        m2 = 30 if match.group("half2") else int(match.group("m2") or 0)
         return f"{h1:02d}:{m1:02d}", f"{h2:02d}:{m2:02d}"
 
     def _hour_token_to_int(self, value: Any) -> int:
@@ -11725,7 +12784,13 @@ class MyAgent:
         return office_address
 
     def _extract_room_ids(self, text: str) -> list[str]:
-        return [match.group(0).upper() for match in re.finditer(r"A\d-\dF-\d{3}", text, flags=re.I)]
+        room_ids = [match.group(0).upper() for match in re.finditer(r"A\d-\dF-\d{3}", text, flags=re.I)]
+        for match in re.finditer(r"(?<![A-Za-z0-9])A(\d)-(\d{3})(?![A-Za-z0-9])", text, flags=re.I):
+            building, room_number = match.groups()
+            normalized = f"A{building}-{room_number[0]}F-{room_number}".upper()
+            if normalized not in room_ids:
+                room_ids.append(normalized)
+        return room_ids
 
     def _office_id_from_room_id(self, room_id: Any) -> str:
         room_id = str(room_id or "")
@@ -11971,14 +13036,16 @@ class MyAgent:
 
     def _slice_workflow_text(self, query: str, kind: str) -> str:
         if kind == "leave":
-            keys = ["请假", "事假", "年假", "病假", "育儿假"]
+            keys = ["请假", "事假", "年假", "病假", "育儿假", "婚假", "陪产假", "丧假"]
             positions = [query.find(key) for key in keys if query.find(key) >= 0]
             if not positions:
                 return query
-            start = max(0, min(positions) - 20)
+            trigger_pos = min(positions)
+            connector = max(query.rfind(word, 0, trigger_pos) for word in ["另外", "顺手", "同时", "然后", "还有", "再帮"])
+            start = connector + len(next((word for word in ["另外", "顺手", "同时", "然后", "还有", "再帮"] if query.startswith(word, connector)), "")) if connector >= 0 else max(0, trigger_pos - 40)
             return query[start:]
 
-        expense_keys = ["费用", "采购", "报销", "物资"]
+        expense_keys = ["费用", "采购", "报销", "物资", "设备申请"]
         structure_keys = ["项目", "项目是", "项目为", "项目还是", "平台是", "平台为", "系统是", "系统为", "工程是", "工程为", "专项是", "专项为"]
         budget_keys = ["预算", "总预算", "金额", "总金额"]
         expense_positions = [query.find(key) for key in expense_keys if query.find(key) >= 0]
@@ -11994,7 +13061,10 @@ class MyAgent:
         if boundary >= 0:
             start = boundary + 1
         elif strong_positions:
-            start = max(0, trigger_pos - 20)
+            connector_words = ["另外", "顺手", "同时", "然后", "还有", "再帮"]
+            connector_positions = [(query.rfind(word, 0, trigger_pos), word) for word in connector_words]
+            connector_pos, connector_word = max(connector_positions, key=lambda item: item[0])
+            start = connector_pos + len(connector_word) if connector_pos >= 0 else max(0, trigger_pos - 40)
         else:
             start = 0
         return query[start:]
@@ -12333,6 +13403,7 @@ class MyAgent:
             return {}
         for pattern in [
             r"(?:要做|需要|采购|购买|要买|包括|包含)(?:一批|一些)?\s*([^，。；;、]{2,18}?)(?:，|。|；|;|预算|总预算|总金额|金额)",
+            r"(?:存|保存|提交|申请)(?:一个|一笔|个)?\s*([^，。；;、]{2,18}?)(?:采购|费用)?草稿",
         ]:
             for match in re.finditer(pattern, str(text or "")):
                 name = self._clean_material_name_match(match.group(1), match.group(1))
@@ -12428,7 +13499,7 @@ class MyAgent:
         if re.fullmatch(r"\d{1,2}:\d{1,2}", text):
             hour, minute = [int(part) for part in text.split(":", 1)]
             return f"{hour:02d}:{minute:02d}"
-        if re.fullmatch(r"\d{1,2}点半?", text):
+        if re.search(r"(?:\d{1,2}|[一二两三四五六七八九十]+)点", text):
             return self._parse_time_token(text)
         if text in {"上午", "下午", "全天", "半天", "早上", "晚上"}:
             return ""
@@ -12582,7 +13653,7 @@ class MyAgent:
         return 1
 
     def _schedule_required_days(self, state: RuntimeState) -> list[str]:
-        query = self._full_query(state.obs)
+        query = self._meeting_query(state)
         now = state.obs.get("now")
         days = []
         explicit_day = self._extract_day_text(query)
