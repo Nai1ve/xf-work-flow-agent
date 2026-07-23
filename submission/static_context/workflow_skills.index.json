@@ -347,7 +347,7 @@
         {
           "cost": 1,
           "depends_on": [
-            "locate"
+            "select_room"
           ],
           "failure_edges": {
             "*": {
@@ -366,7 +366,7 @@
         {
           "cost": 1,
           "depends_on": [
-            "cancel"
+            "locate"
           ],
           "failure_edges": {
             "*": {
@@ -408,7 +408,7 @@
         {
           "cost": 1,
           "depends_on": [
-            "select_room"
+            "cancel"
           ],
           "failure_edges": {
             "*": {
@@ -512,6 +512,29 @@
           ],
           "tool": "meetingroom.room.schedule",
           "validator": "meeting.schedules_queried"
+        }
+      ]
+    },
+    "meetingroom.workspace_query": {
+      "domain": "meetingroom",
+      "intent": "query_workspace",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workspace_query_failed"
+            }
+          },
+          "id": "query_workspace",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.workspace"
+          ],
+          "tool": "user.get_workspace",
+          "validator": "meeting.workspace_queried"
         }
       ]
     },

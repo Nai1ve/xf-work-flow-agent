@@ -9,7 +9,6 @@ import json
 import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +18,6 @@ DEFAULT_SPLIT = ROOT / "contest" / "train"
 DEFAULT_VAL_SPLIT = ROOT / "contest" / "val"
 DEFAULT_OUTPUT = ROOT / "submission" / "static_context"
 POLICY_TEMPLATE_DIR = ROOT / "submission" / "static_context"
-
-EXPENSE_WORKFLOW_ID = "34747"
 
 WRITE_TOOLS = {
     "meetingroom.booking.create",
@@ -121,6 +118,15 @@ CAPABILITIES = {
         "risk": "read",
         "required_slots": [],
         "read_tools": ["meetingroom.booking.list"],
+        "write_tools": [],
+        "evidence_required": [],
+    },
+    "meeting.query_workspace": {
+        "domain": "meetingroom",
+        "intent": "query_workspace",
+        "risk": "read",
+        "required_slots": [],
+        "read_tools": ["user.get_workspace"],
         "write_tools": [],
         "evidence_required": [],
     },
@@ -254,11 +260,20 @@ CAPABILITIES = {
     },
 }
 
+for capability_id, capability in CAPABILITIES.items():
+    if str(capability.get("domain") or "") == "meetingroom":
+        capability["result_fields"] = ["booking_result"]
+        if "participant" in capability_id:
+            capability["result_fields"].append("participant_result")
+    elif str(capability.get("domain") or "") == "workflow":
+        capability["result_fields"] = ["workflow_draft_result", "workflow_result"]
+
 
 MEETING_INTENT_CAPABILITY = {
     "book_single": "meeting.book",
     "query_booking": "meeting.query_booking",
     "query": "meeting.query_booking",
+    "query_workspace": "meeting.query_workspace",
     "query_room_schedule": "meeting.query_room_schedule",
     "book_by_schedule_analysis": "meeting.schedule_book",
     "schedule_book": "meeting.schedule_book",
@@ -307,205 +322,6 @@ def relative(path: Path) -> str:
         return str(path.relative_to(ROOT))
     except ValueError:
         return str(path)
-
-
-def expense_request_shape(query: str, rows: list[dict[str, Any]]) -> str:
-    """Separate reusable package conventions from user-specified line items."""
-    normalized_query = re.sub(r"[\s（）()，。；;、,:：]", "", str(query or "")).lower()
-    mentioned = 0
-    for row in rows:
-        name = re.sub(r"[\s（）()]", "", str(row.get("material_name") or "")).lower()
-        aliases = {name}
-        aliases.add(re.sub(r"含.*$", "", name))
-        aliases.add(re.sub(r"(?:制作|服务|采购|印刷)$", "", name))
-        aliases = {item for item in aliases if len(item) >= 2}
-        if any(alias in normalized_query for alias in aliases):
-            mentioned += 1
-    if rows and mentioned == len(rows):
-        return "explicit_complete"
-    if len(rows) > 1 and mentioned:
-        return "explicit_partial"
-    return "generic_package"
-
-
-def normalize_expense_row(row: dict[str, Any]) -> dict[str, str]:
-    return {
-        "material_subclass": str(row.get("material_subclass") or ""),
-        "material_name": str(row.get("material_name") or "").strip(),
-        "quantity": str(row.get("quantity") or ""),
-        "unit_price": str(row.get("unit_price") or ""),
-        "budget_amount": str(row.get("budget_amount") or ""),
-    }
-
-
-def validate_expense_template(total: Any, rows: list[dict[str, str]]) -> None:
-    try:
-        expected_total = Decimal(str(total))
-    except (InvalidOperation, ValueError) as exc:
-        raise ValueError(f"invalid expense total: {total}") from exc
-    actual_total = Decimal("0")
-    for row in rows:
-        try:
-            quantity = Decimal(row["quantity"])
-            unit_price = Decimal(row["unit_price"])
-            budget_amount = Decimal(row["budget_amount"])
-        except (InvalidOperation, ValueError) as exc:
-            raise ValueError(f"invalid expense row amount: {row}") from exc
-        if not row["material_subclass"] or not row["material_name"]:
-            raise ValueError(f"incomplete expense row: {row}")
-        if quantity <= 0 or unit_price < 0 or quantity * unit_price != budget_amount:
-            raise ValueError(f"expense row does not conserve amount: {row}")
-        actual_total += budget_amount
-    if actual_total != expected_total:
-        raise ValueError(f"expense rows total {actual_total} != workflow total {expected_total}")
-
-
-def build_expense_examples_index(cases_dir: Path) -> dict[str, Any]:
-    """Build train-only memories without retaining benchmark case identifiers."""
-    memories: dict[str, dict[str, Any]] = {}
-    source_hashes: list[str] = []
-    for case_path in sorted(cases_dir.glob("*.json")):
-        case = load_json(case_path)
-        case_hash = sha256(case_path)
-        source_hashes.append(case_hash)
-        query = str(case.get("user_query") or "").strip()
-        project_queries = [
-            str((step.get("args") or {}).get("project_name") or "").strip()
-            for step in case.get("gold_trajectory") or []
-            if isinstance(step, dict)
-            and step.get("tool") == "workflow.project_search"
-            and isinstance(step.get("args"), dict)
-            and (step.get("args") or {}).get("project_name")
-        ]
-        for step in case.get("gold_trajectory") or []:
-            if not isinstance(step, dict) or step.get("tool") != "workflow.save":
-                continue
-            args = step.get("args") if isinstance(step.get("args"), dict) else {}
-            if str(args.get("workflow_id") or "") != EXPENSE_WORKFLOW_ID:
-                continue
-            data = args.get("data") if isinstance(args.get("data"), dict) else {}
-            details = data.get("details") if isinstance(data.get("details"), dict) else {}
-            rows = [normalize_expense_row(row) for row in details.get("detail_2") or [] if isinstance(row, dict)]
-            validate_expense_template(data.get("total_amount"), rows)
-            project_aliases = _expense_project_aliases(case, data, project_queries)
-            entry = {
-                "request_shape": expense_request_shape(query, rows),
-                "request_text": query,
-                "submit": bool(args.get("submit")),
-                "project": {
-                    "project_name": str(data.get("project_name") or ""),
-                    "project_code": str(data.get("project_code") or ""),
-                    "wbs_code": str(data.get("wbs_code") or ""),
-                },
-                "project_search_queries": sorted(set(project_queries)),
-                "project_aliases": project_aliases,
-                "material_category": str(data.get("material_category") or ""),
-                "total_amount": str(data.get("total_amount") or ""),
-                "rows": rows,
-            }
-            memory_id = content_sha256(entry)[:20]
-            existing = memories.get(memory_id)
-            if existing:
-                existing["support_count"] += 1
-                existing["source_sha256"].append(case_hash)
-                continue
-            memories[memory_id] = {
-                "memory_id": memory_id,
-                **entry,
-                "support_count": 1,
-                "source_sha256": [case_hash],
-            }
-    entries = sorted(memories.values(), key=lambda item: item["memory_id"])
-    shape_counts = Counter(str(item.get("request_shape") or "unknown") for item in entries)
-    corpus_hash = hashlib.sha256("\n".join(sorted(source_hashes)).encode("ascii")).hexdigest()
-    return {
-        "schema_version": "expense-examples-v1",
-        "provenance": {
-            "split": "train",
-            "cases_path": relative(cases_dir),
-            "cases_sha256": corpus_hash,
-            "policy": "train gold only; case identifiers omitted; runtime ids must still be verified by tools",
-        },
-        "counts": {
-            "source_cases": len(source_hashes),
-            "memories": len(entries),
-            "request_shapes": dict(sorted(shape_counts.items())),
-        },
-        "entries": entries,
-    }
-
-
-def build_leave_defaults_index(cases_dir: Path) -> dict[str, Any]:
-    """Record train-observed defaults only when the user did not name an approver."""
-    entries: list[dict[str, Any]] = []
-    source_hashes: list[str] = []
-    for case_path in sorted(cases_dir.glob("*.json")):
-        case = load_json(case_path)
-        query = str(case.get("user_query") or "").strip()
-        if "审批人" in query:
-            continue
-        save_step = next(
-            (
-                step
-                for step in case.get("gold_trajectory") or []
-                if isinstance(step, dict)
-                and step.get("tool") == "workflow.save"
-                and str((step.get("args") or {}).get("workflow_id") or "") == "72247"
-            ),
-            None,
-        )
-        if not save_step:
-            continue
-        args = save_step.get("args") if isinstance(save_step.get("args"), dict) else {}
-        data = args.get("data") if isinstance(args.get("data"), dict) else {}
-        approver_id = str(data.get("approver") or "")
-        if not approver_id:
-            continue
-        people = ((case.get("world_state") or {}).get("workflow_people") or []) if isinstance(case.get("world_state"), dict) else []
-        person = next((item for item in people if isinstance(item, dict) and str(item.get("user_id") or "") == approver_id), {})
-        case_hash = sha256(case_path)
-        source_hashes.append(case_hash)
-        payload = {
-            "request_text": query,
-            "submit": bool(args.get("submit")),
-            "leave_type": str(data.get("leave_type") or ""),
-            "approver_user_id": approver_id,
-            "approver_name": str(person.get("name") or ""),
-            "source_sha256": case_hash,
-        }
-        entries.append({"memory_id": content_sha256(payload)[:20], **payload})
-    corpus_hash = hashlib.sha256("\n".join(sorted(source_hashes)).encode("ascii")).hexdigest()
-    return {
-        "schema_version": "leave-defaults-v1",
-        "provenance": {
-            "split": "train",
-            "cases_path": relative(cases_dir),
-            "cases_sha256": corpus_hash,
-            "policy": "train gold defaults only; case identifiers omitted; approver must still be returned by workflow.search_person",
-        },
-        "counts": {"memories": len(entries)},
-        "entries": sorted(entries, key=lambda item: item["memory_id"]),
-    }
-
-
-def _expense_project_aliases(case: dict[str, Any], saved_data: dict[str, Any], project_queries: list[str]) -> list[str]:
-    """Collect only train-observed aliases for the project used by workflow.save."""
-    project_code = str(saved_data.get("project_code") or "")
-    aliases = [str(saved_data.get("project_name") or ""), *project_queries]
-    world_state = case.get("world_state") if isinstance(case.get("world_state"), dict) else {}
-    search_results = world_state.get("project_search_results") if isinstance(world_state.get("project_search_results"), dict) else {}
-    for value in search_results.values():
-        projects = value if isinstance(value, list) else []
-        for project in projects:
-            if not isinstance(project, dict) or str(project.get("project_code") or "") != project_code:
-                continue
-            aliases.extend(
-                [
-                    str(project.get("project_name") or ""),
-                    str(project.get("profit_center") or ""),
-                ]
-            )
-    return sorted({alias.strip() for alias in aliases if alias and alias.strip()})
 
 
 def tool_domain(tool_name: str) -> str:
@@ -838,8 +654,6 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
     tool_path = split_dir / "tool_specs.json"
     workflow_path = split_dir / "data" / "workflow_data.json"
     meetingroom_path = split_dir / "data" / "meetingroom_data.json"
-    cases_dir = split_dir / "cases"
-
     tool_specs = load_json(tool_path)
     workflow_data = load_json(workflow_path)
     meetingroom_data = load_json(meetingroom_path)
@@ -852,8 +666,6 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
     workflows_index = build_workflows_index(workflow_data)
     meetingrooms_index = build_meetingrooms_index(meetingroom_data)
     capabilities_index = build_capabilities_index()
-    expense_examples_index = build_expense_examples_index(cases_dir)
-    leave_defaults_index = build_leave_defaults_index(cases_dir)
     workflow_skills_index = load_json(POLICY_TEMPLATE_DIR / "workflow_skills.index.json")
     outcome_policies_index = load_json(POLICY_TEMPLATE_DIR / "outcome_policies.index.json")
 
@@ -864,8 +676,6 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
             "tool_specs": {"path": relative(tool_path), "sha256": sha256(tool_path)},
             "workflow_data": {"path": relative(workflow_path), "sha256": sha256(workflow_path)},
             "meetingroom_data": {"path": relative(meetingroom_path), "sha256": sha256(meetingroom_path)},
-            "expense_examples": expense_examples_index.get("provenance") or {},
-            "leave_defaults": leave_defaults_index.get("provenance") or {},
         },
         "split_hash_checks": hash_checks,
         "counts": {
@@ -873,8 +683,6 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
             "tools": len(tool_specs),
             "workflows": len(workflow_data.get("workflow_catalog") or []),
             "rooms": len(room_items(meetingroom_data)),
-            "expense_examples": int((expense_examples_index.get("counts") or {}).get("memories") or 0),
-            "leave_defaults": int((leave_defaults_index.get("counts") or {}).get("memories") or 0),
             "workflow_skills": len(workflow_skills_index.get("skills") or {}),
             "outcome_policies": len(outcome_policies_index.get("rules") or []),
         },
@@ -883,8 +691,6 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
             "workflows": "workflows.index.json",
             "meetingrooms": "meetingrooms.index.json",
             "capabilities": "capabilities.index.json",
-            "expense_examples": "expense_examples.index.json",
-            "leave_defaults": "leave_defaults.index.json",
             "workflow_skills": "workflow_skills.index.json",
             "outcome_policies": "outcome_policies.index.json",
             "prompt_cards": "prompt_cards/",
@@ -897,8 +703,10 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
     write_json(output_dir / "workflows.index.json", workflows_index)
     write_json(output_dir / "meetingrooms.index.json", meetingrooms_index)
     write_json(output_dir / "capabilities.index.json", capabilities_index)
-    write_json(output_dir / "expense_examples.index.json", expense_examples_index)
-    write_json(output_dir / "leave_defaults.index.json", leave_defaults_index)
+    for legacy_name in ("expense_examples.index.json", "leave_defaults.index.json"):
+        legacy_path = output_dir / legacy_name
+        if legacy_path.exists():
+            legacy_path.unlink()
     write_json(output_dir / "workflow_skills.index.json", workflow_skills_index)
     write_json(output_dir / "outcome_policies.index.json", outcome_policies_index)
     cards_dir = output_dir / "prompt_cards"

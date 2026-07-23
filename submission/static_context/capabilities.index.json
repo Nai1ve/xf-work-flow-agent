@@ -11,6 +11,7 @@
       "meeting.participant_remove",
       "meeting.query_booking",
       "meeting.query_room_schedule",
+      "meeting.query_workspace",
       "meeting.rebook_larger",
       "meeting.schedule_book"
     ],
@@ -33,7 +34,8 @@
     "read": [
       "meeting.participant_list",
       "meeting.query_booking",
-      "meeting.query_room_schedule"
+      "meeting.query_room_schedule",
+      "meeting.query_workspace"
     ],
     "write": [
       "meeting.book",
@@ -62,6 +64,9 @@
         "start",
         "end"
       ],
+      "result_fields": [
+        "booking_result"
+      ],
       "risk": "write",
       "write_tools": [
         "meetingroom.booking.create"
@@ -80,6 +85,9 @@
       "required_slots": [
         "segments"
       ],
+      "result_fields": [
+        "booking_result"
+      ],
       "risk": "write",
       "write_tools": [
         "meetingroom.booking.create"
@@ -96,6 +104,9 @@
       ],
       "required_slots": [
         "target_booking"
+      ],
+      "result_fields": [
+        "booking_result"
       ],
       "risk": "high_risk_write",
       "write_tools": [
@@ -116,6 +127,9 @@
       "required_slots": [
         "target_booking"
       ],
+      "result_fields": [
+        "booking_result"
+      ],
       "risk": "high_risk_write",
       "write_tools": [
         "meetingroom.booking.cancel",
@@ -134,6 +148,9 @@
       "required_slots": [
         "target_booking",
         "duration_minutes"
+      ],
+      "result_fields": [
+        "booking_result"
       ],
       "risk": "high_risk_write",
       "write_tools": [
@@ -155,6 +172,10 @@
         "target_booking",
         "participants"
       ],
+      "result_fields": [
+        "booking_result",
+        "participant_result"
+      ],
       "risk": "write",
       "write_tools": [
         "meetingroom.booking.participant.add"
@@ -172,6 +193,10 @@
       ],
       "required_slots": [
         "target_booking"
+      ],
+      "result_fields": [
+        "booking_result",
+        "participant_result"
       ],
       "risk": "read",
       "write_tools": []
@@ -191,6 +216,10 @@
         "target_booking",
         "participants"
       ],
+      "result_fields": [
+        "booking_result",
+        "participant_result"
+      ],
       "risk": "write",
       "write_tools": [
         "meetingroom.booking.participant.remove"
@@ -204,6 +233,9 @@
         "meetingroom.booking.list"
       ],
       "required_slots": [],
+      "result_fields": [
+        "booking_result"
+      ],
       "risk": "read",
       "write_tools": []
     },
@@ -216,6 +248,23 @@
       ],
       "required_slots": [
         "room_ids"
+      ],
+      "result_fields": [
+        "booking_result"
+      ],
+      "risk": "read",
+      "write_tools": []
+    },
+    "meeting.query_workspace": {
+      "domain": "meetingroom",
+      "evidence_required": [],
+      "intent": "query_workspace",
+      "read_tools": [
+        "user.get_workspace"
+      ],
+      "required_slots": [],
+      "result_fields": [
+        "booking_result"
       ],
       "risk": "read",
       "write_tools": []
@@ -233,6 +282,9 @@
       ],
       "required_slots": [
         "target_booking"
+      ],
+      "result_fields": [
+        "booking_result"
       ],
       "risk": "high_risk_write",
       "write_tools": [
@@ -253,6 +305,9 @@
       ],
       "required_slots": [
         "day_text"
+      ],
+      "result_fields": [
+        "booking_result"
       ],
       "risk": "write",
       "write_tools": [
@@ -279,6 +334,10 @@
       "required_slots": [
         "project_hint",
         "material_hint"
+      ],
+      "result_fields": [
+        "workflow_draft_result",
+        "workflow_result"
       ],
       "risk": "write",
       "write_tools": [
@@ -308,6 +367,10 @@
         "project_hint",
         "material_hint"
       ],
+      "result_fields": [
+        "workflow_draft_result",
+        "workflow_result"
+      ],
       "risk": "high_risk_write",
       "write_tools": [
         "workflow.save"
@@ -334,6 +397,10 @@
         "end",
         "leave_type_label",
         "approver_hint"
+      ],
+      "result_fields": [
+        "workflow_draft_result",
+        "workflow_result"
       ],
       "risk": "write",
       "write_tools": [
@@ -364,6 +431,10 @@
         "leave_type_label",
         "approver_hint"
       ],
+      "result_fields": [
+        "workflow_draft_result",
+        "workflow_result"
+      ],
       "risk": "high_risk_write",
       "write_tools": [
         "workflow.save"
@@ -371,14 +442,14 @@
     }
   },
   "counts": {
-    "capabilities": 16,
+    "capabilities": 17,
     "domains": {
-      "meetingroom": 12,
+      "meetingroom": 13,
       "workflow": 4
     },
     "risk": {
       "high_risk_write": 6,
-      "read": 3,
+      "read": 4,
       "write": 7
     }
   },
@@ -398,6 +469,7 @@
     "query": "meeting.query_booking",
     "query_booking": "meeting.query_booking",
     "query_room_schedule": "meeting.query_room_schedule",
+    "query_workspace": "meeting.query_workspace",
     "rebook_larger": "meeting.rebook_larger",
     "rebook_larger_existing": "meeting.rebook_larger",
     "schedule_book": "meeting.schedule_book"

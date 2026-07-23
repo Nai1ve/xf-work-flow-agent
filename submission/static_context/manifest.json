@@ -1,18 +1,14 @@
 {
   "counts": {
-    "capabilities": 16,
-    "expense_examples": 57,
-    "leave_defaults": 13,
+    "capabilities": 17,
     "outcome_policies": 6,
     "rooms": 139,
     "tools": 22,
-    "workflow_skills": 14,
+    "workflow_skills": 15,
     "workflows": 2
   },
   "files": {
     "capabilities": "capabilities.index.json",
-    "expense_examples": "expense_examples.index.json",
-    "leave_defaults": "leave_defaults.index.json",
     "meetingrooms": "meetingrooms.index.json",
     "outcome_policies": "outcome_policies.index.json",
     "prompt_cards": "prompt_cards/",
@@ -20,21 +16,9 @@
     "workflow_skills": "workflow_skills.index.json",
     "workflows": "workflows.index.json"
   },
-  "generated_at": "2026-07-22T02:42:59.468572+00:00",
+  "generated_at": "2026-07-23T05:41:32.306644+00:00",
   "schema_version": "static-context-v1",
   "sources": {
-    "expense_examples": {
-      "cases_path": "contest/train/cases",
-      "cases_sha256": "13f12d3b2733ce3dbdadc7425b390c0ccce6a3c2df8e21357c375a3db470f132",
-      "policy": "train gold only; case identifiers omitted; runtime ids must still be verified by tools",
-      "split": "train"
-    },
-    "leave_defaults": {
-      "cases_path": "contest/train/cases",
-      "cases_sha256": "d281d49894559e29b0523fe312f6e383cd4441c7ee0eb624af520426fdd29351",
-      "policy": "train gold defaults only; case identifiers omitted; approver must still be returned by workflow.search_person",
-      "split": "train"
-    },
     "meetingroom_data": {
       "path": "contest/train/data/meetingroom_data.json",
       "sha256": "c09ac3253904a99f4bb3710791b00736009d9e36babf29364e8c44c32b94a5a7"
@@ -45,7 +29,7 @@
     },
     "workflow_data": {
       "path": "contest/train/data/workflow_data.json",
-      "sha256": "4591318396772c152ea59ccb7a17c8e7a534a6a5c3ecbb76ce7c2c1a18ef34a2"
+      "sha256": "c0b51bebcc2007810eba7a0de42a679798092adda01e593303bcd73d2c4fc4ad"
     }
   },
   "split_hash_checks": {
@@ -55,8 +39,8 @@
       "val_sha256": "c09ac3253904a99f4bb3710791b00736009d9e36babf29364e8c44c32b94a5a7"
     },
     "data/workflow_data.json": {
-      "same": false,
-      "train_sha256": "4591318396772c152ea59ccb7a17c8e7a534a6a5c3ecbb76ce7c2c1a18ef34a2",
+      "same": true,
+      "train_sha256": "c0b51bebcc2007810eba7a0de42a679798092adda01e593303bcd73d2c4fc4ad",
       "val_sha256": "c0b51bebcc2007810eba7a0de42a679798092adda01e593303bcd73d2c4fc4ad"
     },
     "tool_specs.json": {

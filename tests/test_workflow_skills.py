@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from submission.my_agent import (
+    CaseCalendar,
     MyAgent,
     OutcomePolicyMemory,
     RuntimeState,
@@ -52,7 +53,7 @@ class WorkflowSkillRegistryTest(unittest.TestCase):
         self.assertEqual(runtime.remaining_cost({"write", "postcheck"}), 2)
 
     def test_all_skill_contracts_are_valid(self) -> None:
-        self.assertEqual(len(self.registry.skills), 14)
+        self.assertEqual(len(self.registry.skills), 15)
         self.assertEqual(self.registry.validate_contracts(), [])
         self.assertEqual(
             self.registry.validate_capability_coverage(load_index("capabilities.index.json")),
@@ -63,6 +64,17 @@ class WorkflowSkillRegistryTest(unittest.TestCase):
         skill_id, definition = self.registry.select_meetingroom("query_room_schedule")
         self.assertEqual(skill_id, "meetingroom.schedule_query")
         self.assertEqual([node["id"] for node in definition["nodes"]], ["query_schedule"])
+
+    def test_rebook_skill_selects_replacement_before_cancel(self) -> None:
+        skill_id, definition = self.registry.select_meetingroom("cancel_rebook_existing")
+        self.assertEqual(skill_id, "meetingroom.rebook")
+        by_id = {node["id"]: node for node in definition["nodes"]}
+        self.assertEqual(by_id["query_rooms"]["depends_on"], ["locate"])
+        self.assertEqual(by_id["select_room"]["depends_on"], ["query_rooms"])
+        self.assertEqual(by_id["cancel"]["depends_on"], ["select_room"])
+        self.assertEqual(by_id["create"]["depends_on"], ["cancel"])
+        runtime = WorkflowSkillRuntime(skill_id, definition)
+        self.assertEqual(runtime.remaining_cost({"write", "postcheck"}), 2)
 
     def test_participant_update_accepts_add_and_remove_tools(self) -> None:
         _, definition = self.registry.select_meetingroom("participant_remove")
@@ -204,6 +216,84 @@ class WorkflowSkillAgentTest(unittest.TestCase):
         state.meetingroom.evidence["workspace"] = {"office_address": "0552_A1_4F"}
         candidates = self.agent._room_search_candidates(state)
         self.assertEqual(candidates[0], {"office_address": "0552_A1_4F"})
+
+    def test_workspace_room_search_expands_floor_building_then_campus(self) -> None:
+        state = RuntimeState({"step_budget": 8}, set(), 8)
+        state.meetingroom.needed = True
+        state.meetingroom.intent = "book_single"
+        state.meetingroom.slots = {
+            "needs_workspace": True,
+            "day": "2026-04-21",
+            "capacity": 10,
+            "location_constraint": "preference",
+            "search_scopes": ["exact_floor", "same_building", "same_campus"],
+        }
+        state.meetingroom.evidence["workspace"] = {"office_address": "0552_A2_1F"}
+        self.assertEqual(
+            self.agent._room_search_candidates(state)[:3],
+            [
+                {"office_address": "0552_A2_1F"},
+                {"office_address": "0552_A2"},
+                {"office_address": "0552"},
+            ],
+        )
+
+    def test_hard_floor_room_search_does_not_broaden(self) -> None:
+        state = RuntimeState({"step_budget": 8}, set(), 8)
+        state.meetingroom.intent = "book_single"
+        state.meetingroom.slots = {
+            "office_candidates": ["A1"],
+            "office_address_candidates": ["0552_A1_4F"],
+            "location_constraint": "hard",
+            "search_scopes": ["exact_floor"],
+        }
+        self.assertEqual(
+            self.agent._room_search_candidates(state),
+            [{"office_address": "0552_A1_4F"}],
+        )
+
+    def test_equivalent_building_queries_are_deduplicated(self) -> None:
+        query = "优先小镇A1四楼，不行就A2，订明天下午2点到3点会议室"
+        state = RuntimeState(
+            {"user_query": query, "now": "2026-04-20T10:00:00+08:00", "step_budget": 8},
+            set(),
+            8,
+        )
+        state.meetingroom.intent = "book_single"
+        state.meetingroom.slots = self.agent._heuristic_meetingroom(query, state.obs)
+        self.agent._normalize_meeting_slots(state)
+        candidates = self.agent._room_search_candidates(state)
+        self.assertEqual(
+            candidates[:3],
+            [
+                {"office_address": "0552_A1_4F"},
+                {"office_address": "0552_A2"},
+                {"office_address": "0552"},
+            ],
+        )
+        self.assertNotIn({"office_id": "A1"}, candidates)
+        self.assertNotIn({"office_id": "A2"}, candidates)
+
+    def test_rebook_read_plan_reserves_both_writes(self) -> None:
+        state = RuntimeState({"step_budget": 5}, set(), 5)
+        state.meetingroom.needed = True
+        state.meetingroom.intent = "cancel_rebook_existing"
+        self.agent._initialize_meetingroom_skill(state)
+        self.assertEqual(self.agent._read_plan_step_reserve(state), 2)
+        self.assertEqual(state.step_budget - state.steps_used - self.agent._read_plan_step_reserve(state), 3)
+
+    def test_case_calendar_has_no_machine_date_fallback(self) -> None:
+        calendar = CaseCalendar(None)
+        self.assertEqual(calendar.resolve_day("明天"), "")
+        self.assertEqual(calendar.month_day(20), "")
+        self.assertEqual(calendar.next_meeting_business_day(), "")
+        self.assertIsNone(calendar.week_start())
+
+    def test_case_calendar_resolves_relative_dates_from_observation(self) -> None:
+        calendar = CaseCalendar("2026-04-18T10:00:00+08:00")
+        self.assertEqual(calendar.resolve_day("明天"), "2026-04-19")
+        self.assertEqual(calendar.resolve_day("明天", prefer_workday=True), "2026-04-20")
+        self.assertEqual(calendar.resolve_day("下周二"), "2026-04-21")
 
     def test_explicit_order_id_satisfies_booking_location_validator(self) -> None:
         state = RuntimeState({"user_query": "查看订单 BK-100 的参会人", "step_budget": 8}, set(), 8)

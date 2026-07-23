@@ -4,7 +4,7 @@ import json
 import unittest
 from pathlib import Path
 
-from submission.my_agent import ExpenseDraftIR, MyAgent, RuntimeState, StaticContextStore
+from submission.my_agent import MyAgent, RuntimeState, StaticContextStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,52 +77,23 @@ class DomainNormalizationRegressionTest(unittest.TestCase):
         self.assertEqual(self.agent._leave_attachment_directory(state), "")
 
 
-class ExpenseMemoryRegressionTest(unittest.TestCase):
+class ExpenseCandidateRegressionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.agent = MyAgent(type("Env", (), {})())
 
-    def test_item_memory_beats_unrelated_project_context(self) -> None:
+    def test_literal_item_match_ignores_unrelated_project_context(self) -> None:
         options = [
             {"label": "电脑及其配件", "value": "WZ_202206060014"},
             {"label": "打印机、扫描仪及其配件", "value": "WZ_202206060015"},
             {"label": "测试设备", "value": "WZ_202206060020"},
         ]
         selected = self.agent._select_subclass_option(
-            "显示器",
+            "电脑",
             options,
             set(),
-            context_hint="显示器 终端测试环境建设项目 办公设备/测试设备",
+            context_hint="项目名称不应改变候选标签的字面匹配",
         )
         self.assertEqual(selected["value"], "WZ_202206060014")
-
-    def test_explicit_multi_total_can_use_exact_verified_memory(self) -> None:
-        query = "办公场景焕新项目这边先存个草稿：27寸显示器2台、扩展坞3个，总预算5300元。"
-        state = RuntimeState({"user_query": query, "step_budget": 10}, set(), 10)
-        state.workflow.needed = True
-        state.workflow.intent = "expense_material"
-        expense = self.agent._heuristic_expense(query)
-        state.workflow.slots = {"submit": False, "source_text": query, "expense": expense}
-        state.workflow.evidence["subclass_options"] = {
-            "options": [
-                {"label": "电脑及其配件", "value": "WZ_202206060014"},
-                {"label": "打印机、扫描仪及其配件", "value": "WZ_202206060015"},
-                {"label": "手机、3C数码", "value": "WZ_202206060019"},
-            ]
-        }
-        state.workflow.evidence["expense_bindings"] = {
-            "subclass": {
-                "allowed_ids": ["WZ_202206060014", "WZ_202206060015", "WZ_202206060019"]
-            }
-        }
-        ir = self.agent._expense_memory_draft_ir(
-            state,
-            {"project_name": "办公场景焕新项目", "project_code": "N-260200005", "wbs_code": "N-260200005.03"},
-            {"label": "办公设备/测试设备", "value": "WZLB-202206060001"},
-            "5300.00",
-            request_type="explicit_multi_unallocated",
-        )
-        self.assertIsInstance(ir, ExpenseDraftIR)
-        self.assertEqual([row["budget_amount"] for row in ir.rows], ["3200", "2100"])
 
     def test_cross_domain_expense_slice_keeps_leading_quantity(self) -> None:
         query = "订明天上午会议室，另外帮我提交办公设备申请，要2台显示器每台1500，1个扩展坞800，项目是星火平台。"
@@ -146,36 +117,7 @@ class ExpenseMemoryRegressionTest(unittest.TestCase):
         ]
         self.assertFalse(self.agent._has_unallocated_multi_material_budget(expense, options))
 
-    def test_single_item_total_uses_verified_memory_without_llm(self) -> None:
-        query = "先帮我存一个外包数据服务草稿，项目是交付运营产品发布会，预算30000元，后面我还要确认采购周期。"
-        state = RuntimeState({"user_query": query, "step_budget": 10}, set(), 10)
-        state.workflow.intent = "expense_material"
-        state.workflow.slots = {"source_text": query, "expense": self.agent._heuristic_expense(query)}
-        state.workflow.evidence["subclass_options"] = {
-            "options": [
-                {"label": "数据服务", "value": "WZ_202506190001"},
-                {"label": "IDC、CDN租赁服务、云服务、运营商业务", "value": "WZ_202206200005"},
-            ]
-        }
-        state.workflow.evidence["expense_bindings"] = {
-            "project": {"selected_id": "F-260100006|F-260100006.03"},
-            "category": {"selected_id": "WZLB-201911250001"},
-            "subclass": {
-                "dependency_fingerprint": "F-260100006|F-260100006.03|WZLB-201911250001",
-                "allowed_ids": ["WZ_202506190001", "WZ_202206200005"],
-            },
-        }
-        ir = self.agent._expense_memory_draft_ir(
-            state,
-            {"project_name": "智能服务外包交付项目", "project_code": "F-260100006", "wbs_code": "F-260100006.03"},
-            {"label": "外包服务费-交付类", "value": "WZLB-201911250001"},
-            "30000.00",
-            request_type="single_item_total",
-        )
-        self.assertIsInstance(ir, ExpenseDraftIR)
-        self.assertEqual(ir.rows[0]["material_name"], "数据服务")
-
-    def test_verified_singleton_still_runs_specific_memory_query(self) -> None:
+    def test_verified_singleton_still_runs_user_grounded_refinement(self) -> None:
         query = "帮我提一个品牌宣传费用申请，项目是智能办公平台品牌升级项目，预算3万元。"
         state = RuntimeState({"user_query": query, "step_budget": 10}, set(), 10)
         state.workflow.intent = "expense_material"
@@ -209,47 +151,6 @@ class ExpenseMemoryRegressionTest(unittest.TestCase):
         self.assertEqual(args, {"project_name": "测试环境建设"})
         self.assertEqual(state.workflow.evidence["project_resolution"]["query_plan"][0]["source"], "candidate_disambiguation")
 
-    def test_request_memory_selects_category_without_llm(self) -> None:
-        query = "先帮我把企业官网改版那边的专题页视觉设计费用存成草稿，预算2.6万元，项目是官网改版那个。"
-        state = RuntimeState({"user_query": query, "step_budget": 10}, set(), 10)
-        state.workflow.intent = "expense_material"
-        expense = self.agent._heuristic_expense(query)
-        state.workflow.slots = {"source_text": query, "expense": expense}
-        state.workflow.evidence["verified_project"] = {
-            "project_name": "企业官网改版传播项目",
-            "project_code": "Q-260200007",
-            "wbs_code": "Q-260200007.03",
-        }
-        options = [
-            {"label": "品牌广告服务", "value": "WZLB-202005120001"},
-            {"label": "广宣印刷物资", "value": "WZLB-201812270001"},
-        ]
-        selected = self.agent._select_expense_category_by_memory(state, expense, options)
-        self.assertEqual(selected["value"], "WZLB-202005120001")
-
-
-class LeaveDefaultMemoryRegressionTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.agent = MyAgent(type("Env", (), {})())
-
-    def test_train_default_memory_has_no_case_identifiers(self) -> None:
-        payload = (ROOT / "submission" / "static_context" / "leave_defaults.index.json").read_text()
-        self.assertNotIn("beta_", payload)
-        self.assertEqual(json.loads(payload)["provenance"]["split"], "train")
-
-    def test_default_approver_memory_only_selects_returned_candidate(self) -> None:
-        query = "帮我订明天下午2点到3点小镇A1四楼6人会议室。另外把4月25日下午2点半到6点的事假直接提交。"
-        state = RuntimeState({"user_query": query, "step_budget": 9}, set(), 9)
-        state.workflow.intent = "leave"
-        state.workflow.slots = {"submit": True, "leave": {"leave_type_label": "事假"}}
-        people = [
-            {"user_id": "120002", "name": "刘明", "title": "研发经理"},
-            {"user_id": "120004", "name": "王芳", "title": "产品经理"},
-        ]
-        selected = self.agent._deterministic_leave_people(state, people)
-        self.assertEqual([person["user_id"] for person in selected], ["120004"])
-
-
 class MeetingResultRegressionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.agent = MyAgent(type("Env", (), {})())
@@ -268,9 +169,16 @@ class MeetingResultRegressionTest(unittest.TestCase):
 
     def test_small_town_floor_expands_to_both_buildings(self) -> None:
         semantic = self.agent._heuristic_meetingroom("订明天上午小镇一楼10人会议室", {})
-        self.assertEqual(semantic["office_address_candidates"][:3:2], ["0552_A1_1F", "0552_A2_1F"])
+        self.assertEqual(semantic["office_address_candidates"][:2], ["0552_A1_1F", "0552_A2_1F"])
 
-    def test_existing_meeting_tomorrow_uses_business_fixture_day_on_weekend(self) -> None:
+    def test_fallback_floor_applies_only_to_the_explicit_building(self) -> None:
+        semantic = self.agent._heuristic_meetingroom(
+            "帮我订明天下午2点到3点的小镇会议室，优先A1四楼，不行就A2",
+            {},
+        )
+        self.assertEqual(semantic["office_address_candidates"][:2], ["0552_A1_4F", "0552_A2"])
+
+    def test_existing_meeting_tomorrow_uses_shared_workday_policy(self) -> None:
         state = RuntimeState(
             {"user_query": "我明天下午两点的项目复盘会能延长半小时就延", "now": "2026-04-18T10:00:00+08:00", "step_budget": 8},
             set(),
@@ -278,7 +186,7 @@ class MeetingResultRegressionTest(unittest.TestCase):
         )
         state.meetingroom.intent = "extend_existing"
         state.meetingroom.slots = {"day_text": "明天"}
-        self.assertEqual(self.agent._meeting_day_candidates(state)[0], "2026-04-21")
+        self.assertEqual(self.agent._meeting_day_candidates(state)[0], "2026-04-20")
 
     def test_direct_booking_answer_projects_room_to_building(self) -> None:
         state = RuntimeState({"step_budget": 4}, set(), 4)
@@ -343,6 +251,96 @@ class MeetingResultRegressionTest(unittest.TestCase):
         state.meetingroom.evidence["pending_selected_room"] = state.meetingroom.evidence["room_candidates"]["rooms"][0]
         self.agent._apply_meeting_tool_result(state, "user.get_workspace", {}, {"office_address": "0551_A4_4F"})
         self.assertEqual(self.agent._select_room_for_booking(state)["room_id"], "A4-4F-004")
+
+    def test_rebook_selects_verified_replacement_before_cancel(self) -> None:
+        state = RuntimeState(
+            {"user_query": "把明天的会议换个更大的会议室", "now": "2026-04-20T10:00:00+08:00", "step_budget": 5},
+            set(),
+            5,
+        )
+        state.steps_used = 3
+        state.meetingroom.needed = True
+        state.meetingroom.intent = "rebook_larger_existing"
+        state.meetingroom.slots = {
+            "day": "2026-04-21",
+            "start": "14:00",
+            "end": "15:00",
+            "capacity": 8,
+            "title": "项目复盘",
+        }
+        state.meetingroom.evidence["selected_booking"] = {
+            "order_id": "BK-1",
+            "room_id": "A1-3F-301",
+            "day": "2026-04-21",
+            "start": "14:00",
+            "end": "15:00",
+            "attendees": 6,
+            "title": "项目复盘",
+        }
+        state.meetingroom.evidence["room_candidates"] = {
+            "day": "2026-04-21",
+            "rooms": [
+                {
+                    "room_id": "A1-3F-302",
+                    "officeId": "office-302",
+                    "capacity": 10,
+                    "bookable": True,
+                    "busy_slots": [],
+                }
+            ],
+        }
+        action = self.agent._next_existing_booking_action(state)
+        self.assertEqual(action.tool, "meetingroom.booking.cancel")
+        self.assertEqual(state.meetingroom.evidence["pending_selected_room"]["room_id"], "A1-3F-302")
+        self.assertTrue(
+            self.agent.preflight_guard.validate_write(state, action.tool, action.args)["passed"]
+        )
+
+    def test_rebook_never_cancels_without_replacement_or_two_steps(self) -> None:
+        state = RuntimeState(
+            {"user_query": "把明天的会议换个更大的会议室", "now": "2026-04-20T10:00:00+08:00", "step_budget": 5},
+            set(),
+            5,
+        )
+        state.steps_used = 4
+        state.meetingroom.needed = True
+        state.meetingroom.intent = "rebook_larger_existing"
+        state.meetingroom.slots = {
+            "day": "2026-04-21",
+            "start": "14:00",
+            "end": "15:00",
+            "capacity": 8,
+            "title": "项目复盘",
+        }
+        state.meetingroom.evidence["selected_booking"] = {
+            "order_id": "BK-1",
+            "room_id": "A1-3F-301",
+            "day": "2026-04-21",
+            "start": "14:00",
+            "end": "15:00",
+            "attendees": 6,
+        }
+        replacement = {
+            "room_id": "A1-3F-302",
+            "officeId": "office-302",
+            "capacity": 10,
+            "bookable": True,
+            "busy_slots": [],
+        }
+        state.meetingroom.evidence["room_candidates"] = {"day": "2026-04-21", "rooms": [replacement]}
+        action = self.agent._next_existing_booking_action(state)
+        self.assertEqual(action.kind, "block_meetingroom")
+        self.assertEqual(action.args["reason"], "insufficient_step_budget")
+
+        state.steps_used = 3
+        state.meetingroom.evidence.pop("pending_selected_room", None)
+        preflight = self.agent.preflight_guard.validate_write(
+            state,
+            "meetingroom.booking.cancel",
+            {"order_id": "BK-1"},
+        )
+        self.assertFalse(preflight["passed"])
+        self.assertIn("rebook_replacement_not_verified", preflight["errors"])
 
 
 if __name__ == "__main__":
