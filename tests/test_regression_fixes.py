@@ -46,6 +46,16 @@ class DomainNormalizationRegressionTest(unittest.TestCase):
         self.assertTrue(submit["submit"])
         self.assertFalse(draft["submit"])
 
+    def test_generic_afternoon_leave_uses_explicit_duration(self) -> None:
+        query = "明天上午10点订个会议室开周会，下午我要请2小时事假去办事。"
+        state = RuntimeState({"user_query": query, "now": "2026-05-12T09:00:00+08:00", "step_budget": 10}, set(), 10)
+        state.workflow.intent = "leave"
+        state.workflow.slots = {"source_text": query, "leave": self.agent._heuristic_leave(query)}
+        plan = self.agent._leave_plan(state)
+        self.assertEqual(plan["start_time"], "2026-05-13 14:00")
+        self.assertEqual(plan["end_time"], "2026-05-13 16:00")
+        self.assertEqual(plan["duration"], 2.0)
+
     def test_regular_leave_without_submit_word_defaults_to_draft(self) -> None:
         workflow = self.agent._heuristic_workflow("我明天10点半到下午3点45请事假，审批人刘经理。", {})
         self.assertFalse(workflow["submit"])
@@ -151,6 +161,14 @@ class ExpenseCandidateRegressionTest(unittest.TestCase):
         self.assertEqual(args, {"project_name": "测试环境建设"})
         self.assertEqual(state.workflow.evidence["project_resolution"]["query_plan"][0]["source"], "candidate_disambiguation")
 
+    def test_verified_subclass_label_is_used_when_contained_in_user_item_name(self) -> None:
+        result = self.agent._specific_material_name(
+            "外包数据服务",
+            {"raw_text": "先帮我存一个外包数据服务草稿"},
+            {"label": "数据服务", "value": "WZ-1"},
+        )
+        self.assertEqual(result, "数据服务")
+
 class MeetingResultRegressionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.agent = MyAgent(type("Env", (), {})())
@@ -226,6 +244,26 @@ class MeetingResultRegressionTest(unittest.TestCase):
             state.meetingroom,
         )
         self.assertEqual(result["office_id"], "verified-office")
+
+    def test_rebook_projection_uses_selected_booking_without_order_slot(self) -> None:
+        state = RuntimeState({"step_budget": 5}, set(), 5)
+        state.meetingroom.intent = "cancel_rebook_existing"
+        state.meetingroom.evidence["selected_booking"] = {"order_id": "BK-OLD"}
+        state.meetingroom.evidence["cancel_done"] = {"cancelled": True, "order_id": "BK-OLD"}
+        result = self.agent._booking_result_from_create(
+            {"day": "2026-05-13", "room_id": "ROOM-NEW", "start": "14:00", "end": "16:00", "title": "全组评审"},
+            {"success": True, "room_id": "ROOM-NEW"},
+            state.meetingroom,
+        )
+        self.assertEqual(result["status"], "rebooked")
+        self.assertEqual(result["cancelled_order_id"], "BK-OLD")
+
+    def test_conditional_extension_conflict_projects_blocked_status(self) -> None:
+        state = RuntimeState({"user_query": "延长半小时，如果冲突就先别动", "step_budget": 5}, set(), 5)
+        state.meetingroom.intent = "extend_existing"
+        state.meetingroom.slots = {"fallback_policy": "keep_if_extend_conflict"}
+        action = self.agent._block_meetingroom(state, "conflict_after_requested_extension", order_id="BK-1")
+        self.assertNotIn("result", action.args)
 
     def test_cross_domain_meeting_span_owns_its_date(self) -> None:
         query = "帮我约下周二下午2点到3点在A2园区8人会议室，主题季度复盘。另外我4月19日下午2点到6点请事假。"

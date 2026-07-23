@@ -58,6 +58,31 @@ class LLMOutputContractTest(unittest.TestCase):
         self.assertNotIn('"confidence":', captured["messages"][0]["content"])
         self.assertEqual(captured["kwargs"]["max_output_tokens"], 192)
 
+    def test_semantic_stage_retries_once_with_shared_attempt_budget(self) -> None:
+        state = self._state("帮我订明天下午两点的会议室")
+        self.agent._llm_config = lambda profile="strong": {
+            "api_key": "test",
+            "timeout": 12,
+            "max_calls": 2,
+            "max_tokens": 256,
+            "profile": profile,
+        }
+        calls: list[dict] = []
+
+        def fake_chat(config, *_args, **_kwargs):
+            calls.append(dict(config))
+            if len(calls) == 1:
+                raise TimeoutError("timed out")
+            return '{"tasks":[{"domain":"meetingroom","intent":"book_single","submit":false,"slots":{"day_text":"明天","start":"14:00","end":"15:00"}}]}'
+
+        self.agent._chat_completion = fake_chat
+        semantic = self.agent._extract_semantics(state, state.obs, [])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(state.semantic_attempts, 2)
+        self.assertEqual(calls[0]["transport_max_attempts"], 1)
+        self.assertLessEqual(calls[0]["timeout"], 8)
+        self.assertEqual(semantic["task_graph"]["tasks"][0]["intent"], "book_single")
+
     def test_candidate_model_returns_only_verified_candidate_id(self) -> None:
         state = self._state("项目选终端测试环境建设项目")
         state.task_graph = {"tasks": []}

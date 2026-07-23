@@ -27,6 +27,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "semantic_extraction": "always",
         "task_graph_log_path": "reports/runtime/task_graph.jsonl",
         "task_graph_timeout_intent_seconds": 12,
+        "task_graph_total_budget_seconds": 14,
+        "task_graph_first_attempt_timeout_seconds": 8,
+        "task_graph_max_attempts": 2,
         "task_graph_timeout_simple_seconds": 10,
         "task_graph_timeout_normal_seconds": 10,
         "task_graph_timeout_complex_seconds": 10,
@@ -889,6 +892,161 @@ class ToolRegistry:
         }
 
 
+class EffectiveToolRegistry(ToolRegistry):
+    """Per-run tool contracts with runtime schemas and static safety metadata."""
+
+    def __init__(self, index: dict[str, Any], reconciliation: dict[str, Any]):
+        super().__init__(index)
+        self.reconciliation = reconciliation
+        self.available_tools = set(reconciliation.get("available_tools") or [])
+        self.available_unmapped = set(reconciliation.get("available_unmapped") or [])
+        self.disabled_tools = set(reconciliation.get("disabled_tools") or [])
+
+    def status(self) -> dict[str, Any]:
+        status = super().status()
+        status.update(
+            {
+                "available_count": len(self.available_tools),
+                "available_unmapped_count": len(self.available_unmapped),
+                "disabled_count": len(self.disabled_tools),
+                "schema_changed_count": len(self.reconciliation.get("schema_changed_tools") or []),
+            }
+        )
+        return status
+
+    def is_available(self, tool: str) -> bool:
+        return tool in self.available_tools
+
+    def can_execute_read(self, tool: str) -> bool:
+        return self.is_available(tool) and self.is_read(tool) and tool not in self.available_unmapped
+
+    def can_execute_write(self, tool: str) -> bool:
+        return self.is_available(tool) and self.is_write(tool) and tool not in self.available_unmapped
+
+    def validate_call(self, tool: str, args: dict[str, Any], available_tools: set[str] | None = None) -> dict[str, Any]:
+        result = super().validate_call(tool, args, available_tools or self.available_tools)
+        errors = list(result.get("errors") or [])
+        warnings = list(result.get("warnings") or [])
+        spec = self.spec(tool)
+        if tool in self.available_unmapped:
+            warnings.append("runtime_tool_unmapped")
+        if tool in self.disabled_tools:
+            errors.append("runtime_tool_disabled")
+        properties = spec.get("properties") if isinstance(spec.get("properties"), dict) else {}
+        type_errors: list[str] = []
+        for key, value in args.items():
+            expected = properties.get(key) if isinstance(properties.get(key), dict) else {}
+            expected_type = str(expected.get("type") or "")
+            if expected_type and not self._matches_type(value, expected_type):
+                type_errors.append(f"{key}:{expected_type}")
+        if type_errors:
+            errors.append("invalid_arg_types")
+        result.update(
+            {
+                "passed": not errors,
+                "errors": list(dict.fromkeys(errors)),
+                "warnings": list(dict.fromkeys(warnings)),
+                "invalid_arg_types": type_errors,
+                "contract_source": spec.get("contract_source") or "static",
+            }
+        )
+        return result
+
+    @staticmethod
+    def _matches_type(value: Any, expected_type: str) -> bool:
+        if value is None:
+            return True
+        if expected_type == "string":
+            return isinstance(value, str)
+        if expected_type == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected_type == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if expected_type == "boolean":
+            return isinstance(value, bool)
+        if expected_type == "array":
+            return isinstance(value, list)
+        if expected_type == "object":
+            return isinstance(value, dict)
+        return True
+
+
+class ToolContractReconciler:
+    def __init__(self, static_registry: ToolRegistry):
+        self.static_registry = static_registry
+
+    def reconcile(self, runtime_tools: Any) -> EffectiveToolRegistry:
+        runtime_by_name = self._runtime_by_name(runtime_tools)
+        static_by_name = self.static_registry.by_name
+        available = set(runtime_by_name)
+        static_names = set(static_by_name)
+        by_name: dict[str, dict[str, Any]] = {}
+        changed: list[str] = []
+
+        for name in sorted(static_names | available):
+            static_spec = static_by_name.get(name) if isinstance(static_by_name.get(name), dict) else {}
+            runtime_spec = runtime_by_name.get(name) if isinstance(runtime_by_name.get(name), dict) else {}
+            merged = json.loads(json.dumps(static_spec, ensure_ascii=False)) if static_spec else {"name": name}
+            runtime_schema = runtime_spec.get("args_schema") if isinstance(runtime_spec.get("args_schema"), dict) else {}
+            if runtime_schema:
+                properties = runtime_schema.get("properties") if isinstance(runtime_schema.get("properties"), dict) else {}
+                required = [str(item) for item in runtime_schema.get("required") or [] if item]
+                previous_contract = {
+                    "properties": merged.get("properties") or {},
+                    "required_args": merged.get("required_args") or [],
+                }
+                merged["properties"] = json.loads(json.dumps(properties, ensure_ascii=False))
+                merged["required_args"] = required
+                merged["args_schema"] = json.loads(json.dumps(runtime_schema, ensure_ascii=False))
+                if previous_contract != {"properties": properties, "required_args": required}:
+                    changed.append(name)
+            if runtime_spec.get("description") not in (None, ""):
+                merged["description"] = runtime_spec.get("description")
+            merged["available"] = name in available
+            merged["mapped"] = name in static_names
+            merged["contract_source"] = "runtime+static" if name in static_names and name in available else (
+                "runtime_unmapped" if name in available else "static_disabled"
+            )
+            if name not in static_names:
+                merged["risk"] = "unknown"
+                merged["domain"] = "unknown"
+            by_name[name] = merged
+
+        required_args = {name: list(spec.get("required_args") or []) for name, spec in by_name.items()}
+        index = {
+            "schema_version": "effective-tools-v1",
+            "by_name": by_name,
+            "required_args": required_args,
+            "write_tools": sorted(self.static_registry.write_tools & available),
+            "high_risk_write_tools": sorted(self.static_registry.high_risk_write_tools & available),
+            "counts": {"tools": len(by_name)},
+        }
+        reconciliation = {
+            "available_tools": sorted(available),
+            "available_unmapped": sorted(available - static_names),
+            "disabled_tools": sorted(static_names - available),
+            "schema_changed_tools": sorted(set(changed)),
+        }
+        return EffectiveToolRegistry(index, reconciliation)
+
+    @staticmethod
+    def _runtime_by_name(runtime_tools: Any) -> dict[str, dict[str, Any]]:
+        if isinstance(runtime_tools, dict):
+            values = runtime_tools.values()
+        elif isinstance(runtime_tools, list):
+            values = runtime_tools
+        else:
+            values = []
+        out: dict[str, dict[str, Any]] = {}
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if name:
+                out[name] = item
+        return out
+
+
 class WorkflowSchemaRegistry:
     BASIC_DETAIL_REQUIRED = {"material_subclass", "material_name", "quantity", "unit_price", "budget_amount"}
 
@@ -1096,6 +1254,19 @@ class TaskGraphContractNormalizer:
         "material_subclass",
         "value",
     }
+    MEETING_ACTION_INTENTS = {
+        "book_single",
+        "book_multi_segments_same_room",
+        "book_by_schedule_analysis",
+        "cancel_existing",
+        "extend_existing",
+        "rebook_larger_existing",
+        "cancel_rebook_existing",
+        "participant_add",
+        "participant_remove",
+        "participant_list",
+    }
+    MEETING_QUERY_INTENTS = {"query_booking", "query_workspace", "query_room_schedule"}
     # Task-graph slots are only user hints.  Keep domains isolated even when a
     # task-graph LLM returns an otherwise valid but cross-domain field.
     DEFAULT_SLOT_ALLOWLIST = {
@@ -1147,11 +1318,13 @@ class TaskGraphContractNormalizer:
                 submit_intent = "unknown"
             submit = submit_intent == "submit"
             requested_intent = str(raw.get("intent") or "unknown").strip()
+            original_requested_intent = requested_intent
             requested_capability = str(raw.get("capability") or "").strip()
-            capability = self._capability_for(domain, requested_intent, submit, requested_capability)
             contract_status = "valid"
             validation_errors: list[str] = []
             fallback = self._baseline_fallback(baseline_by_domain.get(domain) or [], requested_intent)
+            requested_intent = self._ground_requested_intent(domain, requested_intent, fallback, query)
+            capability = self._capability_for(domain, requested_intent, submit, requested_capability)
 
             if not capability and self.registry.capabilities:
                 validation_errors.append("unsupported_intent")
@@ -1178,6 +1351,9 @@ class TaskGraphContractNormalizer:
             slots = raw.get("slots") if isinstance(raw.get("slots"), dict) else {}
             safe_slots, slot_provenance, dropped_slots = self._filter_slots(slots, source_text, query)
             safe_slots, disallowed_slots = self._allowlist_slots(safe_slots, domain, canonical_intent, spec)
+            if original_requested_intent == "query_workspace" and canonical_intent in self.MEETING_ACTION_INTENTS:
+                safe_slots["needs_workspace"] = True
+                slot_provenance["needs_workspace"] = "llm_translation"
             if disallowed_slots:
                 dropped_slots.extend(disallowed_slots)
                 validation_errors.append("capability_slot_allowlist_rejected")
@@ -1213,10 +1389,61 @@ class TaskGraphContractNormalizer:
                 }
             )
 
+        tasks = self._coalesce_auxiliary_tasks(tasks)
         valid_ids = {str(item.get("task_id") or "") for item in tasks}
         for task in tasks:
             task["depends_on"] = [item for item in task.get("depends_on") or [] if item in valid_ids and item != task["task_id"]]
         return {"tasks": tasks}
+
+    def _ground_requested_intent(
+        self,
+        domain: str,
+        requested_intent: str,
+        fallback: dict[str, Any] | None,
+        query: str,
+    ) -> str:
+        if domain != "meetingroom" or requested_intent not in self.MEETING_QUERY_INTENTS or not fallback:
+            return requested_intent
+        baseline_intent = str(fallback.get("intent") or "")
+        if baseline_intent not in self.MEETING_ACTION_INTENTS:
+            return requested_intent
+        action_words = ["订", "预订", "取消", "延长", "换大", "换一个", "加入", "加到", "移除"]
+        return baseline_intent if any(word in str(query or "") for word in action_words) else requested_intent
+
+    def _coalesce_auxiliary_tasks(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        meeting_actions = [
+            task
+            for task in tasks
+            if task.get("domain") == "meetingroom" and task.get("intent") in self.MEETING_ACTION_INTENTS
+        ]
+        removed_ids: set[str] = set()
+        if meeting_actions:
+            target = meeting_actions[0]
+            target_slots = target.setdefault("slots", {})
+            for task in tasks:
+                if task is target or task.get("domain") != "meetingroom" or task.get("intent") != "query_workspace":
+                    continue
+                target_slots["needs_workspace"] = True
+                for key, value in (task.get("slots") or {}).items():
+                    target_slots.setdefault(key, value)
+                removed_ids.add(str(task.get("task_id") or ""))
+
+        seen: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for task in tasks:
+            if str(task.get("task_id") or "") in removed_ids:
+                continue
+            key = (str(task.get("domain") or ""), str(task.get("intent") or ""), str(task.get("submit_intent") or ""))
+            previous = seen.get(key)
+            if previous is None:
+                seen[key] = task
+                continue
+            for slot, value in (task.get("slots") or {}).items():
+                previous.setdefault("slots", {}).setdefault(slot, value)
+            removed_ids.add(str(task.get("task_id") or ""))
+
+        if not removed_ids:
+            return tasks
+        return [task for task in tasks if str(task.get("task_id") or "") not in removed_ids]
 
     def _canonical_baseline_tasks(self, value: Any, query: str) -> list[dict[str, Any]]:
         tasks: list[dict[str, Any]] = []
@@ -1347,8 +1574,12 @@ class TaskGraphContractNormalizer:
 
 
 class ToolAdapter:
-    def __init__(self, meetingroom_index: MeetingroomIndex):
+    def __init__(self, meetingroom_index: MeetingroomIndex, tool_registry: ToolRegistry | None = None):
         self.meetingroom_index = meetingroom_index
+        self.tool_registry = tool_registry
+
+    def set_tool_registry(self, tool_registry: ToolRegistry) -> None:
+        self.tool_registry = tool_registry
 
     def adapt(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
         adapted = json.loads(json.dumps(args or {}, ensure_ascii=False, default=str))
@@ -1367,7 +1598,29 @@ class ToolAdapter:
                 adapted["workflow_id"] = int(adapted["workflow_id"])
             except Exception:
                 pass
-        return {key: value for key, value in adapted.items() if value not in (None, "", [], {})}
+        adapted = {key: value for key, value in adapted.items() if value not in (None, "", [], {})}
+        spec = self.tool_registry.spec(tool) if self.tool_registry is not None else {}
+        properties = spec.get("properties") if isinstance(spec.get("properties"), dict) else {}
+        if properties:
+            adapted = {key: value for key, value in adapted.items() if key in properties}
+            for key, definition in properties.items():
+                if key not in adapted or not isinstance(definition, dict):
+                    continue
+                adapted[key] = self._coerce_arg(adapted[key], str(definition.get("type") or ""))
+        return adapted
+
+    @staticmethod
+    def _coerce_arg(value: Any, expected_type: str) -> Any:
+        try:
+            if expected_type == "integer" and isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+                return int(value)
+            if expected_type == "number" and isinstance(value, str):
+                return float(value)
+            if expected_type == "boolean" and isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+                return value.strip().lower() == "true"
+        except (TypeError, ValueError):
+            return value
+        return value
 
 
 class EvidenceLedger:
@@ -1544,7 +1797,7 @@ class ResultProjectionRegistry:
     def validate(self, state: "RuntimeState", answer: dict[str, Any]) -> dict[str, str]:
         errors: dict[str, str] = {}
         if state.meetingroom.needed and not any(
-            key in answer for key in ("booking_result", "participant_result", "participants")
+            key in answer for key in ("booking_result", "participant_result", "participants", "participants_added")
         ):
             errors["meetingroom"] = "missing_meetingroom_result_projection"
         if state.workflow.needed and not any(
@@ -1557,12 +1810,35 @@ class ResultProjectionRegistry:
         mr = state.meetingroom
         participant_results = mr.evidence.get("participant_results") or []
         if participant_results and mr.intent in {"participant_add", "participant_remove"}:
+            query = " ".join(
+                [str(state.obs.get("user_query") or "")]
+                + [str(item.get("content") or "") for item in state.obs.get("messages") or [] if isinstance(item, dict)]
+            )
+            explicit_order = bool(re.search(r"(?:SEED|BK)-[A-Za-z0-9-]+", query, flags=re.I))
+            if mr.intent == "participant_add" and len(participant_results) > 1 and not explicit_order:
+                answer["participants_added"] = [
+                    {key: item.get(key) for key in ("user_id", "name") if item.get(key) not in (None, "")}
+                    for item in participant_results
+                ]
+                return
+            order_id = participant_results[0].get("order_id") or mr.slots.get("order_id")
+            if mr.evidence.get("extend_done") and mr.intent == "participant_add":
+                extend_at = query.find("延长")
+                add_at = min((pos for pos in (query.find("加入"), query.find("加到"), query.find("参会人")) if pos >= 0), default=-1)
+                status = "extended_and_participant_added" if extend_at >= 0 and add_at >= 0 and extend_at < add_at else "updated"
+                answer["booking_result"] = {
+                    "status": status,
+                    "order_id": order_id,
+                    "added_user_id": participant_results[0].get("user_id"),
+                    "new_end": (mr.evidence.get("extend_done") or {}).get("end"),
+                }
+                return
             if len(participant_results) == 1:
                 answer["participant_result"] = dict(participant_results[0])
-            action = "participants_added" if mr.intent == "participant_add" else "participants_removed"
+                return
             answer["booking_result"] = {
-                "status": action,
-                "order_id": participant_results[0].get("order_id"),
+                "status": "participants_added" if mr.intent == "participant_add" else "participants_removed",
+                "order_id": order_id,
                 "added_count" if mr.intent == "participant_add" else "removed_count": len(participant_results),
             }
             return
@@ -1887,6 +2163,8 @@ class RuntimeState:
         self.llm_call_sequence = 0
         self.llm_elapsed_fast_seconds = 0.0
         self.llm_elapsed_strong_seconds = 0.0
+        self.semantic_elapsed_seconds = 0.0
+        self.semantic_attempts = 0
         self.action_elapsed_seconds = 0.0
         self.tool_elapsed_seconds = 0.0
         self.reply_elapsed_seconds = 0.0
@@ -1904,6 +2182,8 @@ class RuntimeState:
         self.history: list[dict[str, Any]] = []
         self.cache: dict[str, Any] = {}
         self.asked_slots: set[str] = set()
+        self.reply_messages_attempted: set[str] = set()
+        self.reply_messages_unresolved: set[str] = set()
         self.completed_tools: set[str] = set()
         self.ledger = EvidenceLedger()
         self.semantic_facts = SemanticFactStore()
@@ -2146,14 +2426,16 @@ class MyAgent:
             enabled=self._static_context_enabled(),
             max_chars=self._static_context_max_chars(),
         )
-        self.tool_registry = ToolRegistry(self.static_context.tools)
+        self.static_tool_registry = ToolRegistry(self.static_context.tools)
+        self.tool_contract_reconciler = ToolContractReconciler(self.static_tool_registry)
+        self.tool_registry: ToolRegistry = self.static_tool_registry
         self.workflow_registry = WorkflowSchemaRegistry(self.static_context.workflows)
         self.meetingroom_index = MeetingroomIndex(self.static_context.meetingrooms)
         self.capability_registry = CapabilityRegistry(self.static_context.capabilities)
         self.workflow_skill_registry = WorkflowSkillRegistry(self.static_context.workflow_skills)
         self.outcome_policy_memory = OutcomePolicyMemory(self.static_context.outcome_policies)
         self.task_graph_normalizer = TaskGraphContractNormalizer(self.capability_registry)
-        self.tool_adapter = ToolAdapter(self.meetingroom_index)
+        self.tool_adapter = ToolAdapter(self.meetingroom_index, self.tool_registry)
         self.preflight_guard = PreflightGuard(self.tool_registry, self.workflow_registry, self.meetingroom_index)
         self.result_projection_registry = ResultProjectionRegistry()
         self.read_plan_executor = ReadPlanExecutor(self)
@@ -2164,9 +2446,12 @@ class MyAgent:
         try:
             obs = self.env.reset(case_id)
             tools = self.env.list_tools()
+            self.tool_registry = self.tool_contract_reconciler.reconcile(tools)
+            self.tool_adapter.set_tool_registry(self.tool_registry)
+            self.preflight_guard.tool_registry = self.tool_registry
             state = RuntimeState(
                 obs=obs,
-                tools={item.get("name") for item in tools if isinstance(item, dict)},
+                tools=set(self.tool_registry.available_tools),
                 step_budget=int(obs.get("step_budget") or 0),
             )
             state.deadline_at = state.started_at + self._case_deadline_seconds()
@@ -2193,6 +2478,7 @@ class MyAgent:
                 {
                     "event": "registry_status",
                     "tool_registry": self.tool_registry.status(),
+                    "tool_reconciliation": self.tool_registry.reconciliation,
                     "workflow_registry": self.workflow_registry.status(),
                     "meetingroom_index": self.meetingroom_index.status(),
                     "capability_registry": self.capability_registry.status(),
@@ -2244,6 +2530,7 @@ class MyAgent:
                 debug_config,
                 {
                     "event": "finish",
+                    "completed": True,
                     "case_id": case_id,
                     "steps_used": state.steps_used,
                     "llm_calls_fast": state.llm_calls_fast,
@@ -2253,6 +2540,8 @@ class MyAgent:
                     "elapsed": round(elapsed_seconds, 3),
                     "elapsed_seconds": round(elapsed_seconds, 3),
                     "llm_elapsed_seconds": round(llm_elapsed_seconds, 3),
+                    "semantic_elapsed_seconds": round(state.semantic_elapsed_seconds, 3),
+                    "semantic_attempts": state.semantic_attempts,
                     "llm_elapsed_fast_seconds": round(state.llm_elapsed_fast_seconds, 3),
                     "llm_elapsed_strong_seconds": round(state.llm_elapsed_strong_seconds, 3),
                     "tool_elapsed_seconds": round(state.tool_elapsed_seconds, 3),
@@ -2302,6 +2591,29 @@ class MyAgent:
                 self._debug_log(
                     self._debug_llm_config(),
                     {"event": "run_error", "case_id": case_id, "error": str(exc), "answer": answer},
+                )
+                finished_at = time.monotonic()
+                elapsed_seconds = max(0.0, finished_at - state.started_at)
+                llm_elapsed_seconds = state.llm_elapsed_fast_seconds + state.llm_elapsed_strong_seconds
+                self._debug_log(
+                    self._debug_llm_config(),
+                    {
+                        "event": "finish",
+                        "completed": False,
+                        "case_id": case_id,
+                        "error": f"{type(exc).__name__}:{str(exc)[:200]}",
+                        "steps_used": state.steps_used,
+                        "elapsed_seconds": round(elapsed_seconds, 3),
+                        "semantic_elapsed_seconds": round(state.semantic_elapsed_seconds, 3),
+                        "semantic_attempts": state.semantic_attempts,
+                        "llm_elapsed_seconds": round(llm_elapsed_seconds, 3),
+                        "llm_elapsed_fast_seconds": round(state.llm_elapsed_fast_seconds, 3),
+                        "llm_elapsed_strong_seconds": round(state.llm_elapsed_strong_seconds, 3),
+                        "tool_elapsed_seconds": round(state.tool_elapsed_seconds, 3),
+                        "read_elapsed_seconds": round(state.read_elapsed_seconds, 3),
+                        "non_llm_elapsed_seconds": round(max(0.0, elapsed_seconds - llm_elapsed_seconds), 3),
+                        "answer": answer,
+                    },
                 )
                 return answer
             try:
@@ -2447,6 +2759,15 @@ class MyAgent:
     def _empty_read_mapping_max_variants(self) -> int:
         return self._runtime_int("empty_read_mapping_max_variants", 3, minimum=1, maximum=3)
 
+    def _task_graph_total_budget_seconds(self) -> float:
+        return self._runtime_float("task_graph_total_budget_seconds", 14.0, minimum=1.0, maximum=30.0)
+
+    def _task_graph_first_attempt_timeout_seconds(self) -> float:
+        return self._runtime_float("task_graph_first_attempt_timeout_seconds", 8.0, minimum=0.5, maximum=20.0)
+
+    def _task_graph_max_attempts(self) -> int:
+        return self._runtime_int("task_graph_max_attempts", 2, minimum=1, maximum=2)
+
     def _debug_llm_config(self) -> dict[str, Any]:
         return self._llm_config("fast")
 
@@ -2567,6 +2888,7 @@ class MyAgent:
         baseline_contract = self._semantic_contract_from_baseline(baseline, obs)
         baseline_graph = baseline_contract.get("task_graph")
         full_query = self._full_query(obs)
+        semantic_deadline = min(state.deadline_at - 3.0, stage_started + self._task_graph_total_budget_seconds())
 
         def finish(semantic: dict[str, Any], reason: str = "") -> dict[str, Any]:
             nonlocal fallback_reason, source, fast_llm_success
@@ -2582,6 +2904,7 @@ class MyAgent:
             else:
                 semantic["task_graph"] = graph
             self._capture_canonical_semantic_facts(state, baseline, semantic, source)
+            state.semantic_elapsed_seconds = max(0.0, time.monotonic() - stage_started)
             self._log_task_graph_stage(
                 state=state,
                 obs=obs,
@@ -2624,38 +2947,108 @@ class MyAgent:
         prompt_text = TASK_GRAPH_PROMPT
         user_text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         prompt_chars = len(prompt_text) + len(user_text)
-        try:
+        max_attempts = self._task_graph_max_attempts()
+        first_timeout = min(self._task_graph_first_attempt_timeout_seconds(), float(llm_config.get("timeout") or 8.0))
+        for attempt in range(1, max_attempts + 1):
+            remaining_budget = semantic_deadline - time.monotonic()
+            if remaining_budget < 0.5:
+                fallback_reason = fallback_reason or "semantic_total_budget_exhausted"
+                break
+            # urllib/socket timeouts can return slightly after their requested
+            # boundary. Reserve transport cleanup time on retries so the
+            # semantic stage remains close to its wall-clock budget.
+            retry_budget = max(0.5, remaining_budget - 1.0) if attempt > 1 else remaining_budget
+            attempt_timeout = min(first_timeout if attempt == 1 else retry_budget, retry_budget)
+            attempt_config = dict(llm_config)
+            attempt_config["timeout"] = max(0.5, attempt_timeout)
+            attempt_config["max_calls"] = max_attempts
+            attempt_config["transport_max_attempts"] = 1
+            attempt_config["seed"] = None
             fast_attempted = True
-            content = self._chat_completion(
-                llm_config,
-                [
-                    {"role": "system", "content": prompt_text},
-                    {"role": "user", "content": user_text},
-                ],
-                state=state,
-                profile="fast",
-                context_pack_type=context_pack_type,
-                context_chars=context_chars,
-                prompt_chars=prompt_chars,
-                max_output_tokens=192,
-                call_purpose="semantic_task_graph",
-            )
-            response_chars = len(content)
-            parsed = self._parse_json_object(content)
-            if isinstance(parsed, dict):
+            state.semantic_attempts = attempt
+            attempt_started = time.monotonic()
+            try:
+                content = self._chat_completion(
+                    attempt_config,
+                    [
+                        {"role": "system", "content": prompt_text},
+                        {"role": "user", "content": user_text},
+                    ],
+                    state=state,
+                    profile="fast",
+                    context_pack_type=context_pack_type,
+                    context_chars=context_chars,
+                    prompt_chars=prompt_chars,
+                    max_output_tokens=192,
+                    call_purpose="semantic_task_graph",
+                )
+                response_chars = len(content)
+                parsed = self._parse_json_object(content)
+                if not isinstance(parsed, dict):
+                    raise ValueError("invalid_json")
                 parsed = self._expand_sparse_semantic_result(parsed, full_query)
                 merged = self._merge_semantic(baseline, parsed)
                 source = "fast_llm"
                 fast_llm_success = True
+                self._log_semantic_attempt(state, attempt_config, attempt, attempt_started, True, "", semantic_deadline)
                 return finish(merged)
-            fallback_reason = "invalid_json"
-        except Exception as exc:
-            fallback_reason = str(exc)[:200] or "fast_llm_error"
+            except Exception as exc:
+                fallback_reason = str(exc)[:200] or "fast_llm_error"
+                retryable = self._semantic_error_retryable(exc)
+                self._log_semantic_attempt(
+                    state, attempt_config, attempt, attempt_started, False, fallback_reason, semantic_deadline, retryable
+                )
+                if not retryable or attempt >= max_attempts:
+                    break
+                if semantic_deadline - time.monotonic() < 0.5:
+                    fallback_reason = "semantic_total_budget_exhausted"
+                    break
+        if fallback_reason:
             error_event = self._semantic_llm_event(state, fallback_reason, mode, llm_config, complexity)
             error_event["event"] = "semantic_llm_error"
-            error_event["error"] = str(exc)[:240]
+            error_event["error"] = fallback_reason[:240]
+            error_event["attempts"] = state.semantic_attempts
             self._debug_log(llm_config, error_event)
         return finish(self._semantic_contract_from_baseline(baseline, obs), fallback_reason)
+
+    def _semantic_error_retryable(self, exc: Exception) -> bool:
+        text = str(exc or "").lower()
+        if any(marker in text for marker in ["401", "403", "400", "authentication", "unauthorized", "invalid api key"]):
+            return False
+        if isinstance(exc, (TimeoutError, urllib.error.URLError, json.JSONDecodeError, ValueError)):
+            return True
+        return any(
+            marker in text
+            for marker in ["timeout", "timed out", "empty_llm_response", "invalid_json", "http 500", "http 502", "http 503", "http 504"]
+        )
+
+    def _log_semantic_attempt(
+        self,
+        state: RuntimeState,
+        llm_config: dict[str, Any],
+        attempt: int,
+        started_at: float,
+        success: bool,
+        error: str,
+        semantic_deadline: float,
+        retryable: bool = False,
+    ) -> None:
+        now = time.monotonic()
+        self._debug_log(
+            llm_config,
+            {
+                "event": "semantic_attempt",
+                "case_id": state.obs.get("case_id"),
+                "attempt": attempt,
+                "success": success,
+                "retryable": retryable,
+                "timeout_seconds": round(float(llm_config.get("timeout") or 0), 3),
+                "elapsed_seconds": round(max(0.0, now - started_at), 3),
+                "semantic_budget_remaining_seconds": round(max(0.0, semantic_deadline - now), 3),
+                "case_remaining_seconds": round(self._remaining_seconds(state), 3),
+                "error": str(error or "")[:240],
+            },
+        )
 
     def _capture_canonical_semantic_facts(
         self,
@@ -2810,7 +3203,6 @@ class MyAgent:
             "prompt_chars": prompt_chars,
             "response_chars": response_chars,
         }
-        self._write_task_graph_log(event)
         self._debug_log(llm_config, event)
 
     def _capability_route_from_baseline(
@@ -3273,7 +3665,8 @@ class MyAgent:
         call_purpose: str = "",
     ) -> str:
         call_profile = profile or str(llm_config.get("profile") or "strong")
-        if state is not None and not self._can_call_llm(state, call_profile):
+        call_limit = int(llm_config.get("max_calls") or 1)
+        if state is not None and not self._can_call_llm(state, call_profile, max_calls=call_limit):
             raise TimeoutError(f"{call_profile} llm budget exhausted or deadline too close")
         self._note_llm_call(state, call_profile)
         call_started = time.monotonic()
@@ -3332,7 +3725,8 @@ class MyAgent:
                 return value if isinstance(value, dict) else {}
 
         def send_with_transient_retry(request_body: dict[str, Any], request_timeout: float) -> dict[str, Any]:
-            for retry_index in range(2):
+            max_transport_attempts = max(1, min(2, int(llm_config.get("transport_max_attempts") or 2)))
+            for retry_index in range(max_transport_attempts):
                 try:
                     value = send_request(request_body, request_timeout)
                     choices = value.get("choices") if isinstance(value, dict) else []
@@ -3343,7 +3737,7 @@ class MyAgent:
                 except urllib.error.HTTPError:
                     raise
                 except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
-                    if retry_index > 0 or (state is not None and self._remaining_seconds(state) < 5.0):
+                    if retry_index + 1 >= max_transport_attempts or (state is not None and self._remaining_seconds(state) < 5.0):
                         raise
                     self._debug_log(
                         llm_config,
@@ -5275,8 +5669,19 @@ class MyAgent:
             self._sync_workflow_skill(state)
             if state.workflow_skill is not None:
                 reserve += state.workflow_skill.remaining_cost({"write", "postcheck"})
+                if wf.intent == "expense_material" and not wf.evidence.get("save_done"):
+                    reserve += self._expense_downstream_read_reserve(state)
             elif wf.intent in {"leave", "expense_material"} and not wf.evidence.get("save_done"):
                 reserve += 1
+        return reserve
+
+    def _expense_downstream_read_reserve(self, state: RuntimeState) -> int:
+        evidence = state.workflow.evidence
+        reserve = 0
+        if not evidence.get("verified_project"):
+            reserve += 2  # category and dependent subclass
+        elif not evidence.get("selected_material_category"):
+            reserve += 1  # dependent subclass after category selection
         return reserve
 
     def _build_read_plan(self, state: RuntimeState) -> ReadPlan:
@@ -5369,7 +5774,7 @@ class MyAgent:
             if ready("project") and not wf.evidence.get("verified_project") and not wf.evidence.get("project_candidates"):
                 if not self._append_project_empty_retry_tasks(state, tasks, expense):
                     self._append_project_search_fanout_tasks(state, tasks, expense)
-            if ready("category") and not wf.evidence.get("category_options"):
+            if ready("category") and wf.evidence.get("verified_project") and not wf.evidence.get("category_options"):
                 field_id = self._expense_category_field_id(state)
                 if field_id:
                     self._append_read_task(
@@ -5407,10 +5812,9 @@ class MyAgent:
                 item,
                 "workflow",
                 group_key=group_key,
-                # A concrete singleton is sufficient in competition mode.
-                # A broad structure-word singleton must not suppress the
-                # concrete queries already queued behind it.
-                stop_group_on_success=self._project_query_quality(item) > 0.15,
+                # When the user supplied a formal name, keep one normalized
+                # core query behind the original phrase before closing the group.
+                stop_group_on_success=(len(variants) == 1 or index > 0) and self._project_query_quality(item) > 0.15,
                 mapping_score=2.0 - index * 0.1,
             )
             if len(tasks) > before:
@@ -5512,19 +5916,32 @@ class MyAgent:
             return [first_args]
         tried = set(str(item) for item in expense.get("_tried_project_keywords") or [])
         out: list[str] = []
+        composed_candidates: set[str] = set()
+        formal_core_candidates: set[str] = set()
         first = self._clean_project_phrase(first_args.get("project_name") or "")
         if first:
             out.append(first)
         explicit = self._clean_project_phrase(expense.get("project_name") or "")
         context_tokens = self._project_context_structural_tokens(state, explicit)
         formal_explicit = self._looks_like_formal_project_hint(explicit)
+        if explicit and not formal_explicit:
+            for keyword in expense.get("project_keywords") or []:
+                text = self._clean_project_phrase(keyword)
+                if text and text != explicit:
+                    composed = self._compose_project_business_candidate(text, explicit)
+                    if composed:
+                        out.append(composed)
+                        composed_candidates.add(composed)
         if explicit:
-            out.extend(self._project_structural_candidates(explicit))
             if formal_explicit:
-                out.extend(self._formal_hint_core_candidates(explicit))
+                formal_cores = self._formal_hint_core_candidates(explicit)
+                formal_core_candidates.update(formal_cores)
+                out.extend(formal_cores)
+                out.extend(self._project_structural_candidates(explicit))
                 out.extend(self._project_candidate_forms(explicit))
                 out.extend(self._project_name_variants(explicit))
             else:
+                out.extend(self._project_structural_candidates(explicit))
                 out.extend(self._project_candidate_forms(explicit))
         for keyword in expense.get("project_keywords") or []:
             text = self._clean_project_phrase(keyword)
@@ -5533,8 +5950,16 @@ class MyAgent:
                 if formal_explicit or self._looks_like_formal_project_hint(text):
                     out.append(text)
                     out.extend(self._project_candidate_forms(text))
-                    out.extend(self._formal_hint_core_candidates(text))
+                    formal_cores = self._formal_hint_core_candidates(text)
+                    formal_core_candidates.update(formal_cores)
+                    out.extend(formal_cores)
                     out.extend(self._project_core_token_candidates(text))
+                elif text != explicit:
+                    composed = self._compose_project_business_candidate(text, explicit)
+                    if composed:
+                        out.append(composed)
+                        composed_candidates.add(composed)
+                    out.append(text)
         if formal_explicit:
             out.extend(self._project_phrase_candidates(self._workflow_query(state)))
         # Bare structure words are fallback probes and must never displace a
@@ -5560,7 +5985,11 @@ class MyAgent:
                 value
                 for _, value in sorted(
                     enumerate(remaining_values),
-                    key=lambda pair: (-self._project_query_quality({"project_name": pair[1]}), pair[0]),
+                    key=lambda pair: (
+                        0 if pair[1] in formal_core_candidates else 1 if pair[1] in composed_candidates else 2,
+                        -self._project_query_quality({"project_name": pair[1]}),
+                        pair[0],
+                    ),
                 )
             ]
             ordered = [first_value, *remaining_values]
@@ -5591,6 +6020,19 @@ class MyAgent:
         # Keep the literal plus bounded tokens/phrases extracted from the
         # user's project text, including its explicit structure terms.
         return [{"project_name": value} for value in variants[:3]]
+
+    def _compose_project_business_candidate(self, business_phrase: str, project_phrase: str) -> str:
+        """Compose a bounded query from two user-provided phrases only."""
+        business = re.sub(r"[^\u4e00-\u9fa5A-Za-z0-9]", "", str(business_phrase or ""))
+        project = re.sub(r"[^\u4e00-\u9fa5A-Za-z0-9]", "", str(project_phrase or ""))
+        if len(business) < 4 or len(project) < 4:
+            return ""
+        left = business[:2]
+        right = project[:2]
+        if left == right or left in project or right in business:
+            return ""
+        candidate = left + right
+        return candidate if self._valid_project_search_candidate(candidate, allow_short=True) else ""
 
     def _project_structural_candidates(self, value: Any) -> list[str]:
         """Split only the supplied project phrase around structural terms."""
@@ -6077,6 +6519,22 @@ class MyAgent:
                 args = self._next_booking_list_args(state)
                 if args is not None:
                     self._append_read_task(state, tasks, "meetingroom.booking.list", args, "meetingroom")
+            selected_booking = mr.evidence.get("selected_booking") if isinstance(mr.evidence.get("selected_booking"), dict) else {}
+            if selected_booking and self._requires_room_occupancy_read(state) and not mr.evidence.get("room_occupancy"):
+                canonical_args = self._canonical_selected_booking_list_args(state)
+                if canonical_args is not None:
+                    self._append_read_task(state, tasks, "meetingroom.booking.list", canonical_args, "meetingroom")
+                    return
+                day = str(selected_booking.get("day") or self._meeting_day(state) or "")
+                room_id = str(selected_booking.get("room_id") or "")
+                if day and room_id:
+                    self._append_read_task(
+                        state,
+                        tasks,
+                        "meetingroom.room.bookings",
+                        {"day": day, "room_id": room_id},
+                        "meetingroom",
+                    )
             if self._is_rebook_intent(mr.intent) or self._is_rebook_larger_intent(mr.intent):
                 self._append_room_list_read_tasks(state, tasks)
             return
@@ -6101,7 +6559,12 @@ class MyAgent:
                 index = int(mr.evidence.get("participant_index") or 0)
                 people = mr.slots.get("participants") if isinstance(mr.slots.get("participants"), list) else []
                 person = people[index] if index < len(people) and isinstance(people[index], dict) else {}
-                if order_id and mr.intent == "participant_add" and "participants" not in mr.evidence:
+                if (
+                    order_id
+                    and mr.intent == "participant_add"
+                    and "participants" not in mr.evidence
+                    and self._participant_duplicate_check_required(state)
+                ):
                     self._append_read_task(
                         state,
                         tasks,
@@ -6190,6 +6653,10 @@ class MyAgent:
 
     def _read_task_allowed(self, state: RuntimeState, task: ReadTask) -> bool:
         if task.tool not in READ_TOOLS or task.tool not in state.tools:
+            return False
+        if isinstance(self.tool_registry, EffectiveToolRegistry) and not self.tool_registry.can_execute_read(task.tool):
+            return False
+        if not isinstance(self.tool_registry, EffectiveToolRegistry) and not self.tool_registry.is_read(task.tool):
             return False
         if task.task_key in state.read_task_keys_completed or task.task_key in state.read_task_keys_attempted:
             return False
@@ -6637,6 +7104,11 @@ class MyAgent:
 
     def _next_existing_booking_action(self, state: RuntimeState) -> StepAction | None:
         mr = state.meetingroom
+        if state.obs.get("mode") == "multi_turn" and not (self._extract_order_id(self._full_query(state.obs)) or mr.slots.get("order_id")):
+            dialogue = state.obs.get("dialogue_state") if isinstance(state.obs.get("dialogue_state"), dict) else {}
+            if "order_id" in (dialogue.get("missing_slots") or []) and "order_id" not in state.asked_slots:
+                state.asked_slots.add("order_id")
+                return StepAction("reply", message="请提供需要处理的会议订单号。")
         if "selected_booking" not in mr.evidence:
             args = self._next_booking_list_args(state)
             if args is None:
@@ -6659,6 +7131,14 @@ class MyAgent:
                 return None
             return StepAction("tool", "meetingroom.booking.cancel", {"order_id": booking.get("order_id")})
         if self._is_extend_intent(mr.intent):
+            if self._requires_room_occupancy_read(state) and not mr.evidence.get("room_occupancy"):
+                canonical_args = self._canonical_selected_booking_list_args(state)
+                if canonical_args is not None:
+                    return StepAction("tool", "meetingroom.booking.list", canonical_args)
+                day = str(booking.get("day") or self._meeting_day(state) or "")
+                room_id = str(booking.get("room_id") or "")
+                if day and room_id:
+                    return StepAction("tool", "meetingroom.room.bookings", {"day": day, "room_id": room_id})
             if mr.evidence.get("extend_attempted"):
                 if mr.evidence.get("extend_done"):
                     return None
@@ -6923,8 +7403,6 @@ class MyAgent:
                 self._bind_expense_project(state, singleton_project, "singleton_candidate")
                 projects = [singleton_project]
             elif len(projects) != 1:
-                if not wf.evidence.get("category_options"):
-                    return StepAction("tool", "workflow.browser_search", {"workflow_id": WORKFLOW_IDS["expense"], "field_id": category_field_id})
                 selected_project = self._select_project_candidate_with_llm(state, projects)
                 if selected_project:
                     projects = [selected_project]
@@ -6939,8 +7417,6 @@ class MyAgent:
                 else:
                     return self._block_workflow(state, "ambiguous_project")
         if len(projects) != 1:
-            if not wf.evidence.get("category_options"):
-                return StepAction("tool", "workflow.browser_search", {"workflow_id": WORKFLOW_IDS["expense"], "field_id": category_field_id})
             return self._block_workflow(state, "ambiguous_project")
         refine_args = self._project_refine_search_args(state, projects[0])
         if refine_args is not None:
@@ -7040,6 +7516,22 @@ class MyAgent:
             self._debug_log(llm_config, {"event": "block_workflow", **record})
             return
         if action.kind == "reply":
+            if not self._reply_available(state, action.message):
+                domain = self._reply_domain(state)
+                target = state.meetingroom if domain == "meetingroom" else state.workflow
+                target.status = "blocked"
+                target.blocked_reason = "reply_unavailable"
+                target.result = {"status": "blocked", "reason": "reply_unavailable"}
+                record = {
+                    "tool": "__reply__",
+                    "args": {"message": action.message},
+                    "result": {"error": "reply_unavailable"},
+                }
+                self._annotate_action_record(state, record, action_started, bucket="program")
+                state.history.append(record)
+                self._debug_log(llm_config, {"event": "reply_blocked", **record})
+                return
+            state.reply_messages_attempted.add(action.message)
             try:
                 result = self.env.reply(action.message)
             except Exception as exc:
@@ -7072,6 +7564,26 @@ class MyAgent:
                     "validation": validation,
                 },
             )
+        if not validation.get("passed"):
+            record = {
+                "tool": action.tool,
+                "args": args,
+                "result": {"error": "tool_contract_validation_failed", "validation": validation},
+            }
+            self._annotate_action_record(state, record, action_started, bucket="program")
+            state.history.append(record)
+            self._debug_log(llm_config, {"event": "invalid_action", **record})
+            return
+        if self.tool_registry.risk(action.tool) == "unknown":
+            record = {
+                "tool": action.tool,
+                "args": args,
+                "result": {"error": "unmapped_runtime_tool_not_executable"},
+            }
+            self._annotate_action_record(state, record, action_started, bucket="program")
+            state.history.append(record)
+            self._debug_log(llm_config, {"event": "invalid_action", **record})
+            return
         preflight_id = None
         if self.tool_registry.is_write(action.tool):
             action_domain = self._ledger_domain_for_tool(state, action.tool)
@@ -7203,8 +7715,11 @@ class MyAgent:
             state.meetingroom.evidence["confirmed_create"] = True
             return
         if not resolved:
+            state.reply_messages_unresolved.add(message)
             if action_slot := self._last_asked_slot(state):
-                state.workflow.evidence.setdefault("unresolved_slots", set()).add(action_slot)
+                domain = self._reply_domain(state)
+                target = state.meetingroom if domain == "meetingroom" else state.workflow
+                target.evidence.setdefault("unresolved_slots", set()).add(action_slot)
             return
         state.asked_slots.add(str(resolved))
         text = user_message
@@ -7226,6 +7741,10 @@ class MyAgent:
         elif resolved == "title":
             title = self._extract_meeting_title(text) or text.strip("。")
             state.meetingroom.slots["title"] = title
+        elif resolved == "order_id":
+            order_id = self._extract_order_id(text)
+            if order_id:
+                state.meetingroom.slots["order_id"] = order_id
         elif resolved == "project_code":
             code = self._first_regex(text, r"([A-Z]-\d{9})")
             if code:
@@ -7294,10 +7813,28 @@ class MyAgent:
                 leave["approver_keyword"] = self._extract_approver_keyword(text) or text.strip("。")
 
     def _last_asked_slot(self, state: RuntimeState) -> str:
-        for slot in ["material_subclass", "material_category", "project_code", "total_amount", "approver", "reason", "leave_type", "end_time", "start_time", "title", "attendees", "day"]:
+        for slot in ["order_id", "material_subclass", "material_category", "project_code", "total_amount", "approver", "reason", "leave_type", "end_time", "start_time", "title", "attendees", "day"]:
             if slot in state.asked_slots:
                 return slot
         return ""
+
+    def _reply_available(self, state: RuntimeState, message: str) -> bool:
+        return bool(
+            state.obs.get("mode") == "multi_turn"
+            and isinstance(state.obs.get("dialogue_state"), dict)
+            and isinstance(state.obs.get("user_simulator"), dict)
+            and message not in state.reply_messages_unresolved
+        )
+
+    def _reply_domain(self, state: RuntimeState) -> str:
+        slot = self._last_asked_slot(state)
+        if slot in {"order_id", "day", "attendees", "title"}:
+            return "meetingroom"
+        if slot:
+            return "workflow"
+        if state.meetingroom.needed and state.meetingroom.status in {"pending", "ready"}:
+            return "meetingroom"
+        return "workflow"
 
     def _apply_tool_result(self, state: RuntimeState, tool: str, args: dict[str, Any], result: dict[str, Any]) -> None:
         if tool.startswith("meetingroom.") or tool == "user.get_workspace" or (
@@ -7405,8 +7942,20 @@ class MyAgent:
                 mr.evidence.setdefault("room_lists_by_day", {})[str(result.get("day"))] = result
             tried = mr.evidence.setdefault("tried_room_lists", [])
             tried.append({"args": args, "result": result})
-        elif tool == "meetingroom.room.schedule":
+        elif tool in {"meetingroom.room.schedule", "meetingroom.room.bookings"}:
+            if tool == "meetingroom.room.bookings":
+                mr.evidence["room_occupancy"] = result
             mr.evidence.setdefault("schedules", {})[args.get("room_id")] = result
+            if mr.intent != "query_room_schedule" and args.get("room_id"):
+                room = dict(self.meetingroom_index.room(args.get("room_id")) or {})
+                if room:
+                    room.setdefault("room_id", args.get("room_id"))
+                    room.setdefault("busy_slots", [])
+                    room.setdefault("bookable", True)
+                    mr.evidence["room_candidates"] = self._merge_room_list_results(
+                        mr.evidence.get("room_candidates"),
+                        {"day": self._meeting_day(state), "rooms": [room]},
+                    )
             self._merge_schedule_into_room_candidates(mr, args.get("room_id"), result)
         elif tool == "meetingroom.booking.list":
             bookings = result.get("bookings") or []
@@ -7914,7 +8463,7 @@ class MyAgent:
             day_value = self._next_meeting_business_day(state.obs.get("now"))
         if not day_value:
             return None
-        args: dict[str, Any] = {"capacity_gte": int(slots.get("capacity") or 10)}
+        args: dict[str, Any] = {"capacity_gte": int(slots.get("capacity") or 10), "bookable": True}
         args["day"] = day_value
         if slots.get("has_screen"):
             args["has_screen"] = True
@@ -7941,7 +8490,7 @@ class MyAgent:
             day_value = self._next_meeting_business_day(state.obs.get("now"))
         if not day_value:
             return None
-        args: dict[str, Any] = {"capacity_gte": int(slots.get("capacity") or 10)}
+        args: dict[str, Any] = {"capacity_gte": int(slots.get("capacity") or 10), "bookable": True}
         args["day"] = day_value
         if slots.get("has_screen"):
             args["has_screen"] = True
@@ -8516,10 +9065,34 @@ class MyAgent:
             return args
         return None
 
+    def _canonical_selected_booking_list_args(self, state: RuntimeState) -> dict[str, Any] | None:
+        mr = state.meetingroom
+        booking = mr.evidence.get("selected_booking") if isinstance(mr.evidence.get("selected_booking"), dict) else {}
+        day = str(booking.get("day") or "").strip()
+        if not day:
+            return None
+        args: dict[str, Any] = {"status": "active", "day": day}
+        keyword = self._normalize_meeting_title(booking.get("title"))
+        if keyword:
+            args["keyword"] = keyword
+        tried = [
+            item.get("args")
+            for item in mr.evidence.get("tried_booking_lists", [])
+            if isinstance(item, dict) and isinstance(item.get("args"), dict)
+        ]
+        return None if args in tried else args
+
     def _extension_has_known_conflict(self, state: RuntimeState, booking: dict[str, Any]) -> bool:
         minutes = int(state.meetingroom.slots.get("duration_minutes") or 30)
         new_end = self._add_minutes(str(booking.get("end") or ""), minutes)
         booking_id = booking.get("order_id") or booking.get("booking_id")
+        occupancy = state.meetingroom.evidence.get("room_occupancy") or {}
+        for other in occupancy.get("bookings") or []:
+            other_id = other.get("order_id") or other.get("booking_id")
+            if other_id == booking_id or other.get("status") == "cancelled":
+                continue
+            if self._time_overlap(str(booking.get("end") or ""), new_end, str(other.get("start") or ""), str(other.get("end") or "")):
+                return True
         for other in state.meetingroom.evidence.get("booking_query", {}).get("bookings") or []:
             other_id = other.get("order_id") or other.get("booking_id")
             if other_id == booking_id or other.get("status") == "cancelled":
@@ -8529,6 +9102,15 @@ class MyAgent:
             if self._time_overlap(str(booking.get("start") or ""), new_end, str(other.get("start") or ""), str(other.get("end") or "")):
                 return True
         return False
+
+    def _requires_room_occupancy_read(self, state: RuntimeState) -> bool:
+        mr = state.meetingroom
+        if not (self._is_extend_intent(mr.intent) or self._is_cancel_rebook_intent(mr.intent)):
+            return False
+        query = self._meeting_query(state)
+        return str(mr.slots.get("fallback_policy") or "") == "keep_if_extend_conflict" or any(
+            word in query for word in ["冲突", "别动", "保持原样", "先别动"]
+        )
 
     def _booking_result_from_create(self, args: dict[str, Any], result: dict[str, Any], mr: DomainState) -> dict[str, Any]:
         created = mr.evidence.get("created_segments") or []
@@ -8557,7 +9139,7 @@ class MyAgent:
             "end": result.get("end") or args.get("end"),
             "title": self._normalize_meeting_title(result.get("title") or args.get("title")),
         }
-        if self._is_rebook_intent(mr.intent) and mr.evidence.get("cancel_done"):
+        if self._is_rebook_intent(mr.intent) and mr.evidence.get("cancel_done") and mr.evidence.get("selected_booking"):
             cancelled = mr.evidence.get("cancel_done") or {}
             selected = mr.evidence.get("selected_booking") or {}
             projected["status"] = "rebooked"
@@ -8877,10 +9459,14 @@ class MyAgent:
         end = self._canonical_time_value(leave.get("end"))
         leave_text = self._slice_workflow_text(query, "leave")
         duration = self._extract_duration_hours(leave_text)
+        explicit_start, explicit_end = self._extract_time_range(leave_text)
         explicit_leave_days = self._extract_requested_leave_days(leave_text)
         spans_multiple_days = bool(end_day and start_day and end_day != start_day)
-        if not start and duration and "下午" in query:
-            start = "16:00" if float(duration) <= 2 else "14:00"
+        if duration and "下午" in leave_text and not (explicit_start or explicit_end):
+            start = "14:00"
+            end = self._add_minutes(start, int(float(duration) * 60))
+        elif not start and duration and "下午" in query:
+            start = "14:00"
         if not end and start and duration:
             end = self._add_minutes(start, int(float(duration) * 60))
         if not start:
@@ -9605,7 +10191,7 @@ class MyAgent:
         if not original:
             return []
         cleaned = self._clean_project_phrase(original)
-        forms = [cleaned or original]
+        forms = [original]
         if cleaned:
             forms.append(cleaned)
         for suffix in ["项目", "专项", "工程", "平台", "系统"]:
@@ -9615,10 +10201,7 @@ class MyAgent:
                 # A named X项目 is usually retrieved more precisely by X.
                 # Keep platform/system terms in their original order because
                 # they are also explicit user-provided structural candidates.
-                if suffix == "项目":
-                    forms = [core, *forms]
-                else:
-                    forms.append(core)
+                forms.append(core)
                 break
         return self._dedupe([item for item in forms if self._valid_project_search_candidate(item, allow_short=True)])
 
@@ -9988,8 +10571,6 @@ class MyAgent:
             ),
             hint,
             str(expense.get("expense_type") or ""),
-            str(expense.get("source_text") or ""),
-            self._workflow_query(state),
         ]
         for literal_hint in literal_sources:
             literal = self._select_option_by_literal_hint(literal_hint, options)
@@ -11563,6 +12144,10 @@ class MyAgent:
         item_text = str(item_name or "")
         option_label = str((option or {}).get("label") or "")
         cleaned_item = self._clean_material_name_match(item_text, item_text) if item_text else ""
+        normalized_item = self._normalize_option_text(cleaned_item)
+        normalized_label = self._normalize_option_text(option_label)
+        if normalized_item and normalized_label and normalized_label in normalized_item:
+            return option_label
         if cleaned_item and not self._looks_like_invalid_expense_item_name(cleaned_item):
             return cleaned_item
         if item_text and self._material_name_is_exact_option(item_text, option_label):
@@ -12229,7 +12814,7 @@ class MyAgent:
             args["result"] = dict(state.meetingroom_skill.terminal_result)
         if order_id:
             args["order_id"] = order_id
-        if reason == "conflict_after_requested_extension":
+        if reason == "conflict_after_requested_extension" and not self._requires_room_occupancy_read(state):
             args["result"] = {
                 "status": "extend_failed",
                 "order_id": order_id,
@@ -12603,13 +13188,7 @@ class MyAgent:
         return room_ids
 
     def _office_id_from_room_id(self, room_id: Any) -> str:
-        room_id = str(room_id or "")
-        static = {
-            "A3-3F-311": "a33f311000000000000000000000aa14",
-            "A3-3F-312": "a33f312000000000000000000000aa15",
-            "A3-3F-310": "a33f310000000000000000000000aa13",
-        }
-        return static.get(room_id, "")
+        return str(self.meetingroom_index.office_id_for_room(room_id) or "")
 
     def _extract_capacity(self, text: str) -> int:
         patterns = [
@@ -12728,14 +13307,15 @@ class MyAgent:
             item: dict[str, str] = {}
             if name:
                 item["name"] = name
+            id_key = "user_id" if employee_no and len(employee_no) <= 6 else "employee_no"
             if employee_no:
-                item["employee_no"] = employee_no
+                item[id_key] = employee_no
                 seen_numbers.add(employee_no)
             if name:
                 existing = by_name.get(name)
                 if existing:
-                    if employee_no and not existing.get("employee_no"):
-                        existing["employee_no"] = employee_no
+                    if employee_no and not existing.get(id_key):
+                        existing[id_key] = employee_no
                     return
                 by_name[name] = item
             people.append(item)
@@ -12968,10 +13548,9 @@ class MyAgent:
             unit_price = money if "每" in text[max(0, text.find(name)): text.find(name) + 20] else budget / qty
             items.append({"name": name, "quantity": str(qty), "unit_price": self._money(unit_price), "budget_amount": self._money(budget)})
         items = self._dedupe_expense_items(items)
-        if not items:
-            specific = self._extract_specific_item_with_total_budget(text)
-            if specific:
-                items.append(specific)
+        specific = self._extract_specific_item_with_total_budget(text)
+        if specific and (not items or self._expense_item_name_quality([specific]) > self._expense_item_name_quality(items)):
+            items = [specific]
         if not items:
             service_item = self._extract_service_item_from_budget(text)
             if service_item:
@@ -13020,8 +13599,6 @@ class MyAgent:
             score += min(len(name), 8)
             if any(term in name for term in ["项目", "预算", "金额", "万元", "每台", "每个", "每条", "每场", "每份"]):
                 score -= 12
-            if name in {"周期", "采购周期", "确认采购周期"}:
-                score -= 20
             if re.fullmatch(r"\d+", name):
                 score -= 20
         return score
@@ -13244,15 +13821,20 @@ class MyAgent:
         amount = self._extract_total_amount(text) or self._extract_amount_after(text, ["预算", "总预算", "总金额", "金额"])
         if not amount:
             return {}
-        for pattern in [
-            r"(?:要做|需要|采购|购买|要买|包括|包含)(?:一批|一些)?\s*([^，。；;、]{2,18}?)(?:，|。|；|;|预算|总预算|总金额|金额)",
-            r"(?:存|保存|提交|申请)(?:一个|一笔|个)?\s*([^，。；;、]{2,18}?)(?:采购|费用)?草稿",
-        ]:
+        candidates: list[tuple[int, int, str]] = []
+        patterns = [
+            (1, r"(?:要做|需要|采购|购买|要买|包括|包含)(?:一批|一些)?\s*([^，。；;、]{2,18}?)(?:，|。|；|;|预算|总预算|总金额|金额)"),
+            (2, r"(?:(?:存|保存|提交|申请)(?:一个|一笔|个)?|(?:一个|一笔|个))\s*([^，。；;、]{2,18}?)(?:采购|费用)?草稿"),
+        ]
+        for evidence_rank, pattern in patterns:
             for match in re.finditer(pattern, str(text or "")):
                 name = self._clean_material_name_match(match.group(1), match.group(1))
                 if name and not self._looks_like_invalid_expense_item_name(name):
-                    return {"name": name, "quantity": "1", "unit_price": amount, "budget_amount": amount}
-        return {}
+                    candidates.append((evidence_rank, -match.start(), name))
+        if not candidates:
+            return {}
+        _, _, name = max(candidates, key=lambda item: (item[0], item[1], len(item[2])))
+        return {"name": name, "quantity": "1", "unit_price": amount, "budget_amount": amount}
 
     def _dedupe_expense_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         by_key: dict[tuple[str, str, str], dict[str, Any]] = {}

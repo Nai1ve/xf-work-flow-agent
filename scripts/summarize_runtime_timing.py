@@ -58,6 +58,11 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     read_plans = [item for item in events if item.get("event") == "read_plan"]
     read_batches = [item for item in events if item.get("event") == "read_batch"]
     read_tasks = [item for item in events if item.get("event") == "read_task"]
+    observed_case_ids = {
+        str(item.get("case_id") or "")
+        for item in [*starts, *finishes]
+        if str(item.get("case_id") or "")
+    }
 
     by_llm_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_llm_purpose: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -112,8 +117,13 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "cases": {
             "count": len(finishes),
+            "observed_count": len(observed_case_ids),
+            "completed_count": sum(1 for item in finishes if item.get("completed", True)),
+            "incomplete_count": sum(1 for item in finishes if not item.get("completed", True)),
             "elapsed_seconds": stats([float(item.get("elapsed_seconds") or 0) for item in finishes]),
             "llm_elapsed_seconds": stats([float(item.get("llm_elapsed_seconds") or 0) for item in finishes]),
+            "semantic_elapsed_seconds": stats([float(item.get("semantic_elapsed_seconds") or 0) for item in finishes]),
+            "semantic_attempts": stats([float(item.get("semantic_attempts") or 0) for item in finishes]),
             "fast_llm_elapsed_seconds": stats([float(item.get("llm_elapsed_fast_seconds") or 0) for item in finishes]),
             "strong_llm_elapsed_seconds": stats([float(item.get("llm_elapsed_strong_seconds") or 0) for item in finishes]),
             "tool_elapsed_seconds": stats([float(item.get("tool_elapsed_seconds") or 0) for item in finishes]),
@@ -136,6 +146,7 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
                     "case_id": str(item.get("case_id") or ""),
                     "elapsed_seconds": float(item.get("elapsed_seconds") or 0),
                     "llm_elapsed_seconds": float(item.get("llm_elapsed_seconds") or 0),
+                    "semantic_elapsed_seconds": float(item.get("semantic_elapsed_seconds") or 0),
                     "tool_elapsed_seconds": float(item.get("tool_elapsed_seconds") or 0),
                     "steps_used": int(item.get("steps_used") or 0),
                     "llm_calls": len(calls_by_case.get(str(item.get("case_id") or ""), [])),
