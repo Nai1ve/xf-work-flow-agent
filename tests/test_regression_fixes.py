@@ -11,16 +11,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RoutingContextRegressionTest(unittest.TestCase):
-    def test_compact_router_context_contains_every_registered_intent(self) -> None:
+    def test_compact_router_context_contains_every_registered_capability(self) -> None:
         store = StaticContextStore(ROOT / "submission" / "static_context", max_chars={"intent": 700})
         pack = store.for_intent_router()
         self.assertNotIn("static_context_truncated", pack["content"])
         payload = json.loads(pack["content"])
-        meeting_intents = set(payload["intents"]["meetingroom"])
-        self.assertIn("participant_list", meeting_intents)
-        self.assertIn("participant_add", meeting_intents)
-        self.assertIn("book_by_schedule_analysis", meeting_intents)
-        self.assertEqual(set(payload["intents"]["workflow"]), {"expense_material", "leave"})
+        capabilities = set(payload["caps"])
+        self.assertIn("meeting.participant_list", capabilities)
+        self.assertIn("meeting.participant_add", capabilities)
+        self.assertIn("meeting.schedule_book", capabilities)
+        self.assertIn("workflow.leave_replace_submit", capabilities)
+        self.assertEqual(len(capabilities), 18)
 
 
 class DomainNormalizationRegressionTest(unittest.TestCase):
@@ -33,12 +34,15 @@ class DomainNormalizationRegressionTest(unittest.TestCase):
         self.assertEqual(slots["end"], "15:00")
 
     def test_special_leave_types_and_reasons_are_supported(self) -> None:
-        self.assertEqual(self.agent._leave_type_value("婚假"), "M")
-        self.assertEqual(self.agent._reason_value("婚假"), "03")
-        self.assertEqual(self.agent._leave_type_value("陪产假"), "P")
-        self.assertEqual(self.agent._reason_value("陪产假"), "04")
-        self.assertEqual(self.agent._leave_type_value("丧假"), "F")
-        self.assertEqual(self.agent._reason_value("家里有丧事"), "09")
+        workflow_id = self.agent.workflow_registry.workflow_id("leave")
+        leave_types = {item["label"]: item["value"] for item in self.agent.workflow_registry.options(workflow_id, "leave_type")}
+        reasons = {item["label"]: item["value"] for item in self.agent.workflow_registry.options(workflow_id, "reason")}
+        self.assertEqual(leave_types["婚假"], "M")
+        self.assertEqual(leave_types["陪产假"], "P")
+        self.assertEqual(leave_types["丧假"], "F")
+        self.assertEqual(reasons["本人结婚"], "03")
+        self.assertEqual(reasons["配偶生产陪护"], "04")
+        self.assertEqual(reasons["亲人过世"], "09")
 
     def test_special_leave_defaults_to_submit_unless_draft_is_explicit(self) -> None:
         submit = self.agent._heuristic_workflow("我需要请5月14日到5月16日婚假，审批人找王芳经理。", {})
@@ -51,6 +55,7 @@ class DomainNormalizationRegressionTest(unittest.TestCase):
         state = RuntimeState({"user_query": query, "now": "2026-05-12T09:00:00+08:00", "step_budget": 10}, set(), 10)
         state.workflow.intent = "leave"
         state.workflow.slots = {"source_text": query, "leave": self.agent._heuristic_leave(query)}
+        state.workflow.slots["leave"]["reason_label"] = "本人有事"
         plan = self.agent._leave_plan(state)
         self.assertEqual(plan["start_time"], "2026-05-13 14:00")
         self.assertEqual(plan["end_time"], "2026-05-13 16:00")
@@ -75,6 +80,7 @@ class DomainNormalizationRegressionTest(unittest.TestCase):
         state = RuntimeState({"user_query": query, "now": "2026-04-18T09:00:00+08:00", "step_budget": 9}, set(), 9)
         state.workflow.intent = "leave"
         state.workflow.slots = {"leave": self.agent._heuristic_leave(query)}
+        state.workflow.slots["leave"]["reason_label"] = "本人结婚"
         plan = self.agent._leave_plan(state)
         self.assertEqual(plan["start_time"], "2026-04-20 09:00")
         self.assertEqual(plan["end_time"], "2026-04-22 18:00")
@@ -327,7 +333,7 @@ class MeetingResultRegressionTest(unittest.TestCase):
                 }
             ],
         }
-        action = self.agent._next_existing_booking_action(state)
+        action = self.agent._plan_existing_booking_skill_action(state)
         self.assertEqual(action.tool, "meetingroom.booking.cancel")
         self.assertEqual(state.meetingroom.evidence["pending_selected_room"]["room_id"], "A1-3F-302")
         self.assertTrue(
@@ -366,7 +372,7 @@ class MeetingResultRegressionTest(unittest.TestCase):
             "busy_slots": [],
         }
         state.meetingroom.evidence["room_candidates"] = {"day": "2026-04-21", "rooms": [replacement]}
-        action = self.agent._next_existing_booking_action(state)
+        action = self.agent._plan_existing_booking_skill_action(state)
         self.assertEqual(action.kind, "block_meetingroom")
         self.assertEqual(action.args["reason"], "insufficient_step_budget")
 

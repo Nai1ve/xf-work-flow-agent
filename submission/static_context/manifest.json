@@ -1,7 +1,6 @@
 {
   "counts": {
-    "capabilities": 17,
-    "outcome_policies": 6,
+    "capabilities": 18,
     "rooms": 139,
     "tools": 22,
     "workflow_skills": 15,
@@ -10,22 +9,37 @@
   "files": {
     "capabilities": "capabilities.index.json",
     "meetingrooms": "meetingrooms.index.json",
-    "outcome_policies": "outcome_policies.index.json",
     "prompt_cards": "prompt_cards/",
     "tools": "tools.index.json",
     "workflow_skills": "workflow_skills.index.json",
     "workflows": "workflows.index.json"
   },
-  "generated_at": "2026-07-23T05:41:32.306644+00:00",
+  "generated_at": "2026-07-24T05:57:15.738152+00:00",
   "schema_version": "static-context-v1",
   "sources": {
+    "business_skills": {
+      "path": "scripts/static_context_sources/business_skills.json",
+      "sha256": "4cbb800e5d5d44c20e8ac3380359b1a42b5589c374b974726062e01d08f15d51"
+    },
+    "capabilities": {
+      "path": "scripts/static_context_sources/capabilities.json",
+      "sha256": "2802915acf51ed9c744bcb69441ad5053139defbf872ae7f63d3824a1e86f890"
+    },
     "meetingroom_data": {
       "path": "contest/train/data/meetingroom_data.json",
       "sha256": "c09ac3253904a99f4bb3710791b00736009d9e36babf29364e8c44c32b94a5a7"
     },
+    "skill_node_policy": {
+      "path": "scripts/static_context_sources/skill_node_policy.json",
+      "sha256": "d4a1223e6b5705f2497ded89116a4030306b9cb0beb840b05398a9618d507f09"
+    },
     "tool_specs": {
       "path": "contest/train/tool_specs.json",
       "sha256": "b34115cf241a3c4592780c5b9c141c814faa8c2da859543c2ff6ae35bf3a3af3"
+    },
+    "workflow_bindings": {
+      "path": "scripts/static_context_sources/workflow_bindings.json",
+      "sha256": "99659b72cee8e09c100258e07b66240d9a4ef6f2d3254a63e0b110b02b9db295"
     },
     "workflow_data": {
       "path": "contest/train/data/workflow_data.json",

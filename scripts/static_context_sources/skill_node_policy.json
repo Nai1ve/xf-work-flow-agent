@@ -1,0 +1,45 @@
+{
+  "schema_version": "skill-node-policy-v1",
+  "collect_input": {
+    "id": "collect_input",
+    "phase": "reply",
+    "operation": "reply",
+    "depends_on": [],
+    "tools": [],
+    "args_handler": "",
+    "decision_handler": "collect_input",
+    "validator": "task.required_slots_collected",
+    "cardinality": "single",
+    "success_evidence": [
+      "task.slots"
+    ],
+    "failure_edges": {
+      "*": {
+        "action": "block",
+        "reason": "missing_required_info"
+      }
+    },
+    "cost": 0
+  },
+  "confirm_write": {
+    "id": "confirm_write",
+    "phase": "reply",
+    "operation": "reply",
+    "tools": [],
+    "args_handler": "",
+    "decision_handler": "confirm_write",
+    "validator": "task.write_confirmed",
+    "cardinality": "single",
+    "success_evidence": [
+      "task.explicit_write_intent",
+      "dialogue.confirmation"
+    ],
+    "failure_edges": {
+      "*": {
+        "action": "block",
+        "reason": "need_confirmation"
+      }
+    },
+    "cost": 0
+  }
+}

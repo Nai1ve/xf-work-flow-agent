@@ -415,38 +415,6 @@
         "workflow.save"
       ]
     },
-    "workflow.leave_replace_submit": {
-      "domain": "workflow",
-      "evidence_required": [
-        "source_workflow",
-        "applicant",
-        "workflow_schema",
-        "approver_candidate"
-      ],
-      "intent": "leave",
-      "read_tools": [
-        "user.get_info",
-        "oa.todo.list",
-        "oa.done.list",
-        "workflow.catalog",
-        "workflow.schema",
-        "file.list",
-        "workflow.search_person"
-      ],
-      "required_slots": [
-        "explicit_submit",
-        "day_text",
-        "start",
-        "end",
-        "leave_type_label",
-        "approver_hint"
-      ],
-      "risk": "high_risk_write",
-      "write_tools": [
-        "workflow.delete",
-        "workflow.save"
-      ]
-    },
     "workflow.leave_submit": {
       "domain": "workflow",
       "evidence_required": [
@@ -478,6 +446,38 @@
       "risk": "high_risk_write",
       "write_tools": [
         "workflow.save"
+      ]
+    },
+    "workflow.leave_replace_submit": {
+      "domain": "workflow",
+      "intent": "leave",
+      "risk": "high_risk_write",
+      "required_slots": [
+        "explicit_submit",
+        "day_text",
+        "start",
+        "end",
+        "leave_type_label",
+        "approver_hint"
+      ],
+      "read_tools": [
+        "user.get_info",
+        "oa.todo.list",
+        "oa.done.list",
+        "workflow.catalog",
+        "workflow.schema",
+        "file.list",
+        "workflow.search_person"
+      ],
+      "write_tools": [
+        "workflow.delete",
+        "workflow.save"
+      ],
+      "evidence_required": [
+        "source_workflow",
+        "applicant",
+        "workflow_schema",
+        "approver_candidate"
       ]
     }
   },

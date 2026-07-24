@@ -1,16 +1,60 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 
-class WorkflowSkillRuntime:
+@dataclass
+class NodeDirective:
+    """One scheduler decision produced by a registered node handler."""
+
+    status: str
+    actions: list[Any] = field(default_factory=list)
+    reason: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
+
+
+class HandlerRegistry:
+    """Small explicit registry used by skill nodes instead of method-name reflection."""
+
+    def __init__(self, kind: str):
+        self.kind = kind
+        self._handlers: dict[str, Callable[..., Any]] = {}
+
+    def register(self, name: str, handler: Callable[..., Any]) -> None:
+        key = str(name or "").strip()
+        if not key:
+            raise ValueError(f"{self.kind}_handler_name_required")
+        if key in self._handlers and self._handlers[key] is not handler:
+            raise ValueError(f"duplicate_{self.kind}_handler:{key}")
+        self._handlers[key] = handler
+
+    def get(self, name: str) -> Callable[..., Any] | None:
+        return self._handlers.get(str(name or ""))
+
+    def names(self) -> set[str]:
+        return set(self._handlers)
+
+
+class SkillRun:
     """Persistent execution state for one declarative business-skill DAG."""
 
     TERMINAL_STATUSES = {"completed", "blocked", "skipped"}
 
-    def __init__(self, skill_id: str, definition: dict[str, Any]):
+    def __init__(
+        self,
+        skill_id: str,
+        definition: dict[str, Any],
+        *,
+        task_id: str = "",
+        capability: str = "",
+        write_after: list[str] | None = None,
+    ):
         self.skill_id = skill_id
+        self.task_id = str(task_id or "")
+        self.capability = str(capability or "")
+        self.write_after = [str(item) for item in write_after or [] if item]
         self.definition = json.loads(json.dumps(definition, ensure_ascii=False, default=str))
         self.nodes = [item for item in self.definition.get("nodes") or [] if isinstance(item, dict) and item.get("id")]
         self.statuses = {str(item["id"]): "pending" for item in self.nodes}
@@ -21,6 +65,17 @@ class WorkflowSkillRuntime:
         self.retry_counts: dict[str, int] = {}
         self._failure_fingerprints: set[str] = set()
         self.terminal_result: dict[str, Any] = {}
+        self.invocations: dict[str, dict[str, str]] = {str(item["id"]): {} for item in self.nodes}
+
+    @property
+    def status(self) -> str:
+        if self.blocked_reason:
+            return "blocked"
+        if self.nodes and all(status in self.TERMINAL_STATUSES for status in self.statuses.values()):
+            return "completed"
+        if any(status == "running" for status in self.statuses.values()):
+            return "running"
+        return "pending"
 
     def sync_completed(self, completed_node_ids: set[str]) -> None:
         for node_id in completed_node_ids:
@@ -64,6 +119,9 @@ class WorkflowSkillRuntime:
                 normalized["reason"] or "validation_failed",
                 fingerprint=normalized["fingerprint"],
             )
+        if self._repeat_invocation_finished(node_id):
+            self.mark_pending(node_id, source="repeat_until")
+            return {"status": "repeat", "node": node_id}
         return {"status": "pending", "node": node_id}
 
     def _dependencies_completed(self, node_id: str) -> bool:
@@ -74,6 +132,28 @@ class WorkflowSkillRuntime:
         if self.statuses.get(node_id) == "pending":
             self.statuses[node_id] = "running"
             self.transitions.append({"node": node_id, "from": "pending", "to": "running"})
+
+    def mark_pending(self, node_id: str, *, source: str = "scheduler") -> None:
+        if self.statuses.get(node_id) != "running":
+            return
+        self.statuses[node_id] = "pending"
+        self.transitions.append({"node": node_id, "from": "running", "to": "pending", "source": source})
+
+    def _repeat_invocation_finished(self, node_id: str) -> bool:
+        node = self.node(node_id) or {}
+        if str(node.get("cardinality") or "single") != "repeat_until":
+            return False
+        if self.statuses.get(node_id) != "running":
+            return False
+        return any(status != "scheduled" for status in (self.invocations.get(node_id) or {}).values())
+
+    def mark_invocation(self, node_id: str, fingerprint: str, status: str) -> None:
+        if node_id not in self.invocations or not fingerprint:
+            return
+        self.invocations[node_id][fingerprint] = status
+
+    def invocation_status(self, node_id: str, fingerprint: str) -> str:
+        return str((self.invocations.get(node_id) or {}).get(fingerprint) or "")
 
     def mark_blocked(self, reason: str, node_id: str = "") -> dict[str, Any]:
         if self.blocked_reason:
@@ -213,7 +293,11 @@ class WorkflowSkillRuntime:
 
     def summary(self) -> dict[str, Any]:
         return {
+            "task_id": self.task_id,
+            "capability": self.capability,
             "skill_id": self.skill_id,
+            "status": self.status,
+            "write_after": list(self.write_after),
             "statuses": dict(self.statuses),
             "next_ready": [str(item.get("id")) for item in self.ready_nodes()],
             "remaining_cost": self.remaining_cost(),
@@ -223,4 +307,5 @@ class WorkflowSkillRuntime:
             "retry_counts": dict(self.retry_counts),
             "failures": list(self.failures[-10:]),
             "terminal_result": dict(self.terminal_result),
+            "invocations": {key: dict(value) for key, value in self.invocations.items() if value},
         }

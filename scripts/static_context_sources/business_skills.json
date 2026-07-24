@@ -1,0 +1,1646 @@
+{
+  "schema_version": "business-skills-v3",
+  "skills": {
+    "meetingroom.book": {
+      "domain": "meetingroom",
+      "intent": "book_single",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {"*": {"action": "block", "reason": "workspace_query_failed"}},
+          "id": "workspace",
+          "phase": "read",
+          "success_evidence": ["meetingroom.workspace"],
+          "tool": "user.get_workspace",
+          "validator": "meeting.workspace_optional",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": ["workspace"],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "no_bookable_room"
+            },
+            "no_bookable_room": {
+              "action": "retry",
+              "max_attempts": 2,
+              "target": "query_rooms"
+            }
+          },
+          "id": "query_rooms",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.room_candidates"
+          ],
+          "tool": "meetingroom.room.list",
+          "validator": "meeting.rooms_queried",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "query_rooms"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "no_bookable_room"
+            },
+            "no_bookable_room": {
+              "action": "retry",
+              "max_attempts": 2,
+              "target": "query_rooms"
+            }
+          },
+          "id": "select_room",
+          "phase": "compute",
+          "success_evidence": [
+            "meetingroom.pending_selected_room"
+          ],
+          "validator": "meeting.room_selected",
+          "operation": "compute",
+          "args_handler": "",
+          "decision_handler": "default_compute",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "select_room"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "booking_create_failed"
+            }
+          },
+          "id": "create",
+          "phase": "write",
+          "success_evidence": [
+            "meetingroom.create_done"
+          ],
+          "tool": "meetingroom.booking.create",
+          "validator": "meeting.booking_created",
+          "operation": "write",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "repeat_until"
+        }
+      ],
+      "capabilities": [
+        "meeting.book",
+        "meeting.book_multi_segments"
+      ]
+    },
+    "meetingroom.cancel": {
+      "domain": "meetingroom",
+      "intent": "cancel_existing",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "existing_booking_not_found"
+            },
+            "existing_booking_not_found": {
+              "action": "retry",
+              "exhausted_reason": "existing_booking_not_found",
+              "max_attempts": 3,
+              "target": "locate"
+            }
+          },
+          "id": "locate",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.selected_booking"
+          ],
+          "tool": "meetingroom.booking.list",
+          "validator": "meeting.booking_located",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "locate"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "booking_cancel_failed"
+            }
+          },
+          "id": "cancel",
+          "phase": "write",
+          "success_evidence": [
+            "meetingroom.cancel_done"
+          ],
+          "tool": "meetingroom.booking.cancel",
+          "validator": "meeting.booking_cancelled",
+          "operation": "write",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        }
+      ],
+      "capabilities": [
+        "meeting.cancel"
+      ]
+    },
+    "meetingroom.extend": {
+      "domain": "meetingroom",
+      "intent": "extend_existing",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "existing_booking_not_found"
+            },
+            "existing_booking_not_found": {
+              "action": "retry",
+              "exhausted_reason": "existing_booking_not_found",
+              "max_attempts": 3,
+              "target": "locate"
+            }
+          },
+          "id": "locate",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.selected_booking"
+          ],
+          "tool": "meetingroom.booking.list",
+          "validator": "meeting.booking_located",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "locate"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "conflict_after_requested_extension"
+            }
+          },
+          "id": "occupancy",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.room_occupancy"
+          ],
+          "tool": "meetingroom.room.bookings",
+          "validator": "meeting.room_occupancy_checked",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "occupancy"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "conflict_after_requested_extension"
+            },
+            "conflict_after_requested_extension": {
+              "action": "block",
+              "reason": "conflict_after_requested_extension",
+              "result": {
+                "reason": "conflict_after_requested_extension",
+                "status": "blocked"
+              }
+            }
+          },
+          "id": "extend",
+          "phase": "write",
+          "success_evidence": [
+            "meetingroom.extend_done"
+          ],
+          "tool": "meetingroom.booking.extend",
+          "validator": "meeting.booking_extended",
+          "operation": "write",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        }
+      ],
+      "capabilities": [
+        "meeting.extend"
+      ]
+    },
+    "meetingroom.participant_list": {
+      "domain": "meetingroom",
+      "intent": "participant_list",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "existing_booking_not_found"
+            },
+            "existing_booking_not_found": {
+              "action": "retry",
+              "exhausted_reason": "existing_booking_not_found",
+              "max_attempts": 3,
+              "target": "locate"
+            }
+          },
+          "id": "locate",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.selected_booking"
+          ],
+          "tool": "meetingroom.booking.list",
+          "validator": "meeting.booking_located",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "locate"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "participant_lookup_failed"
+            }
+          },
+          "id": "read_participants",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.participants"
+          ],
+          "tool": "meetingroom.booking.participant.list",
+          "validator": "meeting.participants_read",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        }
+      ],
+      "capabilities": [
+        "meeting.participant_list"
+      ]
+    },
+    "meetingroom.participant_update": {
+      "domain": "meetingroom",
+      "intent": "participant_add",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "existing_booking_not_found"
+            },
+            "existing_booking_not_found": {
+              "action": "retry",
+              "exhausted_reason": "existing_booking_not_found",
+              "max_attempts": 3,
+              "target": "locate"
+            }
+          },
+          "id": "locate",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.selected_booking"
+          ],
+          "tool": "meetingroom.booking.list",
+          "validator": "meeting.booking_located",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "locate"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "participant_not_found"
+            }
+          },
+          "id": "resolve_people",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.participant_user_*"
+          ],
+          "tool": "user.get_info",
+          "validator": "meeting.participants_resolved",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "foreach"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "resolve_people"
+          ],
+          "failure_edges": {"*": {"action": "block", "reason": "participant_query_failed"}},
+          "id": "read_existing_participants",
+          "phase": "read",
+          "success_evidence": ["meetingroom.participants"],
+          "tool": "meetingroom.booking.participant.list",
+          "validator": "meeting.participants_optional",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "read_existing_participants"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "participant_update_failed"
+            }
+          },
+          "id": "update",
+          "phase": "write",
+          "success_evidence": [
+            "meetingroom.participant_results"
+          ],
+          "tool": "meetingroom.booking.participant.add",
+          "tools": [
+            "meetingroom.booking.participant.add",
+            "meetingroom.booking.participant.remove"
+          ],
+          "validator": "meeting.participants_updated",
+          "operation": "write",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "repeat_until"
+        }
+      ],
+      "capabilities": [
+        "meeting.participant_add",
+        "meeting.participant_remove"
+      ]
+    },
+    "meetingroom.query": {
+      "domain": "meetingroom",
+      "intent": "query_booking",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "booking_query_failed"
+            }
+          },
+          "id": "query_booking",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.booking_query"
+          ],
+          "tool": "meetingroom.booking.list",
+          "validator": "meeting.booking_queried",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        }
+      ],
+      "capabilities": [
+        "meeting.query_booking"
+      ]
+    },
+    "meetingroom.rebook": {
+      "domain": "meetingroom",
+      "intent": "cancel_rebook_existing",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "existing_booking_not_found"
+            },
+            "existing_booking_not_found": {
+              "action": "retry",
+              "exhausted_reason": "existing_booking_not_found",
+              "max_attempts": 3,
+              "target": "locate"
+            }
+          },
+          "id": "locate",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.selected_booking"
+          ],
+          "tool": "meetingroom.booking.list",
+          "validator": "meeting.booking_located",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "select_room"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "booking_cancel_failed"
+            }
+          },
+          "id": "cancel",
+          "phase": "write",
+          "success_evidence": [
+            "meetingroom.cancel_done"
+          ],
+          "tool": "meetingroom.booking.cancel",
+          "validator": "meeting.booking_cancelled",
+          "operation": "write",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "locate"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "no_bookable_room"
+            },
+            "no_bookable_room": {
+              "action": "retry",
+              "max_attempts": 2,
+              "target": "query_rooms"
+            }
+          },
+          "id": "query_rooms",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.room_candidates"
+          ],
+          "tool": "meetingroom.room.list",
+          "validator": "meeting.rooms_queried",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "query_rooms"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "no_bookable_room"
+            }
+          },
+          "id": "select_room",
+          "phase": "compute",
+          "success_evidence": [
+            "meetingroom.pending_selected_room"
+          ],
+          "validator": "meeting.room_selected",
+          "operation": "compute",
+          "args_handler": "",
+          "decision_handler": "default_compute",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "cancel"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "booking_create_failed"
+            }
+          },
+          "id": "create",
+          "phase": "write",
+          "success_evidence": [
+            "meetingroom.create_done"
+          ],
+          "tool": "meetingroom.booking.create",
+          "validator": "meeting.booking_created",
+          "operation": "write",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "repeat_until"
+        }
+      ],
+      "capabilities": [
+        "meeting.cancel_rebook",
+        "meeting.rebook_larger"
+      ]
+    },
+    "meetingroom.schedule_book": {
+      "domain": "meetingroom",
+      "intent": "book_by_schedule_analysis",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {"*": {"action": "block", "reason": "workspace_query_failed"}},
+          "id": "workspace",
+          "phase": "read",
+          "success_evidence": ["meetingroom.workspace"],
+          "tool": "user.get_workspace",
+          "validator": "meeting.workspace_optional",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": ["workspace"],
+          "failure_edges": {"*": {"action": "block", "reason": "no_bookable_room"}},
+          "id": "query_rooms",
+          "phase": "read",
+          "success_evidence": ["meetingroom.room_candidates"],
+          "tool": "meetingroom.room.list",
+          "validator": "meeting.rooms_optional",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": ["query_rooms"],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "no_bookable_room"
+            }
+          },
+          "id": "query_schedule",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.schedules"
+          ],
+          "tool": "meetingroom.room.schedule",
+          "validator": "meeting.schedules_queried",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "foreach"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "query_schedule"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "no_bookable_room"
+            }
+          },
+          "id": "select_room",
+          "phase": "compute",
+          "success_evidence": [
+            "meetingroom.pending_selected_room"
+          ],
+          "validator": "meeting.room_selected",
+          "operation": "compute",
+          "args_handler": "",
+          "decision_handler": "default_compute",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "select_room"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "booking_create_failed"
+            }
+          },
+          "id": "create",
+          "phase": "write",
+          "success_evidence": [
+            "meetingroom.create_done"
+          ],
+          "tool": "meetingroom.booking.create",
+          "validator": "meeting.booking_created",
+          "operation": "write",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "repeat_until"
+        }
+      ],
+      "capabilities": [
+        "meeting.schedule_book"
+      ]
+    },
+    "meetingroom.schedule_query": {
+      "domain": "meetingroom",
+      "intent": "query_room_schedule",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "schedule_query_failed"
+            },
+            "query_schedule_tool_error": {
+              "action": "retry",
+              "exhausted_reason": "schedule_query_failed",
+              "max_attempts": 1,
+              "target": "query_schedule"
+            }
+          },
+          "id": "query_schedule",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.schedules"
+          ],
+          "tool": "meetingroom.room.schedule",
+          "validator": "meeting.schedules_queried",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "foreach"
+        }
+      ],
+      "capabilities": [
+        "meeting.query_room_schedule"
+      ]
+    },
+    "meetingroom.workspace_query": {
+      "domain": "meetingroom",
+      "intent": "query_workspace",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workspace_query_failed"
+            }
+          },
+          "id": "query_workspace",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.workspace"
+          ],
+          "tool": "user.get_workspace",
+          "validator": "meeting.workspace_queried",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        }
+      ],
+      "capabilities": [
+        "meeting.query_workspace"
+      ]
+    },
+    "workflow.expense.draft": {
+      "domain": "workflow",
+      "intent": "expense_material",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            },
+            "invalid_applicant": {
+              "action": "retry",
+              "exhausted_reason": "missing_required_info",
+              "max_attempts": 1,
+              "target": "applicant"
+            }
+          },
+          "id": "applicant",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.applicant"
+          ],
+          "tool": "user.get_info",
+          "validator": "workflow.applicant_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_not_found"
+            },
+            "workflow_not_found": {
+              "action": "retry",
+              "exhausted_reason": "workflow_not_found",
+              "max_attempts": 1,
+              "target": "catalog"
+            }
+          },
+          "id": "catalog",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.catalog"
+          ],
+          "tool": "workflow.catalog",
+          "validator": "workflow.catalog_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_schema_lookup_contract_missing"
+            },
+            "invalid_workflow_schema": {
+              "action": "retry",
+              "exhausted_reason": "workflow_schema_lookup_contract_missing",
+              "max_attempts": 1,
+              "target": "schema"
+            }
+          },
+          "id": "schema",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.schema"
+          ],
+          "tool": "workflow.schema",
+          "validator": "workflow.schema_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "applicant",
+            "catalog",
+            "schema"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_project"
+            },
+            "empty_project_result": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_project",
+              "max_attempts": 4,
+              "target": "project"
+            },
+            "invalid_project_evidence": {
+              "action": "block",
+              "reason": "ambiguous_project"
+            },
+            "project_search_error": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_project",
+              "max_attempts": 2,
+              "target": "project"
+            }
+          },
+          "id": "project",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.verified_project",
+            "workflow.project_search_history"
+          ],
+          "tool": "workflow.project_search",
+          "validator": "workflow.expense_project_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "foreach"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "project"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_material_subclass"
+            },
+            "empty_category_result": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_material_subclass",
+              "max_attempts": 1,
+              "target": "category"
+            },
+            "invalid_material_category": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_material_subclass",
+              "max_attempts": 1,
+              "target": "category"
+            }
+          },
+          "id": "category",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.category_options",
+            "workflow.selected_material_category"
+          ],
+          "tool": "workflow.browser_search",
+          "validator": "workflow.expense_category_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "project",
+            "category"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_material_subclass"
+            },
+            "empty_subclass_result": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_material_subclass",
+              "max_attempts": 2,
+              "target": "category"
+            },
+            "stale_subclass_candidates": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_material_subclass",
+              "max_attempts": 1,
+              "target": "subclass"
+            },
+            "subclass_search_error": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_material_subclass",
+              "max_attempts": 2,
+              "target": "category"
+            }
+          },
+          "id": "subclass",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.subclass_options",
+            "workflow.expense_bindings.subclass"
+          ],
+          "tool": "workflow.browser_search",
+          "validator": "workflow.expense_subclass_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "subclass"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            },
+            "ambiguous_material_subclass": {
+              "action": "block",
+              "reason": "ambiguous_material_subclass"
+            },
+            "insufficient_amount_breakdown": {
+              "action": "block",
+              "reason": "insufficient_amount_breakdown"
+            },
+            "workflow_preflight_failed": {
+              "action": "block",
+              "reason": "workflow_preflight_failed"
+            }
+          },
+          "id": "draft_ir",
+          "phase": "compute",
+          "success_evidence": [
+            "workflow.workflow_skill_draft_ir",
+            "ledger.preflight"
+          ],
+          "validator": "workflow.expense_draft_valid",
+          "operation": "compute",
+          "args_handler": "",
+          "decision_handler": "default_compute",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "draft_ir"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_save_failed"
+            }
+          },
+          "id": "save",
+          "phase": "write",
+          "success_evidence": [
+            "workflow.save_done"
+          ],
+          "tool": "workflow.save",
+          "validator": "workflow.save_verified",
+          "operation": "write",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "repeat_until"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "save"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_postcheck_failed"
+            },
+            "oa_lookup_error": {
+              "action": "retry",
+              "exhausted_reason": "workflow_postcheck_failed",
+              "max_attempts": 1,
+              "target": "verify"
+            }
+          },
+          "id": "verify",
+          "phase": "postcheck",
+          "success_evidence": [
+            "workflow.oa_checked"
+          ],
+          "tool": "oa.todo.list",
+          "validator": "workflow.oa_verified",
+          "operation": "postcheck",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        }
+      ],
+      "submit": false,
+      "capabilities": [
+        "workflow.expense_draft"
+      ]
+    },
+    "workflow.expense.submit": {
+      "extends": "workflow.expense.draft",
+      "replace_nodes": {
+        "verify": {
+          "tool": "oa.done.list"
+        }
+      },
+      "submit": true,
+      "capabilities": [
+        "workflow.expense_submit"
+      ],
+      "nodes": []
+    },
+    "workflow.leave.draft": {
+      "domain": "workflow",
+      "intent": "leave",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "applicant",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.applicant"
+          ],
+          "tool": "user.get_info",
+          "validator": "workflow.applicant_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_not_found"
+            }
+          },
+          "id": "catalog",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.catalog"
+          ],
+          "tool": "workflow.catalog",
+          "validator": "workflow.catalog_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_schema_lookup_contract_missing"
+            }
+          },
+          "id": "schema",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.schema"
+          ],
+          "tool": "workflow.schema",
+          "validator": "workflow.schema_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "applicant",
+            "catalog",
+            "schema"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "leave_form",
+          "phase": "compute",
+          "success_evidence": [
+            "user_text"
+          ],
+          "validator": "workflow.leave_form_valid",
+          "operation": "compute",
+          "args_handler": "",
+          "decision_handler": "default_compute",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "leave_form"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "leave_attachment_not_found"
+            },
+            "file_list_error": {
+              "action": "retry",
+              "exhausted_reason": "leave_attachment_not_found",
+              "max_attempts": 1,
+              "target": "attachment"
+            }
+          },
+          "id": "attachment",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.file_list"
+          ],
+          "tool": "file.list",
+          "validator": "workflow.leave_attachment_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "leave_form",
+            "attachment"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_approver"
+            },
+            "approver_search_error": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_approver",
+              "max_attempts": 2,
+              "target": "approver_search"
+            },
+            "empty_approver_result": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_approver",
+              "max_attempts": 3,
+              "target": "approver_search"
+            }
+          },
+          "id": "approver_search",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.approver_searches"
+          ],
+          "tool": "workflow.search_person",
+          "validator": "workflow.approver_search_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "approver_search"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_approver"
+            }
+          },
+          "id": "approver_resolved",
+          "phase": "compute",
+          "success_evidence": [
+            "workflow.search_person:selected"
+          ],
+          "validator": "workflow.approver_resolved",
+          "operation": "compute",
+          "args_handler": "",
+          "decision_handler": "default_compute",
+          "cardinality": "single"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "approver_resolved"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_preflight_failed"
+            }
+          },
+          "id": "draft_ir",
+          "phase": "compute",
+          "success_evidence": [
+            "workflow.workflow_skill_draft_ir",
+            "ledger.preflight"
+          ],
+          "validator": "workflow.leave_draft_valid",
+          "operation": "compute",
+          "args_handler": "",
+          "decision_handler": "default_compute",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "draft_ir"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_save_failed"
+            }
+          },
+          "id": "save",
+          "phase": "write",
+          "success_evidence": [
+            "workflow.save_done"
+          ],
+          "tool": "workflow.save",
+          "validator": "workflow.save_verified",
+          "operation": "write",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "repeat_until"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "save"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_postcheck_failed"
+            },
+            "oa_lookup_error": {
+              "action": "retry",
+              "max_attempts": 1,
+              "target": "verify"
+            }
+          },
+          "id": "verify",
+          "phase": "postcheck",
+          "success_evidence": [
+            "workflow.oa_checked"
+          ],
+          "tool": "oa.todo.list",
+          "validator": "workflow.oa_verified",
+          "operation": "postcheck",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        }
+      ],
+      "submit": false,
+      "capabilities": [
+        "workflow.leave_draft"
+      ]
+    },
+    "workflow.leave.replace_submit": {
+      "domain": "workflow",
+      "intent": "leave",
+      "nodes": [
+        {
+          "cost": 1,
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "applicant",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.applicant"
+          ],
+          "tool": "user.get_info",
+          "validator": "workflow.applicant_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "applicant"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "existing_workflow_not_found"
+            }
+          },
+          "id": "source_lookup",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.replacement_source_lookup"
+          ],
+          "tool": "oa.done.list",
+          "validator": "workflow.leave_source_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "source_lookup"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_delete_failed"
+            }
+          },
+          "id": "delete_source",
+          "phase": "write",
+          "success_evidence": [
+            "workflow.replacement_delete_done"
+          ],
+          "tool": "workflow.delete",
+          "validator": "workflow.leave_source_deleted",
+          "operation": "write",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "delete_source"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_not_found"
+            }
+          },
+          "id": "catalog",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.catalog"
+          ],
+          "tool": "workflow.catalog",
+          "validator": "workflow.catalog_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "delete_source"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_schema_lookup_contract_missing"
+            }
+          },
+          "id": "schema",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.schema"
+          ],
+          "tool": "workflow.schema",
+          "validator": "workflow.schema_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "catalog",
+            "schema"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "leave_form",
+          "phase": "compute",
+          "success_evidence": [
+            "user_text"
+          ],
+          "validator": "workflow.leave_form_valid",
+          "operation": "compute",
+          "args_handler": "",
+          "decision_handler": "default_compute",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "leave_form"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "leave_attachment_not_found"
+            },
+            "file_list_error": {
+              "action": "retry",
+              "exhausted_reason": "leave_attachment_not_found",
+              "max_attempts": 1,
+              "target": "attachment"
+            }
+          },
+          "id": "attachment",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.file_list"
+          ],
+          "tool": "file.list",
+          "validator": "workflow.leave_attachment_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "leave_form",
+            "attachment"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_approver"
+            },
+            "empty_approver_result": {
+              "action": "retry",
+              "max_attempts": 3,
+              "target": "approver_search"
+            }
+          },
+          "id": "approver_search",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.approver_searches"
+          ],
+          "tool": "workflow.search_person",
+          "validator": "workflow.approver_search_verified",
+          "operation": "read",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "approver_search"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_approver"
+            }
+          },
+          "id": "approver_resolved",
+          "phase": "compute",
+          "success_evidence": [
+            "workflow.search_person:selected"
+          ],
+          "validator": "workflow.approver_resolved",
+          "operation": "compute",
+          "args_handler": "",
+          "decision_handler": "default_compute",
+          "cardinality": "single"
+        },
+        {
+          "cost": 0,
+          "depends_on": [
+            "approver_resolved"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_preflight_failed"
+            }
+          },
+          "id": "draft_ir",
+          "phase": "compute",
+          "success_evidence": [
+            "workflow.workflow_skill_draft_ir",
+            "ledger.preflight"
+          ],
+          "validator": "workflow.leave_draft_valid",
+          "operation": "compute",
+          "args_handler": "",
+          "decision_handler": "default_compute",
+          "cardinality": "single"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "draft_ir"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_save_failed"
+            }
+          },
+          "id": "save",
+          "phase": "write",
+          "success_evidence": [
+            "workflow.save_done"
+          ],
+          "tool": "workflow.save",
+          "validator": "workflow.save_verified",
+          "operation": "write",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "repeat_until"
+        },
+        {
+          "cost": 1,
+          "depends_on": [
+            "save"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_postcheck_failed"
+            }
+          },
+          "id": "verify",
+          "phase": "postcheck",
+          "success_evidence": [
+            "workflow.oa_checked"
+          ],
+          "tool": "oa.done.list",
+          "validator": "workflow.oa_verified",
+          "operation": "postcheck",
+          "args_handler": "default_tool_args",
+          "decision_handler": "",
+          "cardinality": "single"
+        }
+      ],
+      "submit": true,
+      "capabilities": [
+        "workflow.leave_replace_submit"
+      ]
+    },
+    "workflow.leave.submit": {
+      "extends": "workflow.leave.draft",
+      "replace_nodes": {
+        "verify": {
+          "tool": "oa.done.list"
+        }
+      },
+      "submit": true,
+      "capabilities": [
+        "workflow.leave_submit"
+      ],
+      "nodes": []
+    }
+  },
+  "capability_map": {
+    "meeting.book": "meetingroom.book",
+    "meeting.book_multi_segments": "meetingroom.book",
+    "meeting.cancel": "meetingroom.cancel",
+    "meeting.cancel_rebook": "meetingroom.rebook",
+    "meeting.extend": "meetingroom.extend",
+    "meeting.participant_add": "meetingroom.participant_update",
+    "meeting.participant_list": "meetingroom.participant_list",
+    "meeting.participant_remove": "meetingroom.participant_update",
+    "meeting.query_booking": "meetingroom.query",
+    "meeting.query_room_schedule": "meetingroom.schedule_query",
+    "meeting.query_workspace": "meetingroom.workspace_query",
+    "meeting.rebook_larger": "meetingroom.rebook",
+    "meeting.schedule_book": "meetingroom.schedule_book",
+    "workflow.expense_draft": "workflow.expense.draft",
+    "workflow.expense_submit": "workflow.expense.submit",
+    "workflow.leave_draft": "workflow.leave.draft",
+    "workflow.leave_submit": "workflow.leave.submit",
+    "workflow.leave_replace_submit": "workflow.leave.replace_submit"
+  }
+}

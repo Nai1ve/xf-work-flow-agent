@@ -1,0 +1,12 @@
+{
+  "expense_material": {
+    "catalog_keyword": "费用类物资",
+    "oa_keyword": "费用",
+    "workflow_id": 34747
+  },
+  "leave": {
+    "catalog_keyword": "请假",
+    "oa_keyword": "请假",
+    "workflow_id": 72247
+  }
+}

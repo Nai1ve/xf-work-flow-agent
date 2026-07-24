@@ -5,13 +5,15 @@ import unittest
 from pathlib import Path
 
 from submission.my_agent import (
-    CaseCalendar,
+    BusinessSkillRegistry,
     MyAgent,
-    OutcomePolicyMemory,
+    ResultProjectionRegistry,
     RuntimeState,
-    WorkflowSkillRegistry,
-    WorkflowSkillRuntime,
+    StepAction,
+    TaskRuntime,
+    ToolRegistry,
 )
+from submission.utils.skill_runtime import SkillRun
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,87 +23,120 @@ def load_index(name: str) -> dict:
     return json.loads((ROOT / "submission" / "static_context" / name).read_text(encoding="utf-8"))
 
 
-class WorkflowSkillRegistryTest(unittest.TestCase):
+class BusinessSkillContractTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.registry = WorkflowSkillRegistry(load_index("workflow_skills.index.json"))
+        self.registry = BusinessSkillRegistry(load_index("workflow_skills.index.json"))
 
-    def test_submit_skill_replaces_only_postcheck_node(self) -> None:
-        skill_id, definition = self.registry.select("expense_material", True)
-        self.assertEqual(skill_id, "workflow.expense.submit")
-        by_id = {node["id"]: node for node in definition["nodes"]}
-        self.assertEqual(by_id["verify"]["tool"], "oa.done.list")
-        self.assertEqual(by_id["project"]["depends_on"], ["applicant", "catalog", "schema"])
-
-    def test_replace_leave_skill_has_delete_barrier(self) -> None:
-        skill_id, definition = self.registry.select("leave", True, replace=True)
-        self.assertEqual(skill_id, "workflow.leave.replace_submit")
-        by_id = {node["id"]: node for node in definition["nodes"]}
-        self.assertEqual(by_id["delete_source"]["depends_on"], ["source_lookup"])
-        self.assertIn("delete_source", by_id["catalog"]["depends_on"])
-
-    def test_runtime_exposes_only_dependency_ready_nodes(self) -> None:
-        _, definition = self.registry.select("leave", False)
-        runtime = WorkflowSkillRuntime("workflow.leave.draft", definition)
-        self.assertEqual(
-            {node["id"] for node in runtime.ready_nodes()},
-            {"applicant", "catalog", "schema"},
-        )
-        runtime.sync_completed({"applicant", "catalog", "schema", "leave_form"})
-        self.assertEqual([node["id"] for node in runtime.ready_nodes()], ["attachment"])
-        runtime.sync_completed({"attachment"})
-        self.assertEqual([node["id"] for node in runtime.ready_nodes()], ["approver_search"])
-        self.assertEqual(runtime.remaining_cost({"write", "postcheck"}), 2)
-
-    def test_all_skill_contracts_are_valid(self) -> None:
+    def test_eighteen_capabilities_map_to_fifteen_skills(self) -> None:
+        capabilities = load_index("capabilities.index.json")
+        self.assertEqual(len(capabilities["capabilities"]), 18)
         self.assertEqual(len(self.registry.skills), 15)
+        self.assertEqual(len(self.registry.capability_map), 18)
+        self.assertEqual(self.registry.validate_capability_coverage(capabilities), [])
+
+    def test_all_skill_contracts_and_tools_are_valid(self) -> None:
+        capabilities = load_index("capabilities.index.json")
+        tools = ToolRegistry(load_index("tools.index.json"))
         self.assertEqual(self.registry.validate_contracts(), [])
-        self.assertEqual(
-            self.registry.validate_capability_coverage(load_index("capabilities.index.json")),
-            [],
-        )
+        self.assertEqual(self.registry.validate_tool_coverage(capabilities, tools), [])
 
-    def test_schedule_query_does_not_select_booking_skill(self) -> None:
-        skill_id, definition = self.registry.select_meetingroom("query_room_schedule")
-        self.assertEqual(skill_id, "meetingroom.schedule_query")
-        self.assertEqual([node["id"] for node in definition["nodes"]], ["query_schedule"])
+    def test_every_skill_has_collect_input_and_writes_have_confirmation(self) -> None:
+        for skill_id in self.registry.skills:
+            definition = self.registry.definition(skill_id)
+            by_id = {node["id"]: node for node in definition["nodes"]}
+            self.assertIn("collect_input", by_id, skill_id)
+            writes = [node for node in definition["nodes"] if node["operation"] == "write"]
+            if writes:
+                self.assertIn("confirm_write", by_id, skill_id)
+                self.assertFalse(any(node["cardinality"] == "foreach" for node in writes), skill_id)
 
-    def test_rebook_skill_selects_replacement_before_cancel(self) -> None:
-        skill_id, definition = self.registry.select_meetingroom("cancel_rebook_existing")
-        self.assertEqual(skill_id, "meetingroom.rebook")
+    def test_rebook_selects_replacement_before_cancel(self) -> None:
+        _, definition = self.registry.select_capability("meeting.cancel_rebook")
         by_id = {node["id"]: node for node in definition["nodes"]}
         self.assertEqual(by_id["query_rooms"]["depends_on"], ["locate"])
         self.assertEqual(by_id["select_room"]["depends_on"], ["query_rooms"])
-        self.assertEqual(by_id["cancel"]["depends_on"], ["select_room"])
+        self.assertEqual(by_id["confirm_write"]["depends_on"], ["select_room"])
+        self.assertEqual(by_id["cancel"]["depends_on"], ["confirm_write"])
         self.assertEqual(by_id["create"]["depends_on"], ["cancel"])
-        runtime = WorkflowSkillRuntime(skill_id, definition)
-        self.assertEqual(runtime.remaining_cost({"write", "postcheck"}), 2)
 
-    def test_participant_update_accepts_add_and_remove_tools(self) -> None:
-        _, definition = self.registry.select_meetingroom("participant_remove")
-        update = next(node for node in definition["nodes"] if node["id"] == "update")
-        self.assertEqual(
-            update["tools"],
-            ["meetingroom.booking.participant.add", "meetingroom.booking.participant.remove"],
-        )
+    def test_extend_has_explicit_occupancy_evidence(self) -> None:
+        _, definition = self.registry.select_capability("meeting.extend")
+        by_id = {node["id"]: node for node in definition["nodes"]}
+        self.assertEqual(by_id["occupancy"]["tool"], "meetingroom.room.bookings")
+        self.assertEqual(by_id["occupancy"]["depends_on"], ["locate"])
+        self.assertEqual(by_id["confirm_write"]["depends_on"], ["occupancy"])
 
-    def test_validation_waits_for_dependencies(self) -> None:
+    def test_leave_replace_has_delete_barrier(self) -> None:
+        _, definition = self.registry.select_capability("workflow.leave_replace_submit")
+        by_id = {node["id"]: node for node in definition["nodes"]}
+        self.assertEqual(by_id["confirm_write"]["depends_on"], ["source_lookup"])
+        self.assertEqual(by_id["delete_source"]["depends_on"], ["confirm_write"])
+        self.assertIn("delete_source", by_id["catalog"]["depends_on"])
+
+
+class SkillRunTest(unittest.TestCase):
+    def test_ready_nodes_and_repeat_invocations_are_task_scoped(self) -> None:
         definition = {
             "nodes": [
-                {"id": "read", "depends_on": []},
-                {"id": "write", "depends_on": ["read"]},
+                {"id": "read", "phase": "read", "operation": "read", "depends_on": []},
+                {"id": "write", "phase": "write", "operation": "write", "depends_on": ["read"]},
             ]
         }
-        runtime = WorkflowSkillRuntime("test", definition)
-        result = runtime.apply_validation("write", {"status": "failed", "reason": "bad", "fingerprint": "bad-1"})
-        self.assertEqual(result["validation"], "failed_waiting_dependencies")
-        self.assertEqual(runtime.statuses["write"], "pending")
-        self.assertFalse(runtime.blocked_reason)
+        run = SkillRun("test", definition, task_id="t1", capability="meeting.book")
+        self.assertEqual([node["id"] for node in run.ready_nodes()], ["read"])
+        run.mark_completed("read")
+        self.assertEqual([node["id"] for node in run.ready_nodes()], ["write"])
+        run.mark_invocation("write", "segment-1", "completed")
+        run.mark_invocation("write", "segment-2", "completed")
+        self.assertEqual(run.invocation_status("write", "segment-2"), "completed")
+
+    def test_repeat_until_returns_to_pending_after_each_finished_invocation(self) -> None:
+        definition = {
+            "nodes": [
+                {
+                    "id": "write",
+                    "phase": "write",
+                    "operation": "write",
+                    "depends_on": [],
+                    "cardinality": "repeat_until",
+                }
+            ]
+        }
+        run = SkillRun("test", definition)
+        for index in range(3):
+            run.mark_running("write")
+            run.mark_invocation("write", f"item-{index}", "completed")
+            if index < 2:
+                self.assertEqual(run.apply_validation("write", {"status": "pending"})["status"], "repeat")
+                self.assertTrue(run.is_ready("write"))
+            else:
+                self.assertEqual(run.apply_validation("write", {"status": "passed"})["status"], "completed")
+        self.assertEqual(run.status, "completed")
+
+    def test_single_node_does_not_repeat_while_validation_is_pending(self) -> None:
+        definition = {
+            "nodes": [
+                {
+                    "id": "write",
+                    "phase": "write",
+                    "operation": "write",
+                    "depends_on": [],
+                    "cardinality": "single",
+                }
+            ]
+        }
+        run = SkillRun("test", definition)
+        run.mark_running("write")
+        run.mark_invocation("write", "same", "completed")
+        self.assertEqual(run.apply_validation("write", {"status": "pending"})["status"], "pending")
+        self.assertEqual(run.statuses["write"], "running")
 
     def test_failure_retry_is_deduplicated_and_exhausts(self) -> None:
         definition = {
             "nodes": [
                 {
                     "id": "query",
+                    "phase": "read",
                     "depends_on": [],
                     "failure_edges": {
                         "empty": {
@@ -111,252 +146,216 @@ class WorkflowSkillRegistryTest(unittest.TestCase):
                             "exhausted_reason": "not_found",
                         }
                     },
-                },
-                {"id": "write", "depends_on": ["query"], "failure_edges": {"*": {"action": "block"}}},
+                }
             ]
         }
-        runtime = WorkflowSkillRuntime("test", definition)
-        runtime.mark_running("query")
-        self.assertEqual(runtime.resolve_failure("query", "empty", fingerprint="same")["status"], "retry")
-        self.assertEqual(runtime.resolve_failure("query", "empty", fingerprint="same")["status"], "duplicate")
-        self.assertEqual(runtime.retry_counts["query"], 1)
-        runtime.mark_running("query")
-        result = runtime.resolve_failure("query", "empty", fingerprint="different")
+        run = SkillRun("test", definition)
+        self.assertEqual(run.resolve_failure("query", "empty", fingerprint="same")["status"], "retry")
+        self.assertEqual(run.resolve_failure("query", "empty", fingerprint="same")["status"], "duplicate")
+        result = run.resolve_failure("query", "empty", fingerprint="different")
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["reason"], "not_found")
 
-    def test_subclass_failure_reopens_category_and_downstream_nodes(self) -> None:
-        _, definition = self.registry.select("expense_material", False)
-        runtime = WorkflowSkillRuntime("workflow.expense.draft", definition)
-        for node_id in ["applicant", "catalog", "schema", "project", "category", "subclass", "draft_ir"]:
-            runtime.statuses[node_id] = "completed"
-        result = runtime.resolve_failure("subclass", "empty_subclass_result", fingerprint="empty-1")
-        self.assertEqual(result["status"], "retry")
-        self.assertEqual(result["target"], "category")
-        self.assertEqual(runtime.statuses["category"], "pending")
-        self.assertEqual(runtime.statuses["subclass"], "pending")
-        self.assertEqual(runtime.statuses["draft_ir"], "pending")
 
-
-class OutcomePolicyMemoryTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.memory = OutcomePolicyMemory(load_index("outcome_policies.index.json"))
-
-    def test_missing_approver_lookup_is_next_action_not_terminal(self) -> None:
-        decision = self.memory.match(
-            "workflow.leave",
-            {
-                "approver_hint_present": True,
-                "approver_search_completed": False,
-                "approver_candidate_count": 0,
-            },
-        )
-        self.assertEqual(decision["decision"], "next_action")
-        self.assertEqual(decision["action"], "workflow.search_person")
-
-    def test_explicit_multi_amount_reason_has_priority(self) -> None:
-        decision = self.memory.match(
-            "workflow.expense_material",
-            {
-                "subclass_query_completed": True,
-                "specific_material_evidence": False,
-                "save_completed": False,
-                "explicit_multi_item_total_only": True,
-            },
-        )
-        self.assertEqual(decision["reason"], "insufficient_amount_breakdown")
-
-    def test_no_bookable_room_is_canonical(self) -> None:
-        decision = self.memory.match(
-            "meetingroom",
-            {"room_query_completed": True, "bookable_room_count": 0, "booking_completed": False},
-        )
-        self.assertEqual(decision["reason"], "no_bookable_room")
-
-
-class WorkflowSkillAgentTest(unittest.TestCase):
+class SkillSchedulerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.agent = MyAgent(type("Env", (), {})())
 
-    def test_approver_planning_does_not_consume_attempt(self) -> None:
-        state = RuntimeState({"step_budget": 10}, set(), 10)
-        state.workflow.needed = True
-        state.workflow.intent = "leave"
-        state.workflow.slots = {"leave": {"approver_keyword": "赵丽"}}
-        plan = {"approver_keyword": "赵丽", "approver_title": "", "approver_employee_no": ""}
-        first = self.agent._next_approver_search_args(state, plan)
-        second = self.agent._next_approver_search_args(state, plan)
-        self.assertEqual(first, second)
-        self.assertEqual(state.workflow.evidence["approver_search_tried"], [])
+    def _state_with_tasks(self, tasks: list[dict]) -> RuntimeState:
+        state = RuntimeState({"step_budget": 12, "mode": "single_turn"}, set(), 12)
+        state.task_graph = {"tasks": tasks}
+        self.agent._initialize_task_runtimes(state)
+        self.agent.skill_scheduler.initialize(state, {})
+        return state
 
-    def test_replace_request_selects_target_leave_type_and_skill(self) -> None:
-        query = "我昨天请了病假，想把今天下午改成事假，审批人王芳，帮我提交。"
-        workflow = self.agent._heuristic_workflow(query, {})
-        state = RuntimeState({"user_query": query, "step_budget": 10}, set(), 10)
-        state.workflow.needed = True
-        state.workflow.intent = "leave"
-        state.workflow.slots = workflow
-        self.agent._normalize_workflow_slots(state)
-        self.agent._initialize_workflow_skill(state)
-        self.assertEqual(self.agent._leave_slots(state)["leave_type_label"], "事假")
-        self.assertEqual(state.workflow_skill.skill_id, "workflow.leave.replace_submit")
+    def _ready_only(self, state: RuntimeState, node_id: str) -> TaskRuntime:
+        runtime = state.task_runtimes[0]
+        for node in runtime.skill_run.nodes:
+            if node["id"] != node_id:
+                runtime.skill_run.mark_completed(node["id"], source="test")
+        self.agent._activate_task_runtime_view(state, runtime)
+        return runtime
 
-    def test_expense_phrase_with_intervening_business_name_is_submit(self) -> None:
-        query = "另外我需要提品牌广告服务费用，项目是城市服务大模型发布活动项目。"
-        self.assertTrue(self.agent._submit_intent(query))
-
-    def test_project_review_meeting_title_is_canonical(self) -> None:
-        self.assertEqual(self.agent._normalize_meeting_title("项目复盘会"), "项目复盘")
-
-    def test_workspace_room_search_uses_floor_evidence_first(self) -> None:
-        state = RuntimeState({"step_budget": 8}, set(), 8)
-        state.meetingroom.needed = True
-        state.meetingroom.intent = "book_single"
-        state.meetingroom.slots = {"needs_workspace": True, "day": "2026-04-21", "capacity": 10}
-        state.meetingroom.evidence["workspace"] = {"office_address": "0552_A1_4F"}
-        candidates = self.agent._room_search_candidates(state)
-        self.assertEqual(candidates[0], {"office_address": "0552_A1_4F"})
-
-    def test_workspace_room_search_expands_floor_building_then_campus(self) -> None:
-        state = RuntimeState({"step_budget": 8}, set(), 8)
-        state.meetingroom.needed = True
-        state.meetingroom.intent = "book_single"
-        state.meetingroom.slots = {
-            "needs_workspace": True,
-            "day": "2026-04-21",
-            "capacity": 10,
-            "location_constraint": "preference",
-            "search_scopes": ["exact_floor", "same_building", "same_campus"],
-        }
-        state.meetingroom.evidence["workspace"] = {"office_address": "0552_A2_1F"}
-        self.assertEqual(
-            self.agent._room_search_candidates(state)[:3],
+    def test_same_domain_reads_are_runnable_before_write_barrier(self) -> None:
+        state = self._state_with_tasks(
             [
-                {"office_address": "0552_A2_1F"},
-                {"office_address": "0552_A2"},
-                {"office_address": "0552"},
-            ],
+                {"task_id": "t1", "domain": "meetingroom", "capability": "meeting.extend", "intent": "extend_existing", "slots": {}, "write_after": []},
+                {"task_id": "t2", "domain": "meetingroom", "capability": "meeting.participant_add", "intent": "participant_add", "slots": {}, "write_after": ["t1"]},
+            ]
         )
+        self.assertTrue(self.agent._task_dependencies_completed(state, state.task_runtimes[1], writes_only=False))
+        self.assertFalse(self.agent._task_dependencies_completed(state, state.task_runtimes[1], writes_only=True))
 
-    def test_hard_floor_room_search_does_not_broaden(self) -> None:
-        state = RuntimeState({"step_budget": 8}, set(), 8)
-        state.meetingroom.intent = "book_single"
-        state.meetingroom.slots = {
-            "office_candidates": ["A1"],
-            "office_address_candidates": ["0552_A1_4F"],
-            "location_constraint": "hard",
-            "search_scopes": ["exact_floor"],
-        }
-        self.assertEqual(
-            self.agent._room_search_candidates(state),
-            [{"office_address": "0552_A1_4F"}],
+    def test_unknown_capability_is_blocked_without_fallback(self) -> None:
+        state = self._state_with_tasks(
+            [{"task_id": "t1", "domain": "unknown", "capability": "unknown.write", "intent": "unknown", "slots": {}}]
         )
+        runtime = state.task_runtimes[0]
+        self.assertEqual(runtime.status, "blocked")
+        self.assertEqual(runtime.blocked_reason, "unsupported_capability")
 
-    def test_equivalent_building_queries_are_deduplicated(self) -> None:
-        query = "优先小镇A1四楼，不行就A2，订明天下午2点到3点会议室"
-        state = RuntimeState(
-            {"user_query": query, "now": "2026-04-20T10:00:00+08:00", "step_budget": 8},
-            set(),
-            8,
-        )
-        state.meetingroom.intent = "book_single"
-        state.meetingroom.slots = self.agent._heuristic_meetingroom(query, state.obs)
-        self.agent._normalize_meeting_slots(state)
-        candidates = self.agent._room_search_candidates(state)
-        self.assertEqual(
-            candidates[:3],
+    def test_handler_registry_covers_every_declared_node(self) -> None:
+        missing = []
+        for skill_id in self.agent.business_skill_registry.skills:
+            for node in self.agent.business_skill_registry.definition(skill_id)["nodes"]:
+                operation = node["operation"]
+                if operation in {"read", "write", "postcheck"} and not self.agent.node_args_handlers.get(node["args_handler"]):
+                    missing.append((skill_id, node["id"], "args"))
+                if operation in {"compute", "reply"} and not self.agent.node_decision_handlers.get(node["decision_handler"]):
+                    missing.append((skill_id, node["id"], "decision"))
+                if not self.agent.node_validators.get(node["validator"]):
+                    missing.append((skill_id, node["id"], "validator"))
+        self.assertEqual(missing, [])
+
+    def test_multi_segment_booking_emits_three_distinct_creates(self) -> None:
+        state = self._state_with_tasks(
             [
-                {"office_address": "0552_A1_4F"},
-                {"office_address": "0552_A2"},
-                {"office_address": "0552"},
-            ],
+                {
+                    "id": "t1",
+                    "domain": "meetingroom",
+                    "capability": "meeting.book_multi_segments",
+                    "intent": "book",
+                    "slots": {
+                        "day": "2026-07-25",
+                        "day_text": "2026-07-25",
+                        "capacity": 2,
+                        "multi_segments": [
+                            {"day": "2026-07-25", "start": "09:00", "end": "09:30", "title": "A"},
+                            {"day": "2026-07-25", "start": "10:00", "end": "10:30", "title": "B"},
+                            {"day": "2026-07-25", "start": "11:00", "end": "11:30", "title": "C"},
+                        ],
+                    },
+                }
+            ]
         )
-        self.assertNotIn({"office_id": "A1"}, candidates)
-        self.assertNotIn({"office_id": "A2"}, candidates)
-
-    def test_rebook_read_plan_reserves_both_writes(self) -> None:
-        state = RuntimeState({"step_budget": 5}, set(), 5)
-        state.meetingroom.needed = True
-        state.meetingroom.intent = "cancel_rebook_existing"
-        self.agent._initialize_meetingroom_skill(state)
-        self.assertEqual(self.agent._read_plan_step_reserve(state), 2)
-        self.assertEqual(state.step_budget - state.steps_used - self.agent._read_plan_step_reserve(state), 3)
-
-    def test_case_calendar_has_no_machine_date_fallback(self) -> None:
-        calendar = CaseCalendar(None)
-        self.assertEqual(calendar.resolve_day("明天"), "")
-        self.assertEqual(calendar.month_day(20), "")
-        self.assertEqual(calendar.next_meeting_business_day(), "")
-        self.assertIsNone(calendar.week_start())
-
-    def test_case_calendar_resolves_relative_dates_from_observation(self) -> None:
-        calendar = CaseCalendar("2026-04-18T10:00:00+08:00")
-        self.assertEqual(calendar.resolve_day("明天"), "2026-04-19")
-        self.assertEqual(calendar.resolve_day("明天", prefer_workday=True), "2026-04-20")
-        self.assertEqual(calendar.resolve_day("下周二"), "2026-04-21")
-
-    def test_explicit_order_id_satisfies_booking_location_validator(self) -> None:
-        state = RuntimeState({"user_query": "查看订单 BK-100 的参会人", "step_budget": 8}, set(), 8)
-        state.meetingroom.needed = True
-        state.meetingroom.intent = "participant_list"
-        state.meetingroom.slots = {"order_id": "BK-100"}
-        self.agent._initialize_meetingroom_skill(state)
-        self.assertEqual(state.meetingroom_skill.statuses["locate"], "completed")
-        self.assertEqual(state.meetingroom_skill.next_ready_id(), "read_participants")
-
-    def test_schedule_query_finishes_without_booking_write(self) -> None:
-        state = RuntimeState({"user_query": "查询A1-3F-349本周日程", "step_budget": 3}, set(), 3)
-        state.meetingroom.needed = True
-        state.meetingroom.intent = "query_room_schedule"
-        state.meetingroom.slots = {"room_ids": ["A1-3F-349"]}
-        first = self.agent._next_schedule_book_action(state)
-        self.assertEqual(first.tool, "meetingroom.room.schedule")
-        state.meetingroom.evidence["schedules"] = {
-            "A1-3F-349": {"room_id": "A1-3F-349", "busy_slots": []}
+        runtime = self._ready_only(state, "create")
+        state.meetingroom.evidence["room_candidates"] = {
+            "day": "2026-07-25",
+            "rooms": [{"room_id": "R-1", "officeId": "O-1", "capacity": 8, "bookable": True, "busy_slots": []}],
         }
-        second = self.agent._next_schedule_book_action(state)
-        self.assertIsNone(second)
-        self.assertEqual(state.meetingroom.status, "done")
-        self.assertEqual(state.meetingroom.result["status"], "queried")
+        calls = []
+        for index in range(3):
+            action = self.agent.skill_scheduler.next_action(state, {})
+            self.assertIsNotNone(action)
+            self.assertEqual(action.tool, "meetingroom.booking.create")
+            calls.append(dict(action.args))
+            self.agent._apply_tool_result(
+                state,
+                action.tool,
+                action.args,
+                {"success": True, "order_id": f"BK-{index + 1}"},
+            )
+        self.assertEqual([(item["start"], item["end"]) for item in calls], [("09:00", "09:30"), ("10:00", "10:30"), ("11:00", "11:30")])
+        self.assertEqual(runtime.skill_run.statuses["create"], "completed")
+        self.assertEqual(len(runtime.skill_run.invocations["create"]), 3)
 
-    def test_room_schedule_query_and_comparison_are_distinct_intents(self) -> None:
-        query = self.agent._heuristic_meetingroom(
-            "查询A1-3F-349会议室5月11日到5月15日的预订情况",
-            {},
-        )
-        compare = self.agent._heuristic_meetingroom(
-            "看看A3-3F-311和A3-3F-312哪个更空闲，选空闲的订周四下午2点到4点",
-            {},
-        )
-        self.assertEqual(query["intent"], "query_room_schedule")
-        self.assertEqual(compare["intent"], "book_by_schedule_analysis")
+    def test_participant_updates_repeat_for_add_and_remove(self) -> None:
+        for capability, intent, tool in (
+            ("meeting.participant_add", "participant_add", "meetingroom.booking.participant.add"),
+            ("meeting.participant_remove", "participant_remove", "meetingroom.booking.participant.remove"),
+        ):
+            with self.subTest(capability=capability):
+                state = self._state_with_tasks(
+                    [
+                        {
+                            "id": "t1",
+                            "domain": "meetingroom",
+                            "capability": capability,
+                            "intent": intent,
+                            "slots": {
+                                "order_id": "BK-1",
+                                "participants": [
+                                    {"user_id": "u1", "name": "A"},
+                                    {"user_id": "u2", "name": "B"},
+                                    {"user_id": "u3", "name": "C"},
+                                ],
+                            },
+                        }
+                    ]
+                )
+                runtime = self._ready_only(state, "update")
+                user_ids = []
+                for _ in range(3):
+                    action = self.agent.skill_scheduler.next_action(state, {})
+                    self.assertIsNotNone(action)
+                    self.assertEqual(action.tool, tool)
+                    user_ids.append(action.args["user_id"])
+                    self.agent._apply_tool_result(
+                        state,
+                        action.tool,
+                        action.args,
+                        {"success": True, "order_id": "BK-1", "user_id": action.args["user_id"]},
+                    )
+                self.assertEqual(user_ids, ["u1", "u2", "u3"])
+                self.assertEqual(runtime.skill_run.statuses["update"], "completed")
+                self.assertEqual(len(runtime.skill_run.invocations["update"]), 3)
 
-    def test_schedule_range_preserves_explicit_date_interval(self) -> None:
-        state = RuntimeState(
-            {"user_query": "查询会议室5月11日到5月15日的日程", "now": "2026-05-11T09:00:00+08:00", "step_budget": 3},
-            set(),
-            3,
+    def test_recurring_leave_save_waits_for_all_plans(self) -> None:
+        state = self._state_with_tasks(
+            [
+                {
+                    "id": "t1",
+                    "domain": "workflow",
+                    "capability": "workflow.leave_submit",
+                    "intent": "leave",
+                    "slots": {"submit": True},
+                }
+            ]
         )
-        state.meetingroom.slots = {"day_text": "5月11日到5月15日"}
-        self.assertEqual(self.agent._schedule_range(state), ("2026-05-11", "2026-05-15"))
+        runtime = self._ready_only(state, "save")
+        state.workflow.evidence["leave_plans"] = [
+            {"day": "2026-07-25"},
+            {"day": "2026-07-26"},
+            {"day": "2026-07-27"},
+        ]
+        workflow_id = self.agent.workflow_registry.workflow_id("leave")
 
-    def test_unsuccessful_write_result_uses_failure_edge(self) -> None:
-        state = RuntimeState({"step_budget": 3}, set(), 3)
-        state.meetingroom.needed = True
-        state.meetingroom.intent = "book_single"
-        _, definition = self.agent.workflow_skill_registry.select_meetingroom("book_single")
-        state.meetingroom_skill = WorkflowSkillRuntime("meetingroom.book", definition)
-        state.meetingroom_skill.statuses["query_rooms"] = "completed"
-        state.meetingroom_skill.statuses["select_room"] = "completed"
-        state.meetingroom_skill.mark_running("create")
-        self.agent._record_skill_tool_outcome(
-            state,
-            "meetingroom.booking.create",
-            {"office_id": "ROOM-1"},
-            {"success": False},
-        )
-        self.assertEqual(state.meetingroom_skill.statuses["create"], "blocked")
-        self.assertEqual(state.meetingroom_skill.blocked_reason, "booking_create_failed")
+        def planner(current: RuntimeState) -> StepAction:
+            index = len(current.workflow.evidence.get("saved_leave_requests") or [])
+            return StepAction(
+                "tool",
+                "workflow.save",
+                {
+                    "workflow_id": workflow_id,
+                    "submit": True,
+                    "data": {
+                        "start_time": f"2026-07-{25 + index} 09:00",
+                        "end_time": f"2026-07-{25 + index} 10:00",
+                        "leave_type": "annual",
+                        "reason": "personal",
+                        "duration": 1,
+                    },
+                    "approvers": ["u1"],
+                },
+            )
+
+        self.agent.skill_capability_planners["workflow.leave_submit"] = planner
+        starts = []
+        for index in range(3):
+            action = self.agent.skill_scheduler.next_action(state, {})
+            self.assertIsNotNone(action)
+            self.assertEqual(action.tool, "workflow.save")
+            args = self.agent.tool_adapter.adapt(action.tool, self.agent._clean_args(action.args))
+            starts.append(args["data"]["start_time"])
+            self.agent._apply_tool_result(
+                state,
+                action.tool,
+                args,
+                {"draft_saved": True, "request_id": f"WF-{index + 1}"},
+            )
+        self.assertEqual(starts, ["2026-07-25 09:00", "2026-07-26 09:00", "2026-07-27 09:00"])
+        self.assertEqual(runtime.skill_run.statuses["save"], "completed")
+        self.assertEqual(len(runtime.skill_run.invocations["save"]), 3)
+
+    def test_partial_success_projection_keeps_successful_task(self) -> None:
+        state = RuntimeState({"step_budget": 8}, set(), 8)
+        state.task_results = [
+            {"task_id": "t1", "domain": "meetingroom", "capability": "meeting.extend", "status": "completed", "result": {"status": "extended", "order_id": "BK-1"}},
+            {"task_id": "t2", "domain": "workflow", "capability": "workflow.expense_submit", "status": "blocked", "result": {"status": "blocked", "reason": "ambiguous_project"}},
+        ]
+        answer = ResultProjectionRegistry().project(state)
+        self.assertEqual(answer["booking_result"]["status"], "extended")
+        self.assertEqual(answer["workflow_result"]["reason"], "ambiguous_project")
 
 
 if __name__ == "__main__":

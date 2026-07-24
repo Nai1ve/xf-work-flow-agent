@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SPLIT = ROOT / "contest" / "train"
 DEFAULT_VAL_SPLIT = ROOT / "contest" / "val"
 DEFAULT_OUTPUT = ROOT / "submission" / "static_context"
-POLICY_TEMPLATE_DIR = ROOT / "submission" / "static_context"
+STATIC_SOURCE_DIR = ROOT / "scripts" / "static_context_sources"
 
 WRITE_TOOLS = {
     "meetingroom.booking.create",
@@ -56,245 +56,6 @@ ADAPTER_NOTES = {
     "workflow.browser_search": [
         "requires workflow_id and field_id; browser values must come from returned options",
     ],
-}
-
-PROMPT_CARDS = {
-    "routing.md": """# Routing Context
-
-Use this context only to map a user request to declared business capabilities and slot hints.
-
-- Domains: meetingroom, workflow, user, oa, file.
-- Meetingroom capabilities: book, query booking, query schedule, cancel, extend, rebook, cancel then rebook, participant add/remove/list.
-- Workflow capabilities: leave draft/submit, expense material draft/submit.
-- User-provided ids, codes, room names, project names, people, dates, amounts, and materials are only hints until verified by tools.
-- Do not produce tool calls or final answers in routing output.
-""",
-    "tool_policy.md": """# Tool Policy
-
-- Never invent ids, codes, option values, user ids, workflow ids, room ids, order ids, project codes, or wbs codes.
-- Read tools collect evidence. Write tools require preflight against tool args, schema rules, and evidence sources.
-- If required evidence is absent or candidates remain ambiguous, return blocked/need_more_info instead of guessing.
-""",
-    "workflow_form_policy.md": """# Workflow Form Policy
-
-- Build workflow drafts from the active workflow schema and verified evidence only.
-- Applicant values come from user.get_info.
-- Approver values come from workflow.search_person.
-- Project name/code/wbs values come from workflow.project_search.
-- Browser/select values come from workflow.browser_search or schema option sets.
-- Detail rows must satisfy required fields and money consistency: quantity * unit_price = budget_amount, and total_amount = sum(detail budget_amount).
-- Explicit submit intent is required for submitted workflows; otherwise treat requests as draft.
-""",
-    "meetingroom_policy.md": """# Meetingroom Policy
-
-- Static room data helps normalize location and room references, but availability and conflicts must come from meetingroom tools.
-- room_id/order_id used in write operations must come from current tool evidence or explicit user text verified by tools.
-- booking.create requires a selected room candidate, day, start, end, and title.
-- Existing booking operations must first identify the target booking with booking.list.
-""",
-    "preflight_policy.md": """# Preflight Policy
-
-- Validate tool name and required arguments before every call.
-- Validate write arguments against evidence sources.
-- Validate workflow required fields, option values, person/project sources, detail rows, and money totals.
-- Validate meetingroom write actions against room candidates, booking targets, bookable flag, and conflict evidence.
-""",
-}
-
-
-CAPABILITIES = {
-    "meeting.book": {
-        "domain": "meetingroom",
-        "intent": "book_single",
-        "risk": "write",
-        "required_slots": ["day_text", "start", "end"],
-        "read_tools": ["user.get_workspace", "meetingroom.room.list", "meetingroom.room.schedule"],
-        "write_tools": ["meetingroom.booking.create"],
-        "evidence_required": ["room_candidate"],
-    },
-    "meeting.query_booking": {
-        "domain": "meetingroom",
-        "intent": "query_booking",
-        "risk": "read",
-        "required_slots": [],
-        "read_tools": ["meetingroom.booking.list"],
-        "write_tools": [],
-        "evidence_required": [],
-    },
-    "meeting.query_workspace": {
-        "domain": "meetingroom",
-        "intent": "query_workspace",
-        "risk": "read",
-        "required_slots": [],
-        "read_tools": ["user.get_workspace"],
-        "write_tools": [],
-        "evidence_required": [],
-    },
-    "meeting.query_room_schedule": {
-        "domain": "meetingroom",
-        "intent": "query_room_schedule",
-        "risk": "read",
-        "required_slots": ["room_ids"],
-        "read_tools": ["meetingroom.room.schedule"],
-        "write_tools": [],
-        "evidence_required": [],
-    },
-    "meeting.schedule_book": {
-        "domain": "meetingroom",
-        "intent": "book_by_schedule_analysis",
-        "risk": "write",
-        "required_slots": ["day_text"],
-        "read_tools": ["meetingroom.room.list", "meetingroom.room.schedule"],
-        "write_tools": ["meetingroom.booking.create"],
-        "evidence_required": ["room_candidate", "schedule"],
-    },
-    "meeting.book_multi_segments": {
-        "domain": "meetingroom",
-        "intent": "book_multi_segments_same_room",
-        "risk": "write",
-        "required_slots": ["segments"],
-        "read_tools": ["meetingroom.room.list", "meetingroom.room.schedule"],
-        "write_tools": ["meetingroom.booking.create"],
-        "evidence_required": ["room_candidate"],
-    },
-    "meeting.cancel": {
-        "domain": "meetingroom",
-        "intent": "cancel_existing",
-        "risk": "high_risk_write",
-        "required_slots": ["target_booking"],
-        "read_tools": ["meetingroom.booking.list"],
-        "write_tools": ["meetingroom.booking.cancel"],
-        "evidence_required": ["selected_booking"],
-    },
-    "meeting.extend": {
-        "domain": "meetingroom",
-        "intent": "extend_existing",
-        "risk": "high_risk_write",
-        "required_slots": ["target_booking", "duration_minutes"],
-        "read_tools": ["meetingroom.booking.list"],
-        "write_tools": ["meetingroom.booking.extend"],
-        "evidence_required": ["selected_booking"],
-    },
-    "meeting.rebook_larger": {
-        "domain": "meetingroom",
-        "intent": "rebook_larger_existing",
-        "risk": "high_risk_write",
-        "required_slots": ["target_booking"],
-        "read_tools": ["meetingroom.booking.list", "meetingroom.room.list"],
-        "write_tools": ["meetingroom.booking.cancel", "meetingroom.booking.create"],
-        "evidence_required": ["selected_booking", "room_candidate"],
-    },
-    "meeting.cancel_rebook": {
-        "domain": "meetingroom",
-        "intent": "cancel_rebook_existing",
-        "risk": "high_risk_write",
-        "required_slots": ["target_booking"],
-        "read_tools": ["meetingroom.booking.list", "meetingroom.room.list"],
-        "write_tools": ["meetingroom.booking.cancel", "meetingroom.booking.create"],
-        "evidence_required": ["selected_booking", "room_candidate"],
-    },
-    "meeting.participant_add": {
-        "domain": "meetingroom",
-        "intent": "participant_add",
-        "risk": "write",
-        "required_slots": ["target_booking", "participants"],
-        "read_tools": ["meetingroom.booking.list", "user.get_info"],
-        "write_tools": ["meetingroom.booking.participant.add"],
-        "evidence_required": ["selected_booking", "verified_user"],
-    },
-    "meeting.participant_remove": {
-        "domain": "meetingroom",
-        "intent": "participant_remove",
-        "risk": "write",
-        "required_slots": ["target_booking", "participants"],
-        "read_tools": ["meetingroom.booking.list", "user.get_info"],
-        "write_tools": ["meetingroom.booking.participant.remove"],
-        "evidence_required": ["selected_booking", "verified_user"],
-    },
-    "meeting.participant_list": {
-        "domain": "meetingroom",
-        "intent": "participant_list",
-        "risk": "read",
-        "required_slots": ["target_booking"],
-        "read_tools": ["meetingroom.booking.list", "meetingroom.booking.participant.list"],
-        "write_tools": [],
-        "evidence_required": ["selected_booking"],
-    },
-    "workflow.leave_draft": {
-        "domain": "workflow",
-        "intent": "leave",
-        "risk": "write",
-        "required_slots": ["day_text", "start", "end", "leave_type_label", "approver_hint"],
-        "read_tools": ["user.get_info", "workflow.catalog", "workflow.schema", "file.list", "workflow.search_person"],
-        "write_tools": ["workflow.save"],
-        "evidence_required": ["applicant", "workflow_schema", "approver_candidate"],
-    },
-    "workflow.leave_submit": {
-        "domain": "workflow",
-        "intent": "leave",
-        "risk": "high_risk_write",
-        "required_slots": ["explicit_submit", "day_text", "start", "end", "leave_type_label", "approver_hint"],
-        "read_tools": ["user.get_info", "workflow.catalog", "workflow.schema", "file.list", "workflow.search_person"],
-        "write_tools": ["workflow.save"],
-        "evidence_required": ["applicant", "workflow_schema", "approver_candidate"],
-        "post_check": "oa.done.list",
-    },
-    "workflow.expense_draft": {
-        "domain": "workflow",
-        "intent": "expense_material",
-        "risk": "write",
-        "required_slots": ["project_hint", "material_hint"],
-        "read_tools": ["user.get_info", "workflow.catalog", "workflow.schema", "workflow.project_search", "workflow.browser_search"],
-        "write_tools": ["workflow.save"],
-        "evidence_required": ["applicant", "workflow_schema", "verified_project", "category_option", "subclass_option"],
-    },
-    "workflow.expense_submit": {
-        "domain": "workflow",
-        "intent": "expense_material",
-        "risk": "high_risk_write",
-        "required_slots": ["explicit_submit", "project_hint", "material_hint"],
-        "read_tools": ["user.get_info", "workflow.catalog", "workflow.schema", "workflow.project_search", "workflow.browser_search"],
-        "write_tools": ["workflow.save"],
-        "evidence_required": ["applicant", "workflow_schema", "verified_project", "category_option", "subclass_option"],
-        "post_check": "oa.done.list",
-    },
-}
-
-for capability_id, capability in CAPABILITIES.items():
-    if str(capability.get("domain") or "") == "meetingroom":
-        capability["result_fields"] = ["booking_result"]
-        if "participant" in capability_id:
-            capability["result_fields"].append("participant_result")
-    elif str(capability.get("domain") or "") == "workflow":
-        capability["result_fields"] = ["workflow_draft_result", "workflow_result"]
-
-
-MEETING_INTENT_CAPABILITY = {
-    "book_single": "meeting.book",
-    "query_booking": "meeting.query_booking",
-    "query": "meeting.query_booking",
-    "query_workspace": "meeting.query_workspace",
-    "query_room_schedule": "meeting.query_room_schedule",
-    "book_by_schedule_analysis": "meeting.schedule_book",
-    "schedule_book": "meeting.schedule_book",
-    "book_multi_segments_same_room": "meeting.book_multi_segments",
-    "cancel_existing": "meeting.cancel",
-    "cancel": "meeting.cancel",
-    "extend_existing": "meeting.extend",
-    "extend": "meeting.extend",
-    "rebook_larger_existing": "meeting.rebook_larger",
-    "rebook_larger": "meeting.rebook_larger",
-    "cancel_rebook_existing": "meeting.cancel_rebook",
-    "cancel_rebook": "meeting.cancel_rebook",
-    "participant_add": "meeting.participant_add",
-    "participant_remove": "meeting.participant_remove",
-    "participant_list": "meeting.participant_list",
-}
-
-
-WORKFLOW_INTENT_CAPABILITY = {
-    "leave": {"draft": "workflow.leave_draft", "submit": "workflow.leave_submit"},
-    "expense_material": {"draft": "workflow.expense_draft", "submit": "workflow.expense_submit"},
 }
 
 
@@ -415,7 +176,7 @@ def evidence_for_field(field: dict[str, Any], workflow_id: str) -> list[str]:
     return evidence
 
 
-def build_workflows_index(workflow_data: dict[str, Any]) -> dict[str, Any]:
+def build_workflows_index(workflow_data: dict[str, Any], bindings: dict[str, Any] | None = None) -> dict[str, Any]:
     catalog = workflow_data.get("workflow_catalog") or []
     schemas = workflow_data.get("workflow_schemas") or {}
     option_sets = workflow_data.get("workflow_browser_options") or {}
@@ -474,6 +235,7 @@ def build_workflows_index(workflow_data: dict[str, Any]) -> dict[str, Any]:
         "catalog": catalog,
         "by_id": by_id,
         "by_name": by_name,
+        "bindings": bindings or {},
         "option_sets": option_sets,
         "counts": {
             "workflows": len(catalog),
@@ -615,25 +377,77 @@ def build_meetingrooms_index(meetingroom_data: dict[str, Any]) -> dict[str, Any]
     }
 
 
-def build_capabilities_index() -> dict[str, Any]:
-    by_domain: dict[str, list[str]] = defaultdict(list)
-    by_risk: dict[str, list[str]] = defaultdict(list)
-    for capability_id, spec in sorted(CAPABILITIES.items()):
-        by_domain[str(spec.get("domain") or "unknown")].append(capability_id)
-        by_risk[str(spec.get("risk") or "unknown")].append(capability_id)
-    return {
-        "schema_version": "capabilities-index-v1",
-        "capabilities": CAPABILITIES,
-        "meeting_intent_map": MEETING_INTENT_CAPABILITY,
-        "workflow_intent_map": WORKFLOW_INTENT_CAPABILITY,
-        "by_domain": {key: sorted(value) for key, value in sorted(by_domain.items())},
-        "by_risk": {key: sorted(value) for key, value in sorted(by_risk.items())},
-        "counts": {
-            "capabilities": len(CAPABILITIES),
-            "domains": {key: len(value) for key, value in sorted(by_domain.items())},
-            "risk": {key: len(value) for key, value in sorted(by_risk.items())},
-        },
-    }
+def load_business_contracts() -> tuple[dict[str, Any], dict[str, Any]]:
+    capabilities = load_json(STATIC_SOURCE_DIR / "capabilities.json")
+    skills = load_json(STATIC_SOURCE_DIR / "business_skills.json")
+    node_policy = load_json(STATIC_SOURCE_DIR / "skill_node_policy.json")
+    if not isinstance(capabilities.get("capabilities"), dict):
+        raise RuntimeError("invalid static capability source")
+    if not isinstance(skills.get("skills"), dict) or not isinstance(skills.get("capability_map"), dict):
+        raise RuntimeError("invalid static skill source")
+    capability_ids = set(capabilities["capabilities"])
+    mapped_ids = set(skills["capability_map"])
+    if capability_ids != mapped_ids:
+        missing = sorted(capability_ids - mapped_ids)
+        extra = sorted(mapped_ids - capability_ids)
+        raise RuntimeError(f"capability/skill coverage mismatch: missing={missing}, extra={extra}")
+    collect_input = node_policy.get("collect_input")
+    confirm_write = node_policy.get("confirm_write")
+    if not isinstance(collect_input, dict) or not isinstance(confirm_write, dict):
+        raise RuntimeError("invalid static skill node policy")
+    compiled = json.loads(json.dumps(skills, ensure_ascii=False))
+    for definition in compiled["skills"].values():
+        nodes = definition.get("nodes") if isinstance(definition.get("nodes"), list) else []
+        if not nodes:
+            continue
+        if not any(str(node.get("id") or "") == "collect_input" for node in nodes if isinstance(node, dict)):
+            nodes.insert(0, json.loads(json.dumps(collect_input, ensure_ascii=False)))
+        first_write = next(
+            (node for node in nodes if isinstance(node, dict) and str(node.get("operation") or node.get("phase") or "") == "write"),
+            None,
+        )
+        if first_write is not None and not any(
+            str(node.get("id") or "") == "confirm_write" for node in nodes if isinstance(node, dict)
+        ):
+            confirmation = json.loads(json.dumps(confirm_write, ensure_ascii=False))
+            confirmation["depends_on"] = list(first_write.get("depends_on") or [])
+            first_write["depends_on"] = ["confirm_write"]
+            nodes.insert(nodes.index(first_write), confirmation)
+    resolved: dict[str, Any] = {}
+
+    def merge(target: dict[str, Any], source: dict[str, Any]) -> None:
+        for key, value in source.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                merge(target[key], value)
+            else:
+                target[key] = json.loads(json.dumps(value, ensure_ascii=False))
+
+    def resolve(skill_id: str, stack: set[str] | None = None) -> dict[str, Any]:
+        if skill_id in resolved:
+            return json.loads(json.dumps(resolved[skill_id], ensure_ascii=False))
+        stack = set(stack or set())
+        if skill_id in stack:
+            raise RuntimeError(f"skill inheritance cycle: {skill_id}")
+        stack.add(skill_id)
+        current = json.loads(json.dumps(compiled["skills"].get(skill_id) or {}, ensure_ascii=False))
+        parent_id = str(current.get("extends") or "")
+        if not parent_id:
+            resolved[skill_id] = current
+            return json.loads(json.dumps(current, ensure_ascii=False))
+        parent = resolve(parent_id, stack)
+        replacements = current.get("replace_nodes") if isinstance(current.get("replace_nodes"), dict) else {}
+        for node in parent.get("nodes") or []:
+            replacement = replacements.get(str(node.get("id") or ""))
+            if isinstance(replacement, dict):
+                merge(node, replacement)
+        merge(parent, {key: value for key, value in current.items() if key not in {"extends", "replace_nodes", "nodes"}})
+        parent.pop("extends", None)
+        parent.pop("replace_nodes", None)
+        resolved[skill_id] = parent
+        return json.loads(json.dumps(parent, ensure_ascii=False))
+
+    compiled["skills"] = {skill_id: resolve(skill_id) for skill_id in compiled["skills"]}
+    return capabilities, compiled
 
 
 def validate_split_hashes(train_dir: Path, val_dir: Path) -> dict[str, Any]:
@@ -663,11 +477,10 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
         raise RuntimeError(f"train/val static data hash mismatch: {', '.join(mismatches)}")
 
     tools_index = build_tools_index(tool_specs)
-    workflows_index = build_workflows_index(workflow_data)
+    workflow_bindings = load_json(STATIC_SOURCE_DIR / "workflow_bindings.json")
+    workflows_index = build_workflows_index(workflow_data, workflow_bindings)
     meetingrooms_index = build_meetingrooms_index(meetingroom_data)
-    capabilities_index = build_capabilities_index()
-    workflow_skills_index = load_json(POLICY_TEMPLATE_DIR / "workflow_skills.index.json")
-    outcome_policies_index = load_json(POLICY_TEMPLATE_DIR / "outcome_policies.index.json")
+    capabilities_index, workflow_skills_index = load_business_contracts()
 
     manifest = {
         "schema_version": "static-context-v1",
@@ -676,15 +489,30 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
             "tool_specs": {"path": relative(tool_path), "sha256": sha256(tool_path)},
             "workflow_data": {"path": relative(workflow_path), "sha256": sha256(workflow_path)},
             "meetingroom_data": {"path": relative(meetingroom_path), "sha256": sha256(meetingroom_path)},
+            "capabilities": {
+                "path": relative(STATIC_SOURCE_DIR / "capabilities.json"),
+                "sha256": sha256(STATIC_SOURCE_DIR / "capabilities.json"),
+            },
+            "business_skills": {
+                "path": relative(STATIC_SOURCE_DIR / "business_skills.json"),
+                "sha256": sha256(STATIC_SOURCE_DIR / "business_skills.json"),
+            },
+            "workflow_bindings": {
+                "path": relative(STATIC_SOURCE_DIR / "workflow_bindings.json"),
+                "sha256": sha256(STATIC_SOURCE_DIR / "workflow_bindings.json"),
+            },
+            "skill_node_policy": {
+                "path": relative(STATIC_SOURCE_DIR / "skill_node_policy.json"),
+                "sha256": sha256(STATIC_SOURCE_DIR / "skill_node_policy.json"),
+            },
         },
         "split_hash_checks": hash_checks,
         "counts": {
-            "capabilities": len(CAPABILITIES),
+            "capabilities": len(capabilities_index.get("capabilities") or {}),
             "tools": len(tool_specs),
             "workflows": len(workflow_data.get("workflow_catalog") or []),
             "rooms": len(room_items(meetingroom_data)),
             "workflow_skills": len(workflow_skills_index.get("skills") or {}),
-            "outcome_policies": len(outcome_policies_index.get("rules") or []),
         },
         "files": {
             "tools": "tools.index.json",
@@ -692,7 +520,6 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
             "meetingrooms": "meetingrooms.index.json",
             "capabilities": "capabilities.index.json",
             "workflow_skills": "workflow_skills.index.json",
-            "outcome_policies": "outcome_policies.index.json",
             "prompt_cards": "prompt_cards/",
         },
     }
@@ -708,11 +535,10 @@ def build_static_context(split_dir: Path, val_dir: Path, output_dir: Path, fail_
         if legacy_path.exists():
             legacy_path.unlink()
     write_json(output_dir / "workflow_skills.index.json", workflow_skills_index)
-    write_json(output_dir / "outcome_policies.index.json", outcome_policies_index)
     cards_dir = output_dir / "prompt_cards"
     cards_dir.mkdir(parents=True, exist_ok=True)
-    for filename, content in PROMPT_CARDS.items():
-        (cards_dir / filename).write_text(content.strip() + "\n", encoding="utf-8")
+    for source_path in sorted((STATIC_SOURCE_DIR / "prompt_cards").glob("*.md")):
+        (cards_dir / source_path.name).write_text(source_path.read_text(encoding="utf-8").strip() + "\n", encoding="utf-8")
     return manifest
 
 

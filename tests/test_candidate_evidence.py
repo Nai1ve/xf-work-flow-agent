@@ -61,7 +61,7 @@ class CandidateEvidenceTest(unittest.TestCase):
         self.assertIn({"project_name": "外包交付"}, variants)
         self.assertEqual(expense["items"][0]["name"], "外包数据服务")
 
-    def test_task_graph_keeps_booking_when_llm_returns_schedule_query(self) -> None:
+    def test_task_graph_uses_declared_capability_without_baseline_recovery(self) -> None:
         query = "帮我先在A1看看订个会议室，不行A2也可以。"
         baseline = {
             "tasks": [
@@ -75,11 +75,12 @@ class CandidateEvidenceTest(unittest.TestCase):
             ]
         }
         normalized = self.agent._normalize_task_graph(
-            {"tasks": [{"domain": "meetingroom", "intent": "query_room_schedule", "slots": {}}]},
+            {"tasks": [{"id": "t1", "capability": "meeting.query_room_schedule", "slots": {"room_ids": ["R1"]}}]},
             baseline,
             query,
         )
-        self.assertEqual(normalized["tasks"][0]["intent"], "book_single")
+        self.assertEqual(normalized["tasks"][0]["capability"], "meeting.query_room_schedule")
+        self.assertEqual(normalized["tasks"][0]["intent"], "query_room_schedule")
 
     def test_task_graph_merges_workspace_lookup_into_booking(self) -> None:
         query = "查一下工位，然后在工位附近订会议室"
@@ -96,8 +97,8 @@ class CandidateEvidenceTest(unittest.TestCase):
         normalized = self.agent._normalize_task_graph(
             {
                 "tasks": [
-                    {"domain": "meetingroom", "intent": "book_single", "slots": {}},
-                    {"domain": "meetingroom", "intent": "query_workspace", "slots": {}},
+                    {"id": "t1", "capability": "meeting.book", "slots": {"day_text": "明天", "start": "14:00", "end": "15:00"}},
+                    {"id": "t2", "capability": "meeting.query_workspace", "slots": {}},
                 ]
             },
             baseline,
@@ -254,7 +255,19 @@ class ResultAndPreflightTest(unittest.TestCase):
         state.workflow.needed = True
         state.workflow.intent = "expense_material"
         state.workflow.slots = {"submit": True, "expense": {"project_name": "外包交付项目"}}
-        self.agent._initialize_workflow_skill(state)
+        state.task_graph = {
+            "tasks": [
+                {
+                    "task_id": "t1",
+                    "domain": "workflow",
+                    "capability": "workflow.expense_submit",
+                    "intent": "expense_material",
+                    "slots": state.workflow.slots,
+                }
+            ]
+        }
+        self.agent._initialize_task_runtimes(state)
+        self.agent.skill_scheduler.initialize(state, {})
         self.assertEqual(self.agent._read_plan_step_reserve(state), 4)
 
     def test_expense_category_read_waits_for_verified_project(self) -> None:
@@ -294,12 +307,6 @@ class ResultAndPreflightTest(unittest.TestCase):
             "title": "项目复盘",
         }
         tasks: list[ReadTask] = []
-        self.agent._append_meetingroom_read_tasks(state, tasks)
-        canonical = next(task for task in tasks if task.tool == "meetingroom.booking.list")
-        self.assertEqual(canonical.args, {"status": "active", "day": "2026-04-21", "keyword": "项目复盘"})
-
-        state.meetingroom.evidence["tried_booking_lists"] = [{"args": canonical.args, "result": {"bookings": []}}]
-        tasks = []
         self.agent._append_meetingroom_read_tasks(state, tasks)
         occupancy = next(task for task in tasks if task.tool == "meetingroom.room.bookings")
         self.assertEqual(occupancy.args, {"day": "2026-04-21", "room_id": "ROOM-1"})

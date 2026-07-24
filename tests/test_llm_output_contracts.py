@@ -35,15 +35,13 @@ class LLMOutputContractTest(unittest.TestCase):
                 {
                     "tasks": [
                         {
-                            "domain": "meetingroom",
-                            "intent": "book_single",
-                            "submit": False,
+                            "id": "t1",
+                            "capability": "meeting.book",
                             "slots": {"day_text": "明天", "start": "14:00", "end": "15:00"},
                         },
                         {
-                            "domain": "workflow",
-                            "intent": "leave",
-                            "submit": True,
+                            "id": "t2",
+                            "capability": "workflow.leave_submit",
                             "slots": {"leave_type_label": "事假"},
                         },
                     ]
@@ -73,7 +71,7 @@ class LLMOutputContractTest(unittest.TestCase):
             calls.append(dict(config))
             if len(calls) == 1:
                 raise TimeoutError("timed out")
-            return '{"tasks":[{"domain":"meetingroom","intent":"book_single","submit":false,"slots":{"day_text":"明天","start":"14:00","end":"15:00"}}]}'
+            return '{"tasks":[{"id":"t1","capability":"meeting.book","slots":{"day_text":"明天","start":"14:00","end":"15:00"},"write_after":[]}]}'
 
         self.agent._chat_completion = fake_chat
         semantic = self.agent._extract_semantics(state, state.obs, [])

@@ -1,13 +1,84 @@
 {
-  "schema_version": "business-skills-v2",
+  "capability_map": {
+    "meeting.book": "meetingroom.book",
+    "meeting.book_multi_segments": "meetingroom.book",
+    "meeting.cancel": "meetingroom.cancel",
+    "meeting.cancel_rebook": "meetingroom.rebook",
+    "meeting.extend": "meetingroom.extend",
+    "meeting.participant_add": "meetingroom.participant_update",
+    "meeting.participant_list": "meetingroom.participant_list",
+    "meeting.participant_remove": "meetingroom.participant_update",
+    "meeting.query_booking": "meetingroom.query",
+    "meeting.query_room_schedule": "meetingroom.schedule_query",
+    "meeting.query_workspace": "meetingroom.workspace_query",
+    "meeting.rebook_larger": "meetingroom.rebook",
+    "meeting.schedule_book": "meetingroom.schedule_book",
+    "workflow.expense_draft": "workflow.expense.draft",
+    "workflow.expense_submit": "workflow.expense.submit",
+    "workflow.leave_draft": "workflow.leave.draft",
+    "workflow.leave_replace_submit": "workflow.leave.replace_submit",
+    "workflow.leave_submit": "workflow.leave.submit"
+  },
+  "schema_version": "business-skills-v3",
   "skills": {
     "meetingroom.book": {
+      "capabilities": [
+        "meeting.book",
+        "meeting.book_multi_segments"
+      ],
       "domain": "meetingroom",
       "intent": "book_single",
       "nodes": [
         {
-          "cost": 1,
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
           "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workspace_query_failed"
+            }
+          },
+          "id": "workspace",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.workspace"
+          ],
+          "tool": "user.get_workspace",
+          "validator": "meeting.workspace_optional"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "workspace"
+          ],
           "failure_edges": {
             "*": {
               "action": "block",
@@ -20,6 +91,7 @@
             }
           },
           "id": "query_rooms",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "meetingroom.room_candidates"
@@ -28,7 +100,10 @@
           "validator": "meeting.rooms_queried"
         },
         {
+          "args_handler": "",
+          "cardinality": "single",
           "cost": 0,
+          "decision_handler": "default_compute",
           "depends_on": [
             "query_rooms"
           ],
@@ -44,6 +119,7 @@
             }
           },
           "id": "select_room",
+          "operation": "compute",
           "phase": "compute",
           "success_evidence": [
             "meetingroom.pending_selected_room"
@@ -51,9 +127,36 @@
           "validator": "meeting.room_selected"
         },
         {
-          "cost": 1,
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "confirm_write",
           "depends_on": [
             "select_room"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "need_confirmation"
+            }
+          },
+          "id": "confirm_write",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.explicit_write_intent",
+            "dialogue.confirmation"
+          ],
+          "tools": [],
+          "validator": "task.write_confirmed"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "repeat_until",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "confirm_write"
           ],
           "failure_edges": {
             "*": {
@@ -62,6 +165,7 @@
             }
           },
           "id": "create",
+          "operation": "write",
           "phase": "write",
           "success_evidence": [
             "meetingroom.create_done"
@@ -72,11 +176,38 @@
       ]
     },
     "meetingroom.cancel": {
+      "capabilities": [
+        "meeting.cancel"
+      ],
       "domain": "meetingroom",
       "intent": "cancel_existing",
       "nodes": [
         {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
@@ -91,6 +222,7 @@
             }
           },
           "id": "locate",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "meetingroom.selected_booking"
@@ -99,9 +231,36 @@
           "validator": "meeting.booking_located"
         },
         {
-          "cost": 1,
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "confirm_write",
           "depends_on": [
             "locate"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "need_confirmation"
+            }
+          },
+          "id": "confirm_write",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.explicit_write_intent",
+            "dialogue.confirmation"
+          ],
+          "tools": [],
+          "validator": "task.write_confirmed"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "confirm_write"
           ],
           "failure_edges": {
             "*": {
@@ -110,6 +269,7 @@
             }
           },
           "id": "cancel",
+          "operation": "write",
           "phase": "write",
           "success_evidence": [
             "meetingroom.cancel_done"
@@ -120,11 +280,38 @@
       ]
     },
     "meetingroom.extend": {
+      "capabilities": [
+        "meeting.extend"
+      ],
       "domain": "meetingroom",
       "intent": "extend_existing",
       "nodes": [
         {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
@@ -139,6 +326,7 @@
             }
           },
           "id": "locate",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "meetingroom.selected_booking"
@@ -147,9 +335,59 @@
           "validator": "meeting.booking_located"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "locate"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "conflict_after_requested_extension"
+            }
+          },
+          "id": "occupancy",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.room_occupancy"
+          ],
+          "tool": "meetingroom.room.bookings",
+          "validator": "meeting.room_occupancy_checked"
+        },
+        {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "confirm_write",
+          "depends_on": [
+            "occupancy"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "need_confirmation"
+            }
+          },
+          "id": "confirm_write",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.explicit_write_intent",
+            "dialogue.confirmation"
+          ],
+          "tools": [],
+          "validator": "task.write_confirmed"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "confirm_write"
           ],
           "failure_edges": {
             "*": {
@@ -166,6 +404,7 @@
             }
           },
           "id": "extend",
+          "operation": "write",
           "phase": "write",
           "success_evidence": [
             "meetingroom.extend_done"
@@ -176,11 +415,38 @@
       ]
     },
     "meetingroom.participant_list": {
+      "capabilities": [
+        "meeting.participant_list"
+      ],
       "domain": "meetingroom",
       "intent": "participant_list",
       "nodes": [
         {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
@@ -195,6 +461,7 @@
             }
           },
           "id": "locate",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "meetingroom.selected_booking"
@@ -203,7 +470,10 @@
           "validator": "meeting.booking_located"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "locate"
           ],
@@ -214,6 +484,7 @@
             }
           },
           "id": "read_participants",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "meetingroom.participants"
@@ -224,11 +495,39 @@
       ]
     },
     "meetingroom.participant_update": {
+      "capabilities": [
+        "meeting.participant_add",
+        "meeting.participant_remove"
+      ],
       "domain": "meetingroom",
       "intent": "participant_add",
       "nodes": [
         {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
@@ -243,6 +542,7 @@
             }
           },
           "id": "locate",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "meetingroom.selected_booking"
@@ -251,7 +551,10 @@
           "validator": "meeting.booking_located"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "foreach",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "locate"
           ],
@@ -262,6 +565,7 @@
             }
           },
           "id": "resolve_people",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "meetingroom.participant_user_*"
@@ -270,9 +574,59 @@
           "validator": "meeting.participants_resolved"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "resolve_people"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "participant_query_failed"
+            }
+          },
+          "id": "read_existing_participants",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.participants"
+          ],
+          "tool": "meetingroom.booking.participant.list",
+          "validator": "meeting.participants_optional"
+        },
+        {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "confirm_write",
+          "depends_on": [
+            "read_existing_participants"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "need_confirmation"
+            }
+          },
+          "id": "confirm_write",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.explicit_write_intent",
+            "dialogue.confirmation"
+          ],
+          "tools": [],
+          "validator": "task.write_confirmed"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "repeat_until",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "confirm_write"
           ],
           "failure_edges": {
             "*": {
@@ -281,6 +635,7 @@
             }
           },
           "id": "update",
+          "operation": "write",
           "phase": "write",
           "success_evidence": [
             "meetingroom.participant_results"
@@ -295,11 +650,38 @@
       ]
     },
     "meetingroom.query": {
+      "capabilities": [
+        "meeting.query_booking"
+      ],
       "domain": "meetingroom",
       "intent": "query_booking",
       "nodes": [
         {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
@@ -308,6 +690,7 @@
             }
           },
           "id": "query_booking",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "meetingroom.booking_query"
@@ -318,11 +701,39 @@
       ]
     },
     "meetingroom.rebook": {
+      "capabilities": [
+        "meeting.cancel_rebook",
+        "meeting.rebook_larger"
+      ],
       "domain": "meetingroom",
       "intent": "cancel_rebook_existing",
       "nodes": [
         {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
@@ -337,6 +748,7 @@
             }
           },
           "id": "locate",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "meetingroom.selected_booking"
@@ -345,9 +757,36 @@
           "validator": "meeting.booking_located"
         },
         {
-          "cost": 1,
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "confirm_write",
           "depends_on": [
             "select_room"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "need_confirmation"
+            }
+          },
+          "id": "confirm_write",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.explicit_write_intent",
+            "dialogue.confirmation"
+          ],
+          "tools": [],
+          "validator": "task.write_confirmed"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "confirm_write"
           ],
           "failure_edges": {
             "*": {
@@ -356,6 +795,7 @@
             }
           },
           "id": "cancel",
+          "operation": "write",
           "phase": "write",
           "success_evidence": [
             "meetingroom.cancel_done"
@@ -364,7 +804,10 @@
           "validator": "meeting.booking_cancelled"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "locate"
           ],
@@ -380,6 +823,7 @@
             }
           },
           "id": "query_rooms",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "meetingroom.room_candidates"
@@ -388,7 +832,10 @@
           "validator": "meeting.rooms_queried"
         },
         {
+          "args_handler": "",
+          "cardinality": "single",
           "cost": 0,
+          "decision_handler": "default_compute",
           "depends_on": [
             "query_rooms"
           ],
@@ -399,6 +846,7 @@
             }
           },
           "id": "select_room",
+          "operation": "compute",
           "phase": "compute",
           "success_evidence": [
             "meetingroom.pending_selected_room"
@@ -406,7 +854,10 @@
           "validator": "meeting.room_selected"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "repeat_until",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "cancel"
           ],
@@ -417,6 +868,7 @@
             }
           },
           "id": "create",
+          "operation": "write",
           "phase": "write",
           "success_evidence": [
             "meetingroom.create_done"
@@ -427,12 +879,85 @@
       ]
     },
     "meetingroom.schedule_book": {
+      "capabilities": [
+        "meeting.schedule_book"
+      ],
       "domain": "meetingroom",
       "intent": "book_by_schedule_analysis",
       "nodes": [
         {
-          "cost": 1,
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
           "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workspace_query_failed"
+            }
+          },
+          "id": "workspace",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.workspace"
+          ],
+          "tool": "user.get_workspace",
+          "validator": "meeting.workspace_optional"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "workspace"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "no_bookable_room"
+            }
+          },
+          "id": "query_rooms",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "meetingroom.room_candidates"
+          ],
+          "tool": "meetingroom.room.list",
+          "validator": "meeting.rooms_optional"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "foreach",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "query_rooms"
+          ],
           "failure_edges": {
             "*": {
               "action": "block",
@@ -440,6 +965,7 @@
             }
           },
           "id": "query_schedule",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "meetingroom.schedules"
@@ -448,7 +974,10 @@
           "validator": "meeting.schedules_queried"
         },
         {
+          "args_handler": "",
+          "cardinality": "single",
           "cost": 0,
+          "decision_handler": "default_compute",
           "depends_on": [
             "query_schedule"
           ],
@@ -459,6 +988,7 @@
             }
           },
           "id": "select_room",
+          "operation": "compute",
           "phase": "compute",
           "success_evidence": [
             "meetingroom.pending_selected_room"
@@ -466,9 +996,36 @@
           "validator": "meeting.room_selected"
         },
         {
-          "cost": 1,
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "confirm_write",
           "depends_on": [
             "select_room"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "need_confirmation"
+            }
+          },
+          "id": "confirm_write",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.explicit_write_intent",
+            "dialogue.confirmation"
+          ],
+          "tools": [],
+          "validator": "task.write_confirmed"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "repeat_until",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "confirm_write"
           ],
           "failure_edges": {
             "*": {
@@ -477,6 +1034,7 @@
             }
           },
           "id": "create",
+          "operation": "write",
           "phase": "write",
           "success_evidence": [
             "meetingroom.create_done"
@@ -487,11 +1045,38 @@
       ]
     },
     "meetingroom.schedule_query": {
+      "capabilities": [
+        "meeting.query_room_schedule"
+      ],
       "domain": "meetingroom",
       "intent": "query_room_schedule",
       "nodes": [
         {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "foreach",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
@@ -506,6 +1091,7 @@
             }
           },
           "id": "query_schedule",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "meetingroom.schedules"
@@ -516,11 +1102,38 @@
       ]
     },
     "meetingroom.workspace_query": {
+      "capabilities": [
+        "meeting.query_workspace"
+      ],
       "domain": "meetingroom",
       "intent": "query_workspace",
       "nodes": [
         {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
@@ -529,6 +1142,7 @@
             }
           },
           "id": "query_workspace",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "meetingroom.workspace"
@@ -539,11 +1153,38 @@
       ]
     },
     "workflow.expense.draft": {
+      "capabilities": [
+        "workflow.expense_draft"
+      ],
       "domain": "workflow",
       "intent": "expense_material",
       "nodes": [
         {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
@@ -558,6 +1199,7 @@
             }
           },
           "id": "applicant",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.applicant"
@@ -566,7 +1208,10 @@
           "validator": "workflow.applicant_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
@@ -581,6 +1226,7 @@
             }
           },
           "id": "catalog",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.catalog"
@@ -589,7 +1235,10 @@
           "validator": "workflow.catalog_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
@@ -604,6 +1253,7 @@
             }
           },
           "id": "schema",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.schema"
@@ -612,7 +1262,10 @@
           "validator": "workflow.schema_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "foreach",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "applicant",
             "catalog",
@@ -641,6 +1294,7 @@
             }
           },
           "id": "project",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.verified_project",
@@ -650,7 +1304,10 @@
           "validator": "workflow.expense_project_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "project"
           ],
@@ -673,6 +1330,7 @@
             }
           },
           "id": "category",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.category_options",
@@ -682,7 +1340,10 @@
           "validator": "workflow.expense_category_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "project",
             "category"
@@ -712,6 +1373,7 @@
             }
           },
           "id": "subclass",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.subclass_options",
@@ -721,7 +1383,10 @@
           "validator": "workflow.expense_subclass_verified"
         },
         {
+          "args_handler": "",
+          "cardinality": "single",
           "cost": 0,
+          "decision_handler": "default_compute",
           "depends_on": [
             "subclass"
           ],
@@ -744,6 +1409,7 @@
             }
           },
           "id": "draft_ir",
+          "operation": "compute",
           "phase": "compute",
           "success_evidence": [
             "workflow.workflow_skill_draft_ir",
@@ -752,9 +1418,36 @@
           "validator": "workflow.expense_draft_valid"
         },
         {
-          "cost": 1,
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "confirm_write",
           "depends_on": [
             "draft_ir"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "need_confirmation"
+            }
+          },
+          "id": "confirm_write",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.explicit_write_intent",
+            "dialogue.confirmation"
+          ],
+          "tools": [],
+          "validator": "task.write_confirmed"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "repeat_until",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "confirm_write"
           ],
           "failure_edges": {
             "*": {
@@ -763,6 +1456,7 @@
             }
           },
           "id": "save",
+          "operation": "write",
           "phase": "write",
           "success_evidence": [
             "workflow.save_done"
@@ -771,7 +1465,10 @@
           "validator": "workflow.save_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "save"
           ],
@@ -788,6 +1485,7 @@
             }
           },
           "id": "verify",
+          "operation": "postcheck",
           "phase": "postcheck",
           "success_evidence": [
             "workflow.oa_checked"
@@ -799,20 +1497,17 @@
       "submit": false
     },
     "workflow.expense.submit": {
-      "extends": "workflow.expense.draft",
-      "replace_nodes": {
-        "verify": {
-          "tool": "oa.done.list"
-        }
-      },
-      "submit": true
-    },
-    "workflow.leave.draft": {
+      "capabilities": [
+        "workflow.expense_submit"
+      ],
       "domain": "workflow",
-      "intent": "leave",
+      "intent": "expense_material",
       "nodes": [
         {
-          "cost": 1,
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
           "depends_on": [],
           "failure_edges": {
             "*": {
@@ -820,7 +1515,35 @@
               "reason": "missing_required_info"
             }
           },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            },
+            "invalid_applicant": {
+              "action": "retry",
+              "exhausted_reason": "missing_required_info",
+              "max_attempts": 1,
+              "target": "applicant"
+            }
+          },
           "id": "applicant",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.applicant"
@@ -829,15 +1552,25 @@
           "validator": "workflow.applicant_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
               "action": "block",
               "reason": "workflow_not_found"
+            },
+            "workflow_not_found": {
+              "action": "retry",
+              "exhausted_reason": "workflow_not_found",
+              "max_attempts": 1,
+              "target": "catalog"
             }
           },
           "id": "catalog",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.catalog"
@@ -846,15 +1579,25 @@
           "validator": "workflow.catalog_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
               "action": "block",
               "reason": "workflow_schema_lookup_contract_missing"
+            },
+            "invalid_workflow_schema": {
+              "action": "retry",
+              "exhausted_reason": "workflow_schema_lookup_contract_missing",
+              "max_attempts": 1,
+              "target": "schema"
             }
           },
           "id": "schema",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.schema"
@@ -863,7 +1606,336 @@
           "validator": "workflow.schema_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "foreach",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "applicant",
+            "catalog",
+            "schema"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_project"
+            },
+            "empty_project_result": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_project",
+              "max_attempts": 4,
+              "target": "project"
+            },
+            "invalid_project_evidence": {
+              "action": "block",
+              "reason": "ambiguous_project"
+            },
+            "project_search_error": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_project",
+              "max_attempts": 2,
+              "target": "project"
+            }
+          },
+          "id": "project",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.verified_project",
+            "workflow.project_search_history"
+          ],
+          "tool": "workflow.project_search",
+          "validator": "workflow.expense_project_verified"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "project"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_material_subclass"
+            },
+            "empty_category_result": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_material_subclass",
+              "max_attempts": 1,
+              "target": "category"
+            },
+            "invalid_material_category": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_material_subclass",
+              "max_attempts": 1,
+              "target": "category"
+            }
+          },
+          "id": "category",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.category_options",
+            "workflow.selected_material_category"
+          ],
+          "tool": "workflow.browser_search",
+          "validator": "workflow.expense_category_verified"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "project",
+            "category"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_material_subclass"
+            },
+            "empty_subclass_result": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_material_subclass",
+              "max_attempts": 2,
+              "target": "category"
+            },
+            "stale_subclass_candidates": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_material_subclass",
+              "max_attempts": 1,
+              "target": "subclass"
+            },
+            "subclass_search_error": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_material_subclass",
+              "max_attempts": 2,
+              "target": "category"
+            }
+          },
+          "id": "subclass",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.subclass_options",
+            "workflow.expense_bindings.subclass"
+          ],
+          "tool": "workflow.browser_search",
+          "validator": "workflow.expense_subclass_verified"
+        },
+        {
+          "args_handler": "",
+          "cardinality": "single",
           "cost": 0,
+          "decision_handler": "default_compute",
+          "depends_on": [
+            "subclass"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            },
+            "ambiguous_material_subclass": {
+              "action": "block",
+              "reason": "ambiguous_material_subclass"
+            },
+            "insufficient_amount_breakdown": {
+              "action": "block",
+              "reason": "insufficient_amount_breakdown"
+            },
+            "workflow_preflight_failed": {
+              "action": "block",
+              "reason": "workflow_preflight_failed"
+            }
+          },
+          "id": "draft_ir",
+          "operation": "compute",
+          "phase": "compute",
+          "success_evidence": [
+            "workflow.workflow_skill_draft_ir",
+            "ledger.preflight"
+          ],
+          "validator": "workflow.expense_draft_valid"
+        },
+        {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "confirm_write",
+          "depends_on": [
+            "draft_ir"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "need_confirmation"
+            }
+          },
+          "id": "confirm_write",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.explicit_write_intent",
+            "dialogue.confirmation"
+          ],
+          "tools": [],
+          "validator": "task.write_confirmed"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "repeat_until",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "confirm_write"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_save_failed"
+            }
+          },
+          "id": "save",
+          "operation": "write",
+          "phase": "write",
+          "success_evidence": [
+            "workflow.save_done"
+          ],
+          "tool": "workflow.save",
+          "validator": "workflow.save_verified"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "save"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_postcheck_failed"
+            },
+            "oa_lookup_error": {
+              "action": "retry",
+              "exhausted_reason": "workflow_postcheck_failed",
+              "max_attempts": 1,
+              "target": "verify"
+            }
+          },
+          "id": "verify",
+          "operation": "postcheck",
+          "phase": "postcheck",
+          "success_evidence": [
+            "workflow.oa_checked"
+          ],
+          "tool": "oa.done.list",
+          "validator": "workflow.oa_verified"
+        }
+      ],
+      "submit": true
+    },
+    "workflow.leave.draft": {
+      "capabilities": [
+        "workflow.leave_draft"
+      ],
+      "domain": "workflow",
+      "intent": "leave",
+      "nodes": [
+        {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "applicant",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.applicant"
+          ],
+          "tool": "user.get_info",
+          "validator": "workflow.applicant_verified"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_not_found"
+            }
+          },
+          "id": "catalog",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.catalog"
+          ],
+          "tool": "workflow.catalog",
+          "validator": "workflow.catalog_verified"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_schema_lookup_contract_missing"
+            }
+          },
+          "id": "schema",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.schema"
+          ],
+          "tool": "workflow.schema",
+          "validator": "workflow.schema_verified"
+        },
+        {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "default_compute",
           "depends_on": [
             "applicant",
             "catalog",
@@ -876,6 +1948,7 @@
             }
           },
           "id": "leave_form",
+          "operation": "compute",
           "phase": "compute",
           "success_evidence": [
             "user_text"
@@ -883,7 +1956,10 @@
           "validator": "workflow.leave_form_valid"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "leave_form"
           ],
@@ -900,6 +1976,7 @@
             }
           },
           "id": "attachment",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.file_list"
@@ -908,7 +1985,10 @@
           "validator": "workflow.leave_attachment_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "leave_form",
             "attachment"
@@ -932,6 +2012,7 @@
             }
           },
           "id": "approver_search",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.approver_searches"
@@ -940,7 +2021,10 @@
           "validator": "workflow.approver_search_verified"
         },
         {
+          "args_handler": "",
+          "cardinality": "single",
           "cost": 0,
+          "decision_handler": "default_compute",
           "depends_on": [
             "approver_search"
           ],
@@ -951,6 +2035,7 @@
             }
           },
           "id": "approver_resolved",
+          "operation": "compute",
           "phase": "compute",
           "success_evidence": [
             "workflow.search_person:selected"
@@ -958,7 +2043,10 @@
           "validator": "workflow.approver_resolved"
         },
         {
+          "args_handler": "",
+          "cardinality": "single",
           "cost": 0,
+          "decision_handler": "default_compute",
           "depends_on": [
             "approver_resolved"
           ],
@@ -969,6 +2057,7 @@
             }
           },
           "id": "draft_ir",
+          "operation": "compute",
           "phase": "compute",
           "success_evidence": [
             "workflow.workflow_skill_draft_ir",
@@ -977,9 +2066,36 @@
           "validator": "workflow.leave_draft_valid"
         },
         {
-          "cost": 1,
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "confirm_write",
           "depends_on": [
             "draft_ir"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "need_confirmation"
+            }
+          },
+          "id": "confirm_write",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.explicit_write_intent",
+            "dialogue.confirmation"
+          ],
+          "tools": [],
+          "validator": "task.write_confirmed"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "repeat_until",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "confirm_write"
           ],
           "failure_edges": {
             "*": {
@@ -988,6 +2104,7 @@
             }
           },
           "id": "save",
+          "operation": "write",
           "phase": "write",
           "success_evidence": [
             "workflow.save_done"
@@ -996,7 +2113,10 @@
           "validator": "workflow.save_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "save"
           ],
@@ -1012,6 +2132,7 @@
             }
           },
           "id": "verify",
+          "operation": "postcheck",
           "phase": "postcheck",
           "success_evidence": [
             "workflow.oa_checked"
@@ -1023,11 +2144,38 @@
       "submit": false
     },
     "workflow.leave.replace_submit": {
+      "capabilities": [
+        "workflow.leave_replace_submit"
+      ],
       "domain": "workflow",
       "intent": "leave",
       "nodes": [
         {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [],
           "failure_edges": {
             "*": {
@@ -1036,6 +2184,7 @@
             }
           },
           "id": "applicant",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.applicant"
@@ -1044,7 +2193,10 @@
           "validator": "workflow.applicant_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "applicant"
           ],
@@ -1055,6 +2207,7 @@
             }
           },
           "id": "source_lookup",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.replacement_source_lookup"
@@ -1063,9 +2216,36 @@
           "validator": "workflow.leave_source_verified"
         },
         {
-          "cost": 1,
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "confirm_write",
           "depends_on": [
             "source_lookup"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "need_confirmation"
+            }
+          },
+          "id": "confirm_write",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.explicit_write_intent",
+            "dialogue.confirmation"
+          ],
+          "tools": [],
+          "validator": "task.write_confirmed"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "confirm_write"
           ],
           "failure_edges": {
             "*": {
@@ -1074,6 +2254,7 @@
             }
           },
           "id": "delete_source",
+          "operation": "write",
           "phase": "write",
           "success_evidence": [
             "workflow.replacement_delete_done"
@@ -1082,7 +2263,10 @@
           "validator": "workflow.leave_source_deleted"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "delete_source"
           ],
@@ -1093,6 +2277,7 @@
             }
           },
           "id": "catalog",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.catalog"
@@ -1101,7 +2286,10 @@
           "validator": "workflow.catalog_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "delete_source"
           ],
@@ -1112,6 +2300,7 @@
             }
           },
           "id": "schema",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.schema"
@@ -1120,7 +2309,10 @@
           "validator": "workflow.schema_verified"
         },
         {
+          "args_handler": "",
+          "cardinality": "single",
           "cost": 0,
+          "decision_handler": "default_compute",
           "depends_on": [
             "catalog",
             "schema"
@@ -1132,6 +2324,7 @@
             }
           },
           "id": "leave_form",
+          "operation": "compute",
           "phase": "compute",
           "success_evidence": [
             "user_text"
@@ -1139,7 +2332,10 @@
           "validator": "workflow.leave_form_valid"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "leave_form"
           ],
@@ -1156,6 +2352,7 @@
             }
           },
           "id": "attachment",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.file_list"
@@ -1164,7 +2361,10 @@
           "validator": "workflow.leave_attachment_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "leave_form",
             "attachment"
@@ -1181,6 +2381,7 @@
             }
           },
           "id": "approver_search",
+          "operation": "read",
           "phase": "read",
           "success_evidence": [
             "workflow.approver_searches"
@@ -1189,7 +2390,10 @@
           "validator": "workflow.approver_search_verified"
         },
         {
+          "args_handler": "",
+          "cardinality": "single",
           "cost": 0,
+          "decision_handler": "default_compute",
           "depends_on": [
             "approver_search"
           ],
@@ -1200,6 +2404,7 @@
             }
           },
           "id": "approver_resolved",
+          "operation": "compute",
           "phase": "compute",
           "success_evidence": [
             "workflow.search_person:selected"
@@ -1207,7 +2412,10 @@
           "validator": "workflow.approver_resolved"
         },
         {
+          "args_handler": "",
+          "cardinality": "single",
           "cost": 0,
+          "decision_handler": "default_compute",
           "depends_on": [
             "approver_resolved"
           ],
@@ -1218,6 +2426,7 @@
             }
           },
           "id": "draft_ir",
+          "operation": "compute",
           "phase": "compute",
           "success_evidence": [
             "workflow.workflow_skill_draft_ir",
@@ -1226,7 +2435,10 @@
           "validator": "workflow.leave_draft_valid"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "repeat_until",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "draft_ir"
           ],
@@ -1237,6 +2449,7 @@
             }
           },
           "id": "save",
+          "operation": "write",
           "phase": "write",
           "success_evidence": [
             "workflow.save_done"
@@ -1245,7 +2458,10 @@
           "validator": "workflow.save_verified"
         },
         {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
           "cost": 1,
+          "decision_handler": "",
           "depends_on": [
             "save"
           ],
@@ -1256,6 +2472,7 @@
             }
           },
           "id": "verify",
+          "operation": "postcheck",
           "phase": "postcheck",
           "success_evidence": [
             "workflow.oa_checked"
@@ -1267,12 +2484,306 @@
       "submit": true
     },
     "workflow.leave.submit": {
-      "extends": "workflow.leave.draft",
-      "replace_nodes": {
-        "verify": {
-          "tool": "oa.done.list"
+      "capabilities": [
+        "workflow.leave_submit"
+      ],
+      "domain": "workflow",
+      "intent": "leave",
+      "nodes": [
+        {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "collect_input",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "collect_input",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.slots"
+          ],
+          "tools": [],
+          "validator": "task.required_slots_collected"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "applicant",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.applicant"
+          ],
+          "tool": "user.get_info",
+          "validator": "workflow.applicant_verified"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_not_found"
+            }
+          },
+          "id": "catalog",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.catalog"
+          ],
+          "tool": "workflow.catalog",
+          "validator": "workflow.catalog_verified"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_schema_lookup_contract_missing"
+            }
+          },
+          "id": "schema",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.schema"
+          ],
+          "tool": "workflow.schema",
+          "validator": "workflow.schema_verified"
+        },
+        {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "default_compute",
+          "depends_on": [
+            "applicant",
+            "catalog",
+            "schema"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "missing_required_info"
+            }
+          },
+          "id": "leave_form",
+          "operation": "compute",
+          "phase": "compute",
+          "success_evidence": [
+            "user_text"
+          ],
+          "validator": "workflow.leave_form_valid"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "leave_form"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "leave_attachment_not_found"
+            },
+            "file_list_error": {
+              "action": "retry",
+              "exhausted_reason": "leave_attachment_not_found",
+              "max_attempts": 1,
+              "target": "attachment"
+            }
+          },
+          "id": "attachment",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.file_list"
+          ],
+          "tool": "file.list",
+          "validator": "workflow.leave_attachment_verified"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "leave_form",
+            "attachment"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_approver"
+            },
+            "approver_search_error": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_approver",
+              "max_attempts": 2,
+              "target": "approver_search"
+            },
+            "empty_approver_result": {
+              "action": "retry",
+              "exhausted_reason": "ambiguous_approver",
+              "max_attempts": 3,
+              "target": "approver_search"
+            }
+          },
+          "id": "approver_search",
+          "operation": "read",
+          "phase": "read",
+          "success_evidence": [
+            "workflow.approver_searches"
+          ],
+          "tool": "workflow.search_person",
+          "validator": "workflow.approver_search_verified"
+        },
+        {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "default_compute",
+          "depends_on": [
+            "approver_search"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_approver"
+            }
+          },
+          "id": "approver_resolved",
+          "operation": "compute",
+          "phase": "compute",
+          "success_evidence": [
+            "workflow.search_person:selected"
+          ],
+          "validator": "workflow.approver_resolved"
+        },
+        {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "default_compute",
+          "depends_on": [
+            "approver_resolved"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_preflight_failed"
+            }
+          },
+          "id": "draft_ir",
+          "operation": "compute",
+          "phase": "compute",
+          "success_evidence": [
+            "workflow.workflow_skill_draft_ir",
+            "ledger.preflight"
+          ],
+          "validator": "workflow.leave_draft_valid"
+        },
+        {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "confirm_write",
+          "depends_on": [
+            "draft_ir"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "need_confirmation"
+            }
+          },
+          "id": "confirm_write",
+          "operation": "reply",
+          "phase": "reply",
+          "success_evidence": [
+            "task.explicit_write_intent",
+            "dialogue.confirmation"
+          ],
+          "tools": [],
+          "validator": "task.write_confirmed"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "repeat_until",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "confirm_write"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_save_failed"
+            }
+          },
+          "id": "save",
+          "operation": "write",
+          "phase": "write",
+          "success_evidence": [
+            "workflow.save_done"
+          ],
+          "tool": "workflow.save",
+          "validator": "workflow.save_verified"
+        },
+        {
+          "args_handler": "default_tool_args",
+          "cardinality": "single",
+          "cost": 1,
+          "decision_handler": "",
+          "depends_on": [
+            "save"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "workflow_postcheck_failed"
+            },
+            "oa_lookup_error": {
+              "action": "retry",
+              "max_attempts": 1,
+              "target": "verify"
+            }
+          },
+          "id": "verify",
+          "operation": "postcheck",
+          "phase": "postcheck",
+          "success_evidence": [
+            "workflow.oa_checked"
+          ],
+          "tool": "oa.done.list",
+          "validator": "workflow.oa_verified"
         }
-      },
+      ],
       "submit": true
     }
   }
