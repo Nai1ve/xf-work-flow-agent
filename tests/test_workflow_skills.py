@@ -258,6 +258,40 @@ class SkillSchedulerTest(unittest.TestCase):
         self.assertTrue(decision.progressed)
         self.assertTrue(runtime.skill_run.is_ready("lookup"))
 
+    def test_missing_multi_turn_expense_does_not_block_other_task_reads(self) -> None:
+        state = self._state_with_tasks(
+            [
+                {
+                    "id": "t1",
+                    "domain": "workflow",
+                    "capability": "workflow.expense_draft",
+                    "intent": "expense_material",
+                    "slots": {"expense": {}},
+                },
+                {
+                    "id": "t2",
+                    "domain": "meetingroom",
+                    "capability": "meeting.book",
+                    "intent": "book_single",
+                    "slots": {
+                        "day": "2026-07-25",
+                        "day_text": "2026-07-25",
+                        "start": "14:00",
+                        "end": "15:00",
+                        "capacity": 6,
+                        "title": "项目复盘",
+                        "office_candidates": ["A1"],
+                    },
+                },
+            ]
+        )
+        state.obs["mode"] = "multi_turn"
+
+        plan = self.agent._build_read_plan(state)
+
+        self.assertTrue(any(task.owner_task_id == "t2" and task.tool == "meetingroom.room.list" for task in plan.tasks))
+        self.assertFalse(any(task.owner_task_id == "t1" for task in plan.tasks))
+
     def test_exhausted_budget_skips_only_ready_postcheck_after_write(self) -> None:
         state = RuntimeState({"step_budget": 1, "mode": "single_turn"}, set(), 1)
         state.steps_used = 1
@@ -512,6 +546,84 @@ class SkillSchedulerTest(unittest.TestCase):
 
         self.assertEqual(result["count"], 0)
         self.assertEqual(result["bookings"], [])
+
+    def test_explicit_order_id_can_drive_cancel_without_booking_lookup(self) -> None:
+        state = self._state_with_tasks(
+            [
+                {
+                    "id": "t1",
+                    "domain": "meetingroom",
+                    "capability": "meeting.cancel",
+                    "intent": "cancel_existing",
+                    "slots": {"order_id": "SEED-CANCEL-001"},
+                }
+            ]
+        )
+        runtime = self._ready_only(state, "cancel")
+
+        action = self.agent._skill_node_tool_action(state, runtime, {"id": "cancel", "tool": "meetingroom.booking.cancel"})
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action.args, {"order_id": "SEED-CANCEL-001"})
+
+    def test_schedule_query_terminal_result_keeps_single_room_and_range(self) -> None:
+        state = RuntimeState(
+            {
+                "user_query": "查A1-3F-349本周5月11日到5月15日的预订",
+                "now": "2026-05-11T09:00:00+08:00",
+                "step_budget": 3,
+            },
+            set(),
+            3,
+        )
+        runtime = TaskRuntime(
+            {
+                "task_id": "t1",
+                "domain": "meetingroom",
+                "capability": "meeting.query_room_schedule",
+                "intent": "query_room_schedule",
+                "slots": {"room_ids": ["A1-3F-349"], "day_text": "5月11日到5月15日"},
+            }
+        )
+        runtime.status = "completed"
+        runtime.local_evidence = {"schedules": {"A1-3F-349": {"bookings": []}}}
+        state.task_runtimes = [runtime]
+        state.active_task_ids = {"meetingroom": "t1"}
+
+        result = self.agent._task_terminal_result(state, runtime)
+
+        self.assertEqual(result["room_id"], "A1-3F-349")
+        self.assertEqual(result["start_date"], "2026-05-11")
+        self.assertEqual(result["end_date"], "2026-05-15")
+
+    def test_workflow_save_is_projected_even_when_postcheck_blocks(self) -> None:
+        state = RuntimeState({"step_budget": 8}, set(), 8)
+        runtime = TaskRuntime(
+            {
+                "task_id": "t1",
+                "domain": "workflow",
+                "capability": "workflow.expense_draft",
+                "intent": "expense_material",
+                "slots": {"submit": False},
+            }
+        )
+        runtime.status = "blocked"
+        runtime.blocked_reason = "scheduler_stalled"
+        runtime.local_evidence = {
+            "save_done": {
+                "args": {
+                    "workflow_id": 34747,
+                    "submit": False,
+                    "data": {"project_code": "P-1", "total_amount": "30000.00"},
+                },
+                "result": {"draft_saved": True},
+            }
+        }
+
+        result = self.agent._task_terminal_result(state, runtime)
+
+        self.assertEqual(result["status"], "draft_saved")
+        self.assertEqual(result["project_code"], "P-1")
 
     def test_validator_does_not_call_llm_tool_or_mutate_evidence(self) -> None:
         state = self._state_with_tasks(

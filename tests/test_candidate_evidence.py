@@ -291,7 +291,7 @@ class ResultAndPreflightTest(unittest.TestCase):
         self.assertEqual(answer["participant_result"]["status"], "removed")
         self.assertNotIn("booking_result", answer)
 
-    def test_expense_read_plan_reserves_only_irreversible_save(self) -> None:
+    def test_expense_read_plan_does_not_reserve_future_write_before_evidence(self) -> None:
         state = RuntimeState({"step_budget": 10}, set(), 10)
         state.workflow.needed = True
         state.workflow.intent = "expense_material"
@@ -309,7 +309,30 @@ class ResultAndPreflightTest(unittest.TestCase):
         }
         self.agent._initialize_task_runtimes(state)
         self.agent.skill_scheduler.initialize(state, {})
-        self.assertEqual(self.agent._read_plan_step_reserve(state), 1)
+        self.assertEqual(self.agent._read_plan_step_reserve(state), 0)
+
+    def test_task_projection_keeps_batch_participant_list_field(self) -> None:
+        state = RuntimeState({"user_query": "把李明、王芳都加到明天的项目会里", "step_budget": 8}, set(), 8)
+        state.task_results = [
+            {
+                "task_id": "t1",
+                "domain": "meetingroom",
+                "capability": "meeting.participant_add",
+                "status": "completed",
+                "result": {
+                    "status": "updated",
+                    "participants": [
+                        {"order_id": "BK-1", "user_id": "U1", "name": "李明"},
+                        {"order_id": "BK-1", "user_id": "U2", "name": "王芳"},
+                    ],
+                },
+            }
+        ]
+
+        answer = ResultProjectionRegistry().project(state)
+
+        self.assertEqual(answer["participants_added"], [{"user_id": "U1", "name": "李明"}, {"user_id": "U2", "name": "王芳"}])
+        self.assertNotIn("booking_result", answer)
 
     def test_expense_category_read_waits_for_verified_project(self) -> None:
         state = RuntimeState({"user_query": "项目申请", "step_budget": 10}, set(), 10)

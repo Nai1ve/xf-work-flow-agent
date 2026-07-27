@@ -142,6 +142,16 @@ class ExpenseCandidateRegressionTest(unittest.TestCase):
         ]
         self.assertFalse(self.agent._has_unallocated_multi_material_budget(expense, options))
 
+    def test_semantic_amount_alias_is_preserved_as_detail_budget(self) -> None:
+        items = self.agent._clean_explicit_expense_items(
+            [
+                {"name": "视频制作", "amount": "4万元"},
+                {"name": "设计服务", "amount": "2万元"},
+            ]
+        )
+
+        self.assertEqual([item["budget_amount"] for item in items], ["40000.00", "20000.00"])
+
     def test_verified_singleton_still_runs_user_grounded_refinement(self) -> None:
         query = "帮我提一个品牌宣传费用申请，项目是智能办公平台品牌升级项目，预算3万元。"
         state = RuntimeState({"user_query": query, "step_budget": 10}, set(), 10)
@@ -215,6 +225,26 @@ class MeetingResultRegressionTest(unittest.TestCase):
         )
         self.assertEqual(semantic["office_address_candidates"][:2], ["0552_A1_4F", "0552_A2"])
 
+    def test_explicit_building_fallback_queries_office_ids_before_generated_addresses(self) -> None:
+        query = "先在A1园区看看，没有合适的再查A2园区"
+        state = RuntimeState({"user_query": query, "now": "2026-04-18T10:00:00+08:00", "step_budget": 6}, set(), 6)
+        state.meetingroom.intent = "book_single"
+        state.meetingroom.slots = {
+            "day_text": "下周二",
+            "start": "14:00",
+            "end": "15:00",
+            "capacity": 10,
+            "office_candidates": ["A1", "A2"],
+            "office_address_candidates": ["0552_A1", "0552_A2"],
+            "search_scopes": ["same_building"],
+            "location_constraint": "preference",
+            "allow_fallback": True,
+        }
+
+        candidates = self.agent._room_search_candidates(state)
+
+        self.assertEqual(candidates[:2], [{"office_id": "A1"}, {"office_id": "A2"}])
+
     def test_existing_meeting_tomorrow_uses_shared_workday_policy(self) -> None:
         state = RuntimeState(
             {"user_query": "我明天下午两点的项目复盘会能延长半小时就延", "now": "2026-04-18T10:00:00+08:00", "step_budget": 8},
@@ -224,6 +254,36 @@ class MeetingResultRegressionTest(unittest.TestCase):
         state.meetingroom.intent = "extend_existing"
         state.meetingroom.slots = {"day_text": "明天"}
         self.assertEqual(self.agent._meeting_day_candidates(state)[0], "2026-04-20")
+
+    def test_relative_day_from_case_calendar_overrides_llm_absolute_day(self) -> None:
+        state = RuntimeState(
+            {"user_query": "帮我预订今天下午2点的会议室", "now": "2026-04-18T10:00:00+08:00", "step_budget": 4},
+            set(),
+            4,
+        )
+        state.meetingroom.intent = "book_single"
+        state.meetingroom.slots = {"day_text": "今天", "day": "2026-04-20", "start": "14:00", "end": "15:00"}
+
+        self.assertEqual(self.agent._meeting_day_candidates(state)[0], "2026-04-18")
+
+    def test_multi_segment_date_ref_is_resolved_per_segment(self) -> None:
+        state = RuntimeState(
+            {"user_query": "周二、周三、周四上午10点开会", "now": "2026-05-04T10:00:00+08:00", "step_budget": 8},
+            set(),
+            8,
+        )
+        state.meetingroom.intent = "book_multi_segments_same_room"
+        state.meetingroom.slots = {"day_text": "周二", "title": "冲刺评审"}
+        segments = self.agent._normalize_multi_segments(
+            state,
+            [
+                {"date_ref": "周二", "start_time": "10:00", "end_time": "12:00"},
+                {"date_ref": "周三", "start_time": "10:00", "end_time": "12:00"},
+                {"date_ref": "周四", "start_time": "10:00", "end_time": "12:00"},
+            ],
+        )
+
+        self.assertEqual([item["day"] for item in segments], ["2026-05-05", "2026-05-06", "2026-05-07"])
 
     def test_direct_booking_answer_projects_room_to_building(self) -> None:
         state = RuntimeState({"step_budget": 4}, set(), 4)
