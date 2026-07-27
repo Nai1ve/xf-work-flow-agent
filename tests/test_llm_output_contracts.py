@@ -56,11 +56,11 @@ class LLMOutputContractTest(unittest.TestCase):
         self.assertNotIn('"confidence":', captured["messages"][0]["content"])
         self.assertEqual(captured["kwargs"]["max_output_tokens"], 192)
 
-    def test_semantic_stage_retries_once_with_shared_attempt_budget(self) -> None:
+    def test_semantic_stage_uses_configured_timeout_without_deadline_cap(self) -> None:
         state = self._state("帮我订明天下午两点的会议室")
         self.agent._llm_config = lambda profile="strong": {
             "api_key": "test",
-            "timeout": 12,
+            "timeout": 30,
             "max_calls": 2,
             "max_tokens": 256,
             "profile": profile,
@@ -69,17 +69,60 @@ class LLMOutputContractTest(unittest.TestCase):
 
         def fake_chat(config, *_args, **_kwargs):
             calls.append(dict(config))
-            if len(calls) == 1:
-                raise TimeoutError("timed out")
             return '{"tasks":[{"id":"t1","capability":"meeting.book","slots":{"day_text":"明天","start":"14:00","end":"15:00"},"write_after":[]}]}'
 
         self.agent._chat_completion = fake_chat
         semantic = self.agent._extract_semantics(state, state.obs, [])
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(state.semantic_attempts, 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(state.semantic_attempts, 1)
         self.assertEqual(calls[0]["transport_max_attempts"], 1)
-        self.assertLessEqual(calls[0]["timeout"], 8)
+        self.assertEqual(calls[0]["timeout"], 30)
         self.assertEqual(semantic["task_graph"]["tasks"][0]["intent"], "book_single")
+
+    def test_semantic_stage_does_not_retry_fast_logical_call(self) -> None:
+        state = self._state("帮我订明天下午两点的会议室")
+        self.agent._llm_config = lambda profile="strong": {
+            "api_key": "test",
+            "timeout": 30,
+            "max_calls": 2,
+            "max_tokens": 256,
+            "profile": profile,
+        }
+        calls: list[dict] = []
+
+        def fake_chat(config, *_args, **_kwargs):
+            calls.append(dict(config))
+            raise TimeoutError("timed out")
+
+        self.agent._chat_completion = fake_chat
+        semantic = self.agent._extract_semantics(state, state.obs, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(state.semantic_attempts, 1)
+        self.assertEqual(calls[0]["transport_max_attempts"], 1)
+        self.assertEqual(semantic["semantic_error"], "timed out")
+
+    def test_fast_semantic_attempts_are_fixed_to_one(self) -> None:
+        self.agent.config["runtime"]["task_graph_max_attempts"] = 2
+        self.assertEqual(self.agent._task_graph_max_attempts(), 1)
+
+    def test_llm_call_count_budget_is_still_enforced(self) -> None:
+        state = self._state("选择项目")
+        state.llm_calls_strong = 2
+        config = {
+            "api_key": "test",
+            "base_url": "https://example.test/v1",
+            "model": "test",
+            "timeout": 30,
+            "max_calls": 2,
+            "profile": "strong",
+        }
+        with self.assertRaisesRegex(RuntimeError, "call budget exhausted"):
+            self.agent._chat_completion(
+                config,
+                [{"role": "user", "content": "Return json."}],
+                state=state,
+                profile="strong",
+            )
 
     def test_candidate_model_returns_only_verified_candidate_id(self) -> None:
         state = self._state("项目选终端测试环境建设项目")
@@ -276,6 +319,41 @@ class LLMOutputContractTest(unittest.TestCase):
             self.assertNotIn("secret-key", log_path.read_text())
             user_messages = [item["content"] for item in captured_request["messages"] if item["role"] == "user"]
             self.assertTrue(any("json" in content.lower() for content in user_messages))
+
+    def test_transport_timeout_is_fixed_and_never_retried_inside_logical_call(self) -> None:
+        state = self._state("选择项目")
+        config = {
+            "base_url": "https://example.test/v1",
+            "model": "test-model",
+            "api_key": "secret-key",
+            "timeout": 2,
+            "max_calls": 2,
+            "transport_max_attempts": 2,
+        }
+        with patch(
+            "submission.my_agent.urllib.request.urlopen",
+            side_effect=TimeoutError("timed out"),
+        ) as urlopen:
+            with self.assertRaisesRegex(TimeoutError, "timed out"):
+                self.agent._chat_completion(
+                    config,
+                    [{"role": "user", "content": "Return json."}],
+                    state=state,
+                    profile="strong",
+                )
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 30.0)
+        self.assertEqual(state.llm_calls_strong, 1)
+
+    def test_profile_limits_are_fixed(self) -> None:
+        self.agent.config["llm_fast"]["max_calls"] = 9
+        self.agent.config["llm_strong"]["max_calls"] = 9
+        self.agent.config["llm_fast"]["timeout"] = 3
+        self.agent.config["llm_strong"]["timeout"] = 4
+        self.assertEqual(self.agent._llm_config("fast")["max_calls"], 1)
+        self.assertEqual(self.agent._llm_config("strong")["max_calls"], 2)
+        self.assertEqual(self.agent._llm_config("fast")["timeout"], 30.0)
+        self.assertEqual(self.agent._llm_config("strong")["timeout"], 30.0)
 
 
 if __name__ == "__main__":

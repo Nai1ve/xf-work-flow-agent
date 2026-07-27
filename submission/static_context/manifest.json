@@ -14,12 +14,12 @@
     "workflow_skills": "workflow_skills.index.json",
     "workflows": "workflows.index.json"
   },
-  "generated_at": "2026-07-24T05:57:15.738152+00:00",
+  "generated_at": "2026-07-27T06:51:53.258210+00:00",
   "schema_version": "static-context-v1",
   "sources": {
     "business_skills": {
       "path": "scripts/static_context_sources/business_skills.json",
-      "sha256": "4cbb800e5d5d44c20e8ac3380359b1a42b5589c374b974726062e01d08f15d51"
+      "sha256": "14454982af7031b2b4741a95c900e99f10da896b5ac9ae718f795b51cc930fa5"
     },
     "capabilities": {
       "path": "scripts/static_context_sources/capabilities.json",

@@ -897,21 +897,43 @@
           "id": "category",
           "phase": "read",
           "success_evidence": [
-            "workflow.category_options",
-            "workflow.selected_material_category"
+            "workflow.category_options"
           ],
           "tool": "workflow.browser_search",
-          "validator": "workflow.expense_category_verified",
+          "validator": "workflow.expense_category_candidates",
           "operation": "read",
           "args_handler": "default_tool_args",
           "decision_handler": "",
           "cardinality": "single"
         },
         {
+          "cost": 0,
+          "depends_on": [
+            "category"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_material_category"
+            }
+          },
+          "id": "select_category",
+          "phase": "compute",
+          "success_evidence": [
+            "workflow.selected_material_category",
+            "workflow.expense_bindings.category"
+          ],
+          "validator": "workflow.expense_category_verified",
+          "operation": "compute",
+          "args_handler": "",
+          "decision_handler": "default_compute",
+          "cardinality": "single"
+        },
+        {
           "cost": 1,
           "depends_on": [
             "project",
-            "category"
+            "select_category"
           ],
           "failure_edges": {
             "*": {

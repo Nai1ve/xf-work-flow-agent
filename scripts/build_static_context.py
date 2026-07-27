@@ -396,6 +396,28 @@ def load_business_contracts() -> tuple[dict[str, Any], dict[str, Any]]:
     if not isinstance(collect_input, dict) or not isinstance(confirm_write, dict):
         raise RuntimeError("invalid static skill node policy")
     compiled = json.loads(json.dumps(skills, ensure_ascii=False))
+    read_args_handlers = {
+        "applicant": "read_applicant",
+        "workspace": "read_workspace",
+        "query_workspace": "read_workspace",
+        "catalog": "read_workflow_catalog",
+        "schema": "read_workflow_schema",
+        "source_lookup": "read_workflow_source",
+        "attachment": "read_attachment",
+        "approver_search": "read_approver",
+        "project": "read_project",
+        "category": "read_expense_category",
+        "subclass": "read_expense_subclass",
+        "locate": "read_booking",
+        "query_booking": "read_booking",
+        "query_rooms": "read_rooms",
+        "query_schedule": "read_schedule",
+        "occupancy": "read_occupancy",
+        "resolve_people": "read_participant_people",
+        "read_participants": "read_participants",
+        "read_existing_participants": "read_participants",
+        "verify": "read_oa",
+    }
     for definition in compiled["skills"].values():
         nodes = definition.get("nodes") if isinstance(definition.get("nodes"), list) else []
         if not nodes:
@@ -413,6 +435,13 @@ def load_business_contracts() -> tuple[dict[str, Any], dict[str, Any]]:
             confirmation["depends_on"] = list(first_write.get("depends_on") or [])
             first_write["depends_on"] = ["confirm_write"]
             nodes.insert(nodes.index(first_write), confirmation)
+        for node in nodes:
+            if not isinstance(node, dict) or str(node.get("operation") or node.get("phase") or "") not in {"read", "postcheck"}:
+                continue
+            handler = read_args_handlers.get(str(node.get("id") or ""))
+            if not handler:
+                raise RuntimeError(f"missing read args handler for node: {node.get('id')}")
+            node["args_handler"] = handler
     resolved: dict[str, Any] = {}
 
     def merge(target: dict[str, Any], source: dict[str, Any]) -> None:

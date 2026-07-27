@@ -61,7 +61,7 @@ PYTHON="$(resolve_python)"
 AGENT="${AGENT:-submission/my_agent.py}"
 SPLITS="${SPLITS:-val}"
 PARALLEL="${PARALLEL:-1}"
-TIMEOUT="${TIMEOUT:-60}"
+TIMEOUT="${TIMEOUT:-180}"
 LIMIT="${LIMIT:-}"
 CASES="${CASES:-}"
 RUN_ID="${RUN_ID:-$(date '+%Y%m%d_%H%M%S')}"
@@ -82,9 +82,25 @@ mkdir -p "$(dirname "$RUNTIME_LOG_PATH")"
 : > "$RUNTIME_LOG_PATH"
 export TASK_GRAPH_LOG_PATH="$RUNTIME_LOG_PATH"
 
-if [[ -f submission/config.local.json && -z "${AGENT_USE_LOCAL_CONFIG:-}" ]]; then
-  export AGENT_USE_LOCAL_CONFIG=1
-fi
+export AGENT_USE_LOCAL_CONFIG=0
+
+validate_llm_profile() {
+  local profile="$1"
+  local prefix="OPENAI_${profile}"
+  local key_var="${prefix}_API_KEY"
+  local url_var="${prefix}_BASE_URL"
+  local model_var="${prefix}_MODEL"
+  local key="${!key_var:-${OPENAI_API_KEY:-}}"
+  local url="${!url_var:-${OPENAI_BASE_URL:-}}"
+  local model="${!model_var:-${OPENAI_MODEL:-}}"
+
+  [[ -n "$key" ]] || fail "$key_var (or OPENAI_API_KEY) is required"
+  [[ "$url" =~ ^https?:// ]] || fail "$url_var (or OPENAI_BASE_URL) must be an HTTP(S) URL"
+  [[ -n "$model" ]] || fail "$model_var (or OPENAI_MODEL) is required"
+}
+
+validate_llm_profile FAST
+validate_llm_profile STRONG
 
 log "Python: $PYTHON"
 log "Agent: $AGENT"

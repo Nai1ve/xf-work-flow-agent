@@ -108,6 +108,47 @@ class CandidateEvidenceTest(unittest.TestCase):
         self.assertEqual(normalized["tasks"][0]["intent"], "book_single")
         self.assertTrue(normalized["tasks"][0]["slots"]["needs_workspace"])
 
+    def test_task_graph_coalesces_auxiliary_capabilities_without_merging_independent_writes(self) -> None:
+        cases = [
+            (
+                "提交费用申请",
+                ["workflow.expense_draft", "workflow.expense_submit"],
+                ["workflow.expense_submit"],
+            ),
+            (
+                "费用先保存草稿，不提交",
+                ["workflow.expense_submit", "workflow.expense_draft"],
+                ["workflow.expense_draft"],
+            ),
+            (
+                "查询订单后取消",
+                ["meeting.query_booking", "meeting.cancel"],
+                ["meeting.cancel"],
+            ),
+            (
+                "先查日程再预订",
+                ["meeting.query_room_schedule", "meeting.book"],
+                ["meeting.schedule_book"],
+            ),
+            (
+                "延长会议并添加参会人",
+                ["meeting.extend", "meeting.participant_add"],
+                ["meeting.extend", "meeting.participant_add"],
+            ),
+        ]
+        for query, capabilities, expected in cases:
+            with self.subTest(query=query):
+                graph = self.agent._normalize_task_graph(
+                    {
+                        "tasks": [
+                            {"id": f"t{index}", "capability": capability, "slots": {}}
+                            for index, capability in enumerate(capabilities, 1)
+                        ]
+                    },
+                    query=query,
+                )
+                self.assertEqual([item["capability"] for item in graph["tasks"]], expected)
+
     def test_cross_domain_scheduler_keeps_both_domains(self) -> None:
         state = RuntimeState({"step_budget": 10}, set(), 10)
         state.meetingroom.needed = True
@@ -250,7 +291,7 @@ class ResultAndPreflightTest(unittest.TestCase):
         self.assertEqual(answer["participant_result"]["status"], "removed")
         self.assertNotIn("booking_result", answer)
 
-    def test_expense_read_plan_reserves_category_subclass_save_and_postcheck(self) -> None:
+    def test_expense_read_plan_reserves_only_irreversible_save(self) -> None:
         state = RuntimeState({"step_budget": 10}, set(), 10)
         state.workflow.needed = True
         state.workflow.intent = "expense_material"
@@ -268,13 +309,30 @@ class ResultAndPreflightTest(unittest.TestCase):
         }
         self.agent._initialize_task_runtimes(state)
         self.agent.skill_scheduler.initialize(state, {})
-        self.assertEqual(self.agent._read_plan_step_reserve(state), 4)
+        self.assertEqual(self.agent._read_plan_step_reserve(state), 1)
 
     def test_expense_category_read_waits_for_verified_project(self) -> None:
         state = RuntimeState({"user_query": "项目申请", "step_budget": 10}, set(), 10)
         state.workflow.needed = True
         state.workflow.intent = "expense_material"
         state.workflow.slots = {"expense": {"project_name": "项目申请"}}
+        state.task_graph = {
+            "tasks": [
+                {
+                    "task_id": "t1",
+                    "domain": "workflow",
+                    "capability": "workflow.expense_submit",
+                    "intent": "expense_material",
+                    "slots": state.workflow.slots,
+                }
+            ]
+        }
+        self.agent._initialize_task_runtimes(state)
+        self.agent.skill_scheduler.initialize(state, {})
+        runtime = state.task_runtimes[0]
+        self.agent._activate_task_runtime_view(state, runtime)
+        for node_id in ["collect_input", "applicant", "catalog", "schema"]:
+            runtime.skill_run.mark_completed(node_id, source="test")
         state.workflow.evidence["applicant"] = {"user_id": "U1"}
         state.workflow.evidence["catalog"] = {"workflows": []}
         state.workflow.evidence["schema"] = {
@@ -283,9 +341,8 @@ class ResultAndPreflightTest(unittest.TestCase):
                 "detail_tables": {"detail_2": {"field_descriptions": {"material_subclass": "field_id=29028"}}},
             }
         }
-        tasks: list[ReadTask] = []
-        self.agent._append_workflow_read_tasks(state, tasks)
-        self.assertFalse(any(task.tool == "workflow.browser_search" for task in tasks))
+        plan = self.agent._build_read_plan(state)
+        self.assertFalse(any(task.tool == "workflow.browser_search" for task in plan.tasks))
 
     def test_room_search_requires_bookable_rooms(self) -> None:
         state = RuntimeState({"user_query": "订明天会议室", "now": "2026-04-20T09:00:00+08:00", "step_budget": 6}, set(), 6)
@@ -298,6 +355,23 @@ class ResultAndPreflightTest(unittest.TestCase):
         state.meetingroom.needed = True
         state.meetingroom.intent = "extend_existing"
         state.meetingroom.slots = {"fallback_policy": "keep_if_extend_conflict"}
+        state.task_graph = {
+            "tasks": [
+                {
+                    "task_id": "t1",
+                    "domain": "meetingroom",
+                    "capability": "meeting.extend",
+                    "intent": "extend_existing",
+                    "slots": state.meetingroom.slots,
+                }
+            ]
+        }
+        self.agent._initialize_task_runtimes(state)
+        self.agent.skill_scheduler.initialize(state, {})
+        runtime = state.task_runtimes[0]
+        self.agent._activate_task_runtime_view(state, runtime)
+        for node_id in ["collect_input", "locate"]:
+            runtime.skill_run.mark_completed(node_id, source="test")
         state.meetingroom.evidence["selected_booking"] = {
             "order_id": "BK-1",
             "room_id": "ROOM-1",
@@ -306,9 +380,8 @@ class ResultAndPreflightTest(unittest.TestCase):
             "end": "15:00",
             "title": "项目复盘",
         }
-        tasks: list[ReadTask] = []
-        self.agent._append_meetingroom_read_tasks(state, tasks)
-        occupancy = next(task for task in tasks if task.tool == "meetingroom.room.bookings")
+        plan = self.agent._build_read_plan(state)
+        occupancy = next(task for task in plan.tasks if task.tool == "meetingroom.room.bookings")
         self.assertEqual(occupancy.args, {"day": "2026-04-21", "room_id": "ROOM-1"})
 
     def test_single_turn_reply_is_blocked_without_calling_env(self) -> None:

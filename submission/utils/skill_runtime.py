@@ -96,6 +96,15 @@ class SkillRun:
             }
         )
 
+    def mark_skipped(self, node_id: str, *, source: str, reason: str) -> None:
+        if node_id not in self.statuses or self.statuses[node_id] in self.TERMINAL_STATUSES:
+            return
+        previous = self.statuses[node_id]
+        self.statuses[node_id] = "skipped"
+        self.transitions.append(
+            {"node": node_id, "from": previous, "to": "skipped", "source": source, "reason": reason}
+        )
+
     def apply_validation(self, node_id: str, result: dict[str, Any]) -> dict[str, Any]:
         if node_id not in self.statuses:
             return {"status": "ignored", "node": node_id}

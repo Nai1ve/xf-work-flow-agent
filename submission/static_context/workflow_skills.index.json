@@ -51,7 +51,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workspace",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -72,7 +72,7 @@
           "validator": "meeting.workspace_optional"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_rooms",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -204,7 +204,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_booking",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -308,7 +308,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_booking",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -335,7 +335,7 @@
           "validator": "meeting.booking_located"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_occupancy",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -443,7 +443,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_booking",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -470,7 +470,7 @@
           "validator": "meeting.booking_located"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_participants",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -524,7 +524,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_booking",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -551,7 +551,7 @@
           "validator": "meeting.booking_located"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_participant_people",
           "cardinality": "foreach",
           "cost": 1,
           "decision_handler": "",
@@ -574,7 +574,7 @@
           "validator": "meeting.participants_resolved"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_participants",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -678,7 +678,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_booking",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -730,7 +730,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_booking",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -804,7 +804,7 @@
           "validator": "meeting.booking_cancelled"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_rooms",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -907,7 +907,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workspace",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -928,7 +928,7 @@
           "validator": "meeting.workspace_optional"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_rooms",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -951,7 +951,7 @@
           "validator": "meeting.rooms_optional"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_schedule",
           "cardinality": "foreach",
           "cost": 1,
           "decision_handler": "",
@@ -1073,7 +1073,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_schedule",
           "cardinality": "foreach",
           "cost": 1,
           "decision_handler": "",
@@ -1130,7 +1130,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workspace",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1181,7 +1181,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_applicant",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1208,7 +1208,7 @@
           "validator": "workflow.applicant_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workflow_catalog",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1235,7 +1235,7 @@
           "validator": "workflow.catalog_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workflow_schema",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1262,7 +1262,7 @@
           "validator": "workflow.schema_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_project",
           "cardinality": "foreach",
           "cost": 1,
           "decision_handler": "",
@@ -1304,7 +1304,7 @@
           "validator": "workflow.expense_project_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_expense_category",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1333,20 +1333,42 @@
           "operation": "read",
           "phase": "read",
           "success_evidence": [
-            "workflow.category_options",
-            "workflow.selected_material_category"
+            "workflow.category_options"
           ],
           "tool": "workflow.browser_search",
+          "validator": "workflow.expense_category_candidates"
+        },
+        {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "default_compute",
+          "depends_on": [
+            "category"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_material_category"
+            }
+          },
+          "id": "select_category",
+          "operation": "compute",
+          "phase": "compute",
+          "success_evidence": [
+            "workflow.selected_material_category",
+            "workflow.expense_bindings.category"
+          ],
           "validator": "workflow.expense_category_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_expense_subclass",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
           "depends_on": [
             "project",
-            "category"
+            "select_category"
           ],
           "failure_edges": {
             "*": {
@@ -1465,7 +1487,7 @@
           "validator": "workflow.save_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_oa",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1525,7 +1547,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_applicant",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1552,7 +1574,7 @@
           "validator": "workflow.applicant_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workflow_catalog",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1579,7 +1601,7 @@
           "validator": "workflow.catalog_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workflow_schema",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1606,7 +1628,7 @@
           "validator": "workflow.schema_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_project",
           "cardinality": "foreach",
           "cost": 1,
           "decision_handler": "",
@@ -1648,7 +1670,7 @@
           "validator": "workflow.expense_project_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_expense_category",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1677,20 +1699,42 @@
           "operation": "read",
           "phase": "read",
           "success_evidence": [
-            "workflow.category_options",
-            "workflow.selected_material_category"
+            "workflow.category_options"
           ],
           "tool": "workflow.browser_search",
+          "validator": "workflow.expense_category_candidates"
+        },
+        {
+          "args_handler": "",
+          "cardinality": "single",
+          "cost": 0,
+          "decision_handler": "default_compute",
+          "depends_on": [
+            "category"
+          ],
+          "failure_edges": {
+            "*": {
+              "action": "block",
+              "reason": "ambiguous_material_category"
+            }
+          },
+          "id": "select_category",
+          "operation": "compute",
+          "phase": "compute",
+          "success_evidence": [
+            "workflow.selected_material_category",
+            "workflow.expense_bindings.category"
+          ],
           "validator": "workflow.expense_category_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_expense_subclass",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
           "depends_on": [
             "project",
-            "category"
+            "select_category"
           ],
           "failure_edges": {
             "*": {
@@ -1809,7 +1853,7 @@
           "validator": "workflow.save_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_oa",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1869,7 +1913,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_applicant",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1890,7 +1934,7 @@
           "validator": "workflow.applicant_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workflow_catalog",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1911,7 +1955,7 @@
           "validator": "workflow.catalog_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workflow_schema",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1956,7 +2000,7 @@
           "validator": "workflow.leave_form_valid"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_attachment",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -1985,7 +2029,7 @@
           "validator": "workflow.leave_attachment_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_approver",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2113,7 +2157,7 @@
           "validator": "workflow.save_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_oa",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2172,7 +2216,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_applicant",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2193,7 +2237,7 @@
           "validator": "workflow.applicant_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workflow_source",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2263,7 +2307,7 @@
           "validator": "workflow.leave_source_deleted"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workflow_catalog",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2286,7 +2330,7 @@
           "validator": "workflow.catalog_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workflow_schema",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2332,7 +2376,7 @@
           "validator": "workflow.leave_form_valid"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_attachment",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2361,7 +2405,7 @@
           "validator": "workflow.leave_attachment_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_approver",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2458,7 +2502,7 @@
           "validator": "workflow.save_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_oa",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2512,7 +2556,7 @@
           "validator": "task.required_slots_collected"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_applicant",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2533,7 +2577,7 @@
           "validator": "workflow.applicant_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workflow_catalog",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2554,7 +2598,7 @@
           "validator": "workflow.catalog_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_workflow_schema",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2599,7 +2643,7 @@
           "validator": "workflow.leave_form_valid"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_attachment",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2628,7 +2672,7 @@
           "validator": "workflow.leave_attachment_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_approver",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",
@@ -2756,7 +2800,7 @@
           "validator": "workflow.save_verified"
         },
         {
-          "args_handler": "default_tool_args",
+          "args_handler": "read_oa",
           "cardinality": "single",
           "cost": 1,
           "decision_handler": "",

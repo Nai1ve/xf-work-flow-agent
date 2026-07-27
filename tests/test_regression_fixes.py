@@ -4,7 +4,7 @@ import json
 import unittest
 from pathlib import Path
 
-from submission.my_agent import MyAgent, RuntimeState, StaticContextStore
+from submission.my_agent import MyAgent, RuntimeState, StaticContextStore, TaskRuntime
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +43,15 @@ class DomainNormalizationRegressionTest(unittest.TestCase):
         self.assertEqual(reasons["本人结婚"], "03")
         self.assertEqual(reasons["配偶生产陪护"], "04")
         self.assertEqual(reasons["亲人过世"], "09")
+
+    def test_slot_heuristics_do_not_map_fixed_leave_or_role_semantics(self) -> None:
+        leave = self.agent._heuristic_leave("明天下午因私事请假，审批人找产品经理")
+        hints = self.agent._extract_approver_hints("审批人找产品经理")
+
+        self.assertNotIn("leave_type_label", leave)
+        self.assertNotIn("reason_label", leave)
+        self.assertNotIn("approver_title", hints)
+        self.assertNotIn("approver_title_hint", hints)
 
     def test_special_leave_defaults_to_submit_unless_draft_is_explicit(self) -> None:
         submit = self.agent._heuristic_workflow("我需要请5月14日到5月16日婚假，审批人找王芳经理。", {})
@@ -184,6 +193,10 @@ class MeetingResultRegressionTest(unittest.TestCase):
         self.assertEqual(semantic["intent"], "participant_add")
         self.assertEqual(semantic["participants"], [{"name": "李明"}, {"name": "王芳"}])
 
+    def test_short_parenthesized_participant_number_is_direct_user_id(self) -> None:
+        semantic = self.agent._heuristic_meetingroom("把张伟（200101）加入订单SEED-1的参会人", {})
+        self.assertEqual(semantic["participants"], [{"name": "张伟", "user_id": "200101"}])
+
     def test_room_shorthand_and_week_context_are_normalized(self) -> None:
         query = "看看A1-349和A1-305下周哪个更空闲，选个空闲的订周三下午2点到4点"
         semantic = self.agent._heuristic_meetingroom(query, {})
@@ -261,8 +274,23 @@ class MeetingResultRegressionTest(unittest.TestCase):
             {"success": True, "room_id": "ROOM-NEW"},
             state.meetingroom,
         )
-        self.assertEqual(result["status"], "rebooked")
+        self.assertEqual(result["status"], "success")
         self.assertEqual(result["cancelled_order_id"], "BK-OLD")
+
+    def test_rebook_title_removes_continuity_marker(self) -> None:
+        self.assertEqual(self.agent._normalize_meeting_title("还是季度复盘"), "季度复盘")
+
+    def test_rebook_room_search_uses_verified_booking_day(self) -> None:
+        state = RuntimeState(
+            {"user_query": "我明天下午的评审会换个大房间", "now": "2026-04-18T10:00:00+08:00", "step_budget": 6},
+            set(),
+            6,
+        )
+        state.meetingroom.intent = "rebook_larger_existing"
+        state.meetingroom.slots = {"day_text": "明天", "day": "2026-04-20"}
+        state.meetingroom.evidence["selected_booking"] = {"day": "2026-04-21", "order_id": "BK-1"}
+
+        self.assertEqual(self.agent._schedule_required_days(state), ["2026-04-21"])
 
     def test_conditional_extension_conflict_projects_blocked_status(self) -> None:
         state = RuntimeState({"user_query": "延长半小时，如果冲突就先别动", "step_budget": 5}, set(), 5)
@@ -333,7 +361,23 @@ class MeetingResultRegressionTest(unittest.TestCase):
                 }
             ],
         }
-        action = self.agent._plan_existing_booking_skill_action(state)
+        runtime = TaskRuntime(
+            {
+                "task_id": "t1",
+                "domain": "meetingroom",
+                "capability": "meeting.rebook_larger",
+                "intent": "rebook_larger_existing",
+                "slots": state.meetingroom.slots,
+            }
+        )
+        state.task_runtimes = [runtime]
+        state.active_task_ids = {"meetingroom": "t1"}
+        self.agent._compute_skill_node(state, runtime, {"id": "select_room"})
+        action = self.agent._skill_node_tool_action(
+            state,
+            runtime,
+            {"id": "cancel", "tool": "meetingroom.booking.cancel", "tools": ["meetingroom.booking.cancel"]},
+        )
         self.assertEqual(action.tool, "meetingroom.booking.cancel")
         self.assertEqual(state.meetingroom.evidence["pending_selected_room"]["room_id"], "A1-3F-302")
         self.assertTrue(
@@ -372,7 +416,23 @@ class MeetingResultRegressionTest(unittest.TestCase):
             "busy_slots": [],
         }
         state.meetingroom.evidence["room_candidates"] = {"day": "2026-04-21", "rooms": [replacement]}
-        action = self.agent._plan_existing_booking_skill_action(state)
+        runtime = TaskRuntime(
+            {
+                "task_id": "t1",
+                "domain": "meetingroom",
+                "capability": "meeting.rebook_larger",
+                "intent": "rebook_larger_existing",
+                "slots": state.meetingroom.slots,
+            }
+        )
+        state.task_runtimes = [runtime]
+        state.active_task_ids = {"meetingroom": "t1"}
+        state.meetingroom.evidence["pending_selected_room"] = replacement
+        action = self.agent._skill_node_tool_action(
+            state,
+            runtime,
+            {"id": "cancel", "tool": "meetingroom.booking.cancel", "tools": ["meetingroom.booking.cancel"]},
+        )
         self.assertEqual(action.kind, "block_meetingroom")
         self.assertEqual(action.args["reason"], "insufficient_step_budget")
 

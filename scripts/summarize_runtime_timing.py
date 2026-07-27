@@ -134,6 +134,9 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
             "read_tasks_parallel_eligible": stats(
                 [float(item.get("read_tasks_parallel_eligible") or 0) for item in finishes]
             ),
+            "read_tasks_failed": stats([float(item.get("read_tasks_failed") or 0) for item in finishes]),
+            "read_tasks_retried": stats([float(item.get("read_tasks_retried") or 0) for item in finishes]),
+            "read_retry_exhausted": stats([float(item.get("read_retry_exhausted") or 0) for item in finishes]),
             "ledger_entries": stats([ledger_value(item, "entries") for item in finishes]),
             "ledger_reads": stats([ledger_value(item, "reads") for item in finishes]),
             "ledger_writes": stats([ledger_value(item, "writes") for item in finishes]),

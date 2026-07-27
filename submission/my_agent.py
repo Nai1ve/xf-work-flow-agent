@@ -23,16 +23,9 @@ except ImportError:  # Standalone submission loader.
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "runtime": {
-        "case_deadline_seconds": 55,
         "semantic_extraction": "always",
         "task_graph_log_path": "reports/runtime/task_graph.jsonl",
-        "task_graph_timeout_intent_seconds": 12,
-        "task_graph_total_budget_seconds": 14,
-        "task_graph_first_attempt_timeout_seconds": 8,
-        "task_graph_max_attempts": 2,
-        "task_graph_timeout_simple_seconds": 10,
-        "task_graph_timeout_normal_seconds": 10,
-        "task_graph_timeout_complex_seconds": 10,
+        "task_graph_max_attempts": 1,
         "static_context_enabled": True,
         "static_context_path": "submission/static_context",
         "static_context_max_chars": {
@@ -49,7 +42,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "async_read_execution_enabled": False,
         "parallel_read_max_workers": 4,
         "parallel_read_max_batch_size": 6,
-        "parallel_read_min_remaining_seconds": 8,
         "parallel_read_timeout_seconds": 6,
         "empty_read_mapping_enabled": True,
         "empty_read_mapping_max_variants": 3,
@@ -59,9 +51,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-4o-mini",
         "api_key": "",
-        "timeout": 8,
+        "timeout": 30,
         "temperature": 0,
-        "seed": 42,
+        "seed": None,
         "max_calls": 1,
         "max_tokens": 256,
         "max_history_items": 16,
@@ -72,9 +64,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-4o",
         "api_key": "",
-        "timeout": 10,
+        "timeout": 30,
         "temperature": 0,
-        "seed": 42,
+        "seed": None,
         "max_calls": 2,
         "max_tokens": 1200,
         "max_history_items": 16,
@@ -85,9 +77,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-4o",
         "api_key": "",
-        "timeout": 10,
+        "timeout": 30,
         "temperature": 0,
-        "seed": 42,
+        "seed": None,
         "max_tokens": 1200,
         "max_llm_rounds": 4,
         "max_history_items": 16,
@@ -236,6 +228,60 @@ class CaseCalendar:
             return 0
 
 
+class SlotResolver:
+    """Resolve general language slots before collect_input decides to block."""
+
+    def __init__(self, agent: Any):
+        self.agent = agent
+
+    def resolve(self, state: "RuntimeState", runtime: "TaskRuntime") -> None:
+        self.agent._activate_task_runtime_view(state, runtime)
+        source = str(runtime.task.get("source_text") or runtime.slots.get("source_text") or self.agent._full_query(state.obs))
+        if runtime.domain == "meetingroom":
+            inferred = self.agent._heuristic_meetingroom(source, state.obs)
+            self._fill_missing(runtime.slots, inferred)
+            state.meetingroom.slots = runtime.slots
+            self.agent._normalize_meeting_slots(state)
+            runtime.slots = state.meetingroom.slots
+            return
+        if runtime.intent == "leave":
+            leave = runtime.slots.setdefault("leave", {})
+            inferred = self.agent._heuristic_leave(source)
+            self._fill_missing(leave, inferred)
+            day_text = str(leave.get("day_text") or "")
+            duration = leave.get("duration_hours") or self.agent._extract_duration_hours(source)
+            explicit_clock_range = bool(
+                re.search(r"(?:\d{1,2}(?::\d{2})?|[一二三四五六七八九十两]+)\s*点?.{0,8}(?:到|至|-|~).{0,8}\d{1,2}(?::\d{2})?\s*点?", source)
+            )
+            if duration and leave.get("start") and not explicit_clock_range:
+                try:
+                    leave["end"] = self.agent._add_minutes(str(leave["start"]), int(float(duration) * 60))
+                except (TypeError, ValueError):
+                    pass
+            if any(token in day_text for token in ["到", "至", "-", "~"]):
+                leave.setdefault("start", "09:00")
+                leave.setdefault("end", "18:00")
+            state.workflow.slots = runtime.slots
+            self.agent._normalize_workflow_slots(state)
+            start_day, end_day = self.agent._resolve_leave_date_range(day_text, state)
+            if start_day:
+                leave["day"] = start_day
+                leave["end_day"] = end_day or start_day
+            runtime.slots = state.workflow.slots
+            return
+        if runtime.intent == "expense_material":
+            expense = runtime.slots.setdefault("expense", {})
+            self._fill_missing(expense, self.agent._heuristic_expense(source))
+            state.workflow.slots = runtime.slots
+            self.agent._normalize_workflow_slots(state)
+            runtime.slots = state.workflow.slots
+
+    @staticmethod
+    def _fill_missing(target: dict[str, Any], incoming: dict[str, Any]) -> None:
+        for key, value in incoming.items():
+            if target.get(key) in (None, "", [], {}) and value not in (None, "", [], {}):
+                target[key] = value
+
 class TemporalIR:
     """Canonical temporal facts shared by meetingroom and workflow flows."""
 
@@ -293,6 +339,55 @@ class StepAction:
         self.tool = tool
         self.args = args or {}
         self.message = message
+        self.read_options: dict[str, Any] = {}
+        self.execution_context: ToolExecutionContext | None = None
+
+
+class ToolExecutionContext:
+    def __init__(
+        self,
+        *,
+        owner_task_id: str = "",
+        owner_node_id: str = "",
+        domain: str = "",
+        attempt: int = 1,
+        metadata: dict[str, Any] | None = None,
+    ):
+        self.owner_task_id = str(owner_task_id or "")
+        self.owner_node_id = str(owner_node_id or "")
+        self.domain = str(domain or "")
+        self.attempt = max(1, int(attempt or 1))
+        self.metadata = dict(metadata or {})
+
+
+class ToolExecutionOutcome:
+    def __init__(
+        self,
+        *,
+        success: bool,
+        result: dict[str, Any] | None = None,
+        error_class: str = "",
+        step_consumed: bool = False,
+        cached: bool = False,
+    ):
+        self.success = bool(success)
+        self.result = result if isinstance(result, dict) else {}
+        self.error_class = str(error_class or "")
+        self.step_consumed = bool(step_consumed)
+        self.cached = bool(cached)
+
+
+class SchedulerDecision:
+    def __init__(
+        self,
+        action: StepAction | None = None,
+        *,
+        progressed: bool = False,
+        diagnostic: dict[str, Any] | None = None,
+    ):
+        self.action = action
+        self.progressed = progressed
+        self.diagnostic = diagnostic or {}
 
 
 class SemanticFactStore:
@@ -426,13 +521,13 @@ class ReadTask:
         domain: str = "",
         depends_on: list[str] | None = None,
         evidence_handler: str = "apply_tool_result",
-        deadline_min_remaining: float = 8.0,
         parallel_eligible: bool = True,
         group_key: str = "",
         stop_group_on_success: bool = False,
         mapping_score: float = 0.0,
         owner_task_id: str = "",
         owner_node_id: str = "",
+        owners: list[dict[str, Any]] | None = None,
     ):
         self.task_key = task_key
         self.tool = tool
@@ -440,24 +535,68 @@ class ReadTask:
         self.domain = domain
         self.depends_on = depends_on or []
         self.evidence_handler = evidence_handler
-        self.deadline_min_remaining = deadline_min_remaining
         self.parallel_eligible = parallel_eligible
         self.group_key = group_key
         self.stop_group_on_success = stop_group_on_success
         self.mapping_score = mapping_score
-        self.owner_task_id = owner_task_id
-        self.owner_node_id = owner_node_id
+        self.owners: list[dict[str, Any]] = []
+        for owner in owners or []:
+            if isinstance(owner, dict):
+                self.add_owner(
+                    str(owner.get("task_id") or owner.get("owner_task_id") or ""),
+                    str(owner.get("node_id") or owner.get("owner_node_id") or ""),
+                    str(owner.get("domain") or domain or ""),
+                    owner.get("metadata") if isinstance(owner.get("metadata"), dict) else {},
+                )
+        if not self.owners:
+            self.add_owner(owner_task_id, owner_node_id, domain)
+
+    @property
+    def owner_task_id(self) -> str:
+        return str((self.owners[0] if self.owners else {}).get("task_id") or "")
+
+    @property
+    def owner_node_id(self) -> str:
+        return str((self.owners[0] if self.owners else {}).get("node_id") or "")
+
+    def add_owner(
+        self,
+        task_id: str,
+        node_id: str,
+        domain: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        owner = {
+            "task_id": str(task_id or ""),
+            "node_id": str(node_id or ""),
+            "domain": str(domain or self.domain or ""),
+            "metadata": dict(metadata or {}),
+        }
+        if not owner["task_id"] and not owner["node_id"]:
+            return
+        if owner not in self.owners:
+            self.owners.append(owner)
 
 
 class ReadPlan:
     def __init__(self, tasks: list[ReadTask] | None = None):
         self.tasks = tasks or []
 
-    def ready_tasks(self, completed: set[str], limit: int) -> list[ReadTask]:
+    def ready_tasks(
+        self,
+        completed: set[str],
+        limit: int,
+        completed_owners: set[str] | None = None,
+    ) -> list[ReadTask]:
         out = []
         seen: set[str] = set()
+        completed_owners = completed_owners or set()
         for task in self.tasks:
-            if task.task_key in completed or task.task_key in seen:
+            owner_keys = {
+                f"{task.task_key}|{item.get('task_id') or ''}|{item.get('node_id') or ''}"
+                for item in task.owners
+            }
+            if (owner_keys and owner_keys.issubset(completed_owners)) or task.task_key in seen:
                 continue
             if any(dep not in completed for dep in task.depends_on):
                 continue
@@ -732,9 +871,14 @@ class SkillScheduler:
             )
         return executed
 
-    def next_action(self, state: "RuntimeState", llm_config: dict[str, Any]) -> StepAction | None:
+    def next_action(self, state: "RuntimeState", llm_config: dict[str, Any]) -> SchedulerDecision:
         self.sync(state, llm_config)
-        for _ in range(32):
+        any_progress = False
+        transition_limit = max(
+            4,
+            sum(len(runtime.skill_run.nodes) for runtime in state.task_runtimes if runtime.skill_run is not None) * 2,
+        )
+        for _ in range(transition_limit):
             progressed = False
             for runtime in state.task_runtimes:
                 if runtime.skill_run is None or runtime.status in TaskRuntime.TERMINAL_STATUSES:
@@ -748,36 +892,61 @@ class SkillScheduler:
                     directive = handler(state, runtime, node)
                     for action in directive.actions:
                         if isinstance(action, StepAction) and action.kind == "reply":
-                            return action
-                    validation = self.agent._validate_registered_skill_node(state, runtime, node)
+                            action.execution_context = ToolExecutionContext(
+                                owner_task_id=runtime.task_id,
+                                owner_node_id=str(node.get("id") or ""),
+                                domain=runtime.domain,
+                            )
+                            return SchedulerDecision(action, progressed=any_progress)
+                    validation = {
+                        "status": "pending" if directive.status in {"waiting", "ready"} else directive.status,
+                        "reason": directive.reason,
+                        "evidence_refs": list(directive.evidence_refs),
+                    }
                     transition = runtime.skill_run.apply_validation(str(node.get("id") or ""), validation)
                     progressed = transition.get("status") in {"completed", "skipped", "retry"}
+                    any_progress = any_progress or progressed
                     if runtime.skill_run.blocked_reason:
                         runtime.status = "blocked"
                         runtime.blocked_reason = runtime.skill_run.blocked_reason
-                        return StepAction(f"block_{runtime.domain}", args={"reason": runtime.blocked_reason})
+                        return SchedulerDecision(
+                            StepAction(f"block_{runtime.domain}", args={"reason": runtime.blocked_reason}),
+                            progressed=True,
+                        )
             if not progressed:
                 break
             self.sync(state, llm_config)
+
+            # A compute/reply transition may unlock a read node. Return to the
+            # outer fixed-point loop so ReadPlan is rebuilt before writes.
+            if any(
+                runtime.skill_run is not None and runtime.skill_run.ready_nodes({"read", "postcheck"})
+                for runtime in state.task_runtimes
+                if runtime.status not in TaskRuntime.TERMINAL_STATUSES
+            ):
+                return SchedulerDecision(progressed=True)
 
         for runtime in state.task_runtimes:
             if runtime.skill_run is None or runtime.status in TaskRuntime.TERMINAL_STATUSES:
                 continue
             self.agent._activate_task_runtime_view(state, runtime)
-            for node in runtime.skill_run.ready_nodes({"write", "postcheck"}):
+            for node in runtime.skill_run.ready_nodes({"write"}):
                 operation = str(node.get("operation") or node.get("phase") or "")
                 if operation == "write" and not self.agent._task_dependencies_completed(state, runtime, writes_only=True):
                     continue
                 handler = self.agent.node_args_handlers.get(str(node.get("args_handler") or ""))
                 if handler is None:
                     runtime.skill_run.mark_blocked("missing_args_handler", str(node.get("id") or ""))
-                    return StepAction(f"block_{runtime.domain}", args={"reason": "missing_args_handler"})
+                    return SchedulerDecision(
+                        StepAction(f"block_{runtime.domain}", args={"reason": "missing_args_handler"}),
+                        progressed=True,
+                    )
                 directive = handler(state, runtime, node)
                 action = next((item for item in directive.actions if isinstance(item, StepAction)), None)
                 if action is None:
                     continue
                 if action.kind in {"reply", "block_meetingroom", "block_workflow"}:
-                    return action
+                    return SchedulerDecision(action, progressed=any_progress)
                 if action.kind != "tool":
                     continue
                 node_id = str(node.get("id") or "")
@@ -802,10 +971,18 @@ class SkillScheduler:
                             "invocation_fingerprint": invocation_fingerprint,
                         },
                     )
-                    return StepAction(f"block_{runtime.domain}", args={"reason": "duplicate_skill_invocation"})
+                    return SchedulerDecision(
+                        StepAction(f"block_{runtime.domain}", args={"reason": "duplicate_skill_invocation"}),
+                        progressed=True,
+                    )
                 runtime.skill_run.mark_invocation(node_id, invocation_fingerprint, "scheduled")
                 runtime.skill_run.mark_running(node_id)
                 runtime.status = "writing" if operation == "write" else "reading"
+                action.execution_context = ToolExecutionContext(
+                    owner_task_id=runtime.task_id,
+                    owner_node_id=node_id,
+                    domain=runtime.domain,
+                )
                 self.agent._debug_log(
                     llm_config,
                     {
@@ -820,8 +997,72 @@ class SkillScheduler:
                         "invocation_fingerprint": invocation_fingerprint,
                     },
                 )
-                return action
-        return None
+                return SchedulerDecision(action, progressed=any_progress)
+        return SchedulerDecision(progressed=any_progress, diagnostic=self.stall_diagnostic(state))
+
+    def settle_exhausted_postchecks(self, state: "RuntimeState", llm_config: dict[str, Any]) -> bool:
+        """Finish successful writes when only best-effort postchecks lack a tool step."""
+        if state.steps_used < state.step_budget:
+            return False
+        progressed = False
+        for runtime in state.task_runtimes:
+            if runtime.status in TaskRuntime.TERMINAL_STATUSES or runtime.skill_run is None:
+                continue
+            for node in runtime.skill_run.ready_nodes({"postcheck"}):
+                node_id = str(node.get("id") or "")
+                runtime.skill_run.mark_skipped(
+                    node_id,
+                    source="step_budget",
+                    reason="postcheck_not_run_insufficient_step_budget",
+                )
+                progressed = True
+                self.agent._debug_log(
+                    llm_config,
+                    {
+                        "event": "skill_transition",
+                        "case_id": state.obs.get("case_id"),
+                        "task_id": runtime.task_id,
+                        "skill_id": runtime.skill_run.skill_id,
+                        "node_id": node_id,
+                        "from": "pending",
+                        "to": "skipped",
+                        "reason": "postcheck_not_run_insufficient_step_budget",
+                    },
+                )
+        if progressed:
+            self.sync(state, llm_config)
+        return progressed
+
+    def stall_diagnostic(self, state: "RuntimeState") -> dict[str, Any]:
+        tasks = []
+        for runtime in state.task_runtimes:
+            if runtime.status in TaskRuntime.TERMINAL_STATUSES or runtime.skill_run is None:
+                continue
+            pending = []
+            for node in runtime.skill_run.nodes:
+                node_id = str(node.get("id") or "")
+                if runtime.skill_run.statuses.get(node_id) in SkillRun.TERMINAL_STATUSES:
+                    continue
+                dependencies = [str(item) for item in node.get("depends_on") or []]
+                pending.append(
+                    {
+                        "node_id": node_id,
+                        "operation": str(node.get("operation") or node.get("phase") or ""),
+                        "status": runtime.skill_run.statuses.get(node_id),
+                        "depends_on": dependencies,
+                        "incomplete_dependencies": [
+                            item for item in dependencies if runtime.skill_run.statuses.get(item) != "completed"
+                        ],
+                        "validation": runtime.skill_run.validations.get(node_id) or {},
+                    }
+                )
+            tasks.append({"task_id": runtime.task_id, "capability": runtime.capability, "nodes": pending})
+        return {
+            "reason": "insufficient_step_budget" if state.steps_used >= state.step_budget else "scheduler_stalled",
+            "steps_used": state.steps_used,
+            "step_budget": state.step_budget,
+            "tasks": tasks,
+        }
 
 
 class ToolRegistry:
@@ -1435,7 +1676,7 @@ class TaskGraphContractNormalizer:
                 }
             )
 
-        tasks = self._coalesce_auxiliary_tasks(tasks)
+        tasks = self._coalesce_auxiliary_tasks(tasks, query=query)
         valid_ids = {str(item.get("task_id") or "") for item in tasks}
         for task in tasks:
             task["depends_on"] = [item for item in task.get("depends_on") or [] if item in valid_ids and item != task["task_id"]]
@@ -1457,31 +1698,85 @@ class TaskGraphContractNormalizer:
         action_words = ["订", "预订", "取消", "延长", "换大", "换一个", "加入", "加到", "移除"]
         return baseline_intent if any(word in str(query or "") for word in action_words) else requested_intent
 
-    def _coalesce_auxiliary_tasks(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        meeting_actions = [
-            task
-            for task in tasks
-            if task.get("domain") == "meetingroom" and task.get("intent") in self.MEETING_ACTION_INTENTS
-        ]
+    def _coalesce_auxiliary_tasks(self, tasks: list[dict[str, Any]], query: str = "") -> list[dict[str, Any]]:
         removed_ids: set[str] = set()
-        if meeting_actions:
-            target = meeting_actions[0]
+        replacement_ids: dict[str, str] = {}
+
+        def absorb(target: dict[str, Any], source: dict[str, Any]) -> None:
             target_slots = target.setdefault("slots", {})
-            for task in tasks:
-                if (
-                    task is target
-                    or task.get("domain") != "meetingroom"
-                    or task.get("requested_intent", task.get("intent")) != "query_workspace"
-                ):
-                    continue
-                target_slots["needs_workspace"] = True
-                for key, value in (task.get("slots") or {}).items():
+            for key, value in (source.get("slots") or {}).items():
+                if value not in (None, "", [], {}):
                     target_slots.setdefault(key, value)
-                removed_ids.add(str(task.get("task_id") or ""))
+            target["source_text"] = " ".join(
+                self._string_list([target.get("source_text"), source.get("source_text")])
+            ).strip()
+            source_id = str(source.get("task_id") or "")
+            target_id = str(target.get("task_id") or "")
+            if source_id and target_id and source_id != target_id:
+                removed_ids.add(source_id)
+                replacement_ids[source_id] = target_id
+
+        expense_tasks = [task for task in tasks if task.get("domain") == "workflow" and str(task.get("capability") or "").startswith("workflow.expense_")]
+        expense_submit = next((task for task in expense_tasks if task.get("capability") == "workflow.expense_submit"), None)
+        expense_draft = next((task for task in expense_tasks if task.get("capability") == "workflow.expense_draft"), None)
+        if expense_submit is not None and expense_draft is not None:
+            explicit_draft = any(token in query for token in ["草稿", "暂存", "不要提交", "不提交"])
+            explicit_submit = any(token in query for token in ["提交", "发起", "送审"])
+            if explicit_submit and not explicit_draft:
+                absorb(expense_submit, expense_draft)
+                expense_submit["submit_intent"] = "submit"
+            else:
+                absorb(expense_draft, expense_submit)
+                expense_draft["submit_intent"] = "draft"
+
+        meeting_tasks = [task for task in tasks if task.get("domain") == "meetingroom"]
+        book_targets = [
+            task for task in meeting_tasks
+            if task.get("capability") in {"meeting.book", "meeting.book_multi_segments", "meeting.schedule_book"}
+        ]
+        action_targets = [
+            task for task in meeting_tasks
+            if task.get("capability") in {
+                "meeting.cancel", "meeting.extend", "meeting.cancel_rebook", "meeting.rebook_larger",
+                "meeting.participant_add", "meeting.participant_remove",
+            }
+        ]
+        for task in list(meeting_tasks):
+            capability = str(task.get("capability") or "")
+            if capability == "meeting.query_workspace" and book_targets:
+                target = book_targets[0]
+                target.setdefault("slots", {})["needs_workspace"] = True
+                absorb(target, task)
+            elif capability == "meeting.query_booking" and action_targets:
+                absorb(action_targets[0], task)
+            elif capability == "meeting.query_room_schedule" and book_targets:
+                target = next((item for item in book_targets if item.get("capability") == "meeting.schedule_book"), book_targets[0])
+                if target.get("capability") in {"meeting.book", "meeting.book_multi_segments"}:
+                    target["capability"] = "meeting.schedule_book"
+                    target["intent"] = "book_by_schedule_analysis"
+                absorb(target, task)
+
+        schedule_target = next((task for task in book_targets if task.get("capability") == "meeting.schedule_book"), None)
+        if schedule_target is not None:
+            for task in book_targets:
+                if task is schedule_target or str(task.get("task_id") or "") in removed_ids:
+                    continue
+                absorb(schedule_target, task)
 
         if not removed_ids:
             return tasks
-        return [task for task in tasks if str(task.get("task_id") or "") not in removed_ids]
+        out = [task for task in tasks if str(task.get("task_id") or "") not in removed_ids]
+        for task in out:
+            for field in ("depends_on", "write_after"):
+                rewritten = [replacement_ids.get(str(item), str(item)) for item in task.get(field) or []]
+                task[field] = self._dedupe_strings(
+                    [item for item in rewritten if item and item != str(task.get("task_id") or "")]
+                )
+        return out
+
+    @staticmethod
+    def _dedupe_strings(values: list[str]) -> list[str]:
+        return list(dict.fromkeys(str(item) for item in values if item))
 
     def _canonical_baseline_tasks(self, value: Any, query: str) -> list[dict[str, Any]]:
         tasks: list[dict[str, Any]] = []
@@ -1685,6 +1980,8 @@ class EvidenceLedger:
         domain: str,
         cached: bool = False,
         preflight_id: int | None = None,
+        owner_task_id: str = "",
+        owner_node_id: str = "",
     ) -> dict[str, Any]:
         return self._append(
             {
@@ -1696,6 +1993,8 @@ class EvidenceLedger:
                 "success": isinstance(result, dict) and not result.get("error"),
                 "result_summary": self._result_summary(result),
                 "preflight_id": preflight_id,
+                "owner_task_id": str(owner_task_id or ""),
+                "owner_node_id": str(owner_node_id or ""),
             }
         )
 
@@ -1847,7 +2146,11 @@ class ResultProjectionRegistry:
                 meeting_results.append((capability, dict(result)))
             elif str(item.get("domain") or "") == "workflow":
                 workflow_results.append(dict(result))
+        meeting_blocked: list[dict[str, Any]] = []
         for capability, result in meeting_results:
+            if result.get("status") == "blocked":
+                meeting_blocked.append(result)
+                continue
             if capability == "meeting.participant_list":
                 answer["participants"] = result.get("participants") or []
                 answer["booking_result"] = result
@@ -1859,6 +2162,8 @@ class ResultProjectionRegistry:
                     answer["booking_result"] = result
             else:
                 answer["booking_result"] = result
+        if "booking_result" not in answer and meeting_blocked:
+            answer["booking_result"] = meeting_blocked[0]
         capabilities = [capability for capability, _ in meeting_results]
         if "meeting.extend" in capabilities and "meeting.participant_add" in capabilities:
             extended = next((result for capability, result in meeting_results if capability == "meeting.extend"), {})
@@ -1871,9 +2176,12 @@ class ResultProjectionRegistry:
                 "added_user_id": (participants[0] if participants else {}).get("user_id"),
             }
         if workflow_results:
-            answer["workflow_draft_result"] = workflow_results[-1]
-            if workflow_results[-1].get("status") == "blocked":
-                answer["workflow_result"] = dict(workflow_results[-1])
+            successful = [item for item in workflow_results if item.get("status") != "blocked"]
+            projected = successful[-1] if successful else workflow_results[0]
+            answer["workflow_draft_result"] = projected
+            blocked = next((item for item in workflow_results if item.get("status") == "blocked"), None)
+            if blocked is not None:
+                answer["workflow_result"] = dict(blocked)
 
     def validate(self, state: "RuntimeState", answer: dict[str, Any]) -> dict[str, str]:
         errors: dict[str, str] = {}
@@ -2234,7 +2542,6 @@ class DomainState:
 class RuntimeState:
     def __init__(self, obs: dict[str, Any], tools: set[str], step_budget: int):
         self.started_at = time.monotonic()
-        self.deadline_at = self.started_at + 55.0
         self.obs = obs
         self.tools = tools
         self.step_budget = step_budget
@@ -2255,10 +2562,16 @@ class RuntimeState:
         self.read_tasks_total = 0
         self.read_tasks_cached = 0
         self.read_tasks_parallel_eligible = 0
+        self.read_tasks_failed = 0
+        self.read_tasks_retried = 0
+        self.read_retry_exhausted = 0
         self.empty_read_mappings_total = 0
         self.empty_read_retry_tasks_total = 0
         self.read_task_keys_completed: set[str] = set()
+        self.read_task_owner_keys_completed: set[str] = set()
         self.read_task_keys_attempted: set[str] = set()
+        self.read_task_attempt_counts: dict[str, int] = {}
+        self.read_task_outcomes: dict[str, ToolExecutionOutcome] = {}
         self.read_task_groups_succeeded: set[str] = set()
         self.history: list[dict[str, Any]] = []
         self.cache: dict[str, Any] = {}
@@ -2274,6 +2587,8 @@ class RuntimeState:
         self.skill_runs: dict[str, SkillRun] = {}
         self.active_task_ids: dict[str, str] = {}
         self.task_results: list[dict[str, Any]] = []
+        self.scheduler_stalls: list[dict[str, Any]] = []
+        self.skill_decision_cache: dict[str, dict[str, Any]] = {}
         # Read scheduling must not let one domain consume steps reserved for
         # another unfinished task. Writes remain allowed so a ready task can
         # always spend its reserved completion step.
@@ -2514,6 +2829,7 @@ class MyAgent:
         self.tool_adapter = ToolAdapter(self.meetingroom_index, self.tool_registry)
         self.preflight_guard = PreflightGuard(self.tool_registry, self.workflow_registry, self.meetingroom_index)
         self.result_projection_registry = ResultProjectionRegistry()
+        self.slot_resolver = SlotResolver(self)
         self.read_plan_executor = ReadPlanExecutor(self)
         self.node_args_handlers = HandlerRegistry("node_args")
         self.node_decision_handlers = HandlerRegistry("node_decision")
@@ -2525,6 +2841,26 @@ class MyAgent:
 
     def _register_skill_handlers(self) -> None:
         self.node_args_handlers.register("default_tool_args", self._default_skill_tool_args)
+        for name, handler in {
+            "read_applicant": self._read_applicant_node,
+            "read_workspace": self._read_workspace_node,
+            "read_workflow_catalog": self._read_workflow_catalog_node,
+            "read_workflow_schema": self._read_workflow_schema_node,
+            "read_workflow_source": self._read_workflow_source_node,
+            "read_attachment": self._read_attachment_node,
+            "read_approver": self._read_approver_node,
+            "read_project": self._read_project_node,
+            "read_expense_category": self._read_expense_category_node,
+            "read_expense_subclass": self._read_expense_subclass_node,
+            "read_oa": self._read_oa_node,
+            "read_booking": self._read_booking_node,
+            "read_rooms": self._read_rooms_node,
+            "read_schedule": self._read_schedule_node,
+            "read_occupancy": self._read_occupancy_node,
+            "read_participant_people": self._read_participant_people_node,
+            "read_participants": self._read_participants_node,
+        }.items():
+            self.node_args_handlers.register(name, handler)
         self.node_decision_handlers.register("default_compute", self._default_skill_compute)
         self.node_decision_handlers.register("collect_input", self._collect_input_skill_node)
         self.node_decision_handlers.register("confirm_write", self._confirm_write_skill_node)
@@ -2534,26 +2870,6 @@ class MyAgent:
                 validator = str(node.get("validator") or "") if isinstance(node, dict) else ""
                 if validator and self.node_validators.get(validator) is None:
                     self.node_validators.register(validator, self._validate_registered_skill_node)
-        self.skill_capability_planners = {
-            "meeting.book": self._plan_booking_skill_action,
-            "meeting.book_multi_segments": self._plan_booking_skill_action,
-            "meeting.schedule_book": self._plan_schedule_skill_action,
-            "meeting.query_room_schedule": self._plan_schedule_skill_action,
-            "meeting.query_booking": self._plan_meeting_query_skill_action,
-            "meeting.query_workspace": self._plan_workspace_skill_action,
-            "meeting.cancel": self._plan_existing_booking_skill_action,
-            "meeting.extend": self._plan_existing_booking_skill_action,
-            "meeting.cancel_rebook": self._plan_existing_booking_skill_action,
-            "meeting.rebook_larger": self._plan_existing_booking_skill_action,
-            "meeting.participant_list": self._plan_participant_skill_action,
-            "meeting.participant_add": self._plan_participant_skill_action,
-            "meeting.participant_remove": self._plan_participant_skill_action,
-            "workflow.leave_draft": self._plan_leave_skill_action,
-            "workflow.leave_submit": self._plan_leave_skill_action,
-            "workflow.leave_replace_submit": self._plan_leave_replace_task_action,
-            "workflow.expense_draft": self._plan_expense_skill_action,
-            "workflow.expense_submit": self._plan_expense_skill_action,
-        }
 
     def _workflow_id(self, kind: str) -> int | str:
         workflow_id = self.workflow_registry.workflow_id(kind)
@@ -2567,22 +2883,242 @@ class MyAgent:
     def _default_skill_tool_args(
         self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]
     ) -> NodeDirective:
-        action = self._plan_node_action(state, runtime, node)
+        action = self._skill_node_tool_action(state, runtime, node)
         if action is None:
             return NodeDirective("waiting")
         return NodeDirective("ready", actions=[action])
 
+    @staticmethod
+    def _read_actions_directive(actions: list[StepAction]) -> NodeDirective:
+        return NodeDirective("ready", actions=actions) if actions else NodeDirective("waiting")
+
+    @staticmethod
+    def _read_action(tool: str, args: dict[str, Any], **options: Any) -> StepAction:
+        action = StepAction("tool", tool, args)
+        action.read_options = dict(options)
+        return action
+
+    def _actions_from_read_tasks(self, tasks: list[ReadTask]) -> list[StepAction]:
+        actions: list[StepAction] = []
+        for task in tasks:
+            actions.append(
+                self._read_action(
+                    task.tool,
+                    task.args,
+                    group_key=task.group_key,
+                    stop_group_on_success=task.stop_group_on_success,
+                    mapping_score=task.mapping_score,
+                    parallel_eligible=task.parallel_eligible,
+                )
+            )
+        return actions
+
+    def _read_applicant_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        return NodeDirective("ready", actions=[self._read_action("user.get_info", {})])
+
+    def _read_workspace_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        if str(node.get("validator") or "") == "meeting.workspace_optional" and not runtime.slots.get("needs_workspace"):
+            return NodeDirective("passed", evidence_refs=["task.slots:no_workspace_lookup_required"])
+        return NodeDirective("ready", actions=[self._read_action("user.get_workspace", {})])
+
+    def _read_workflow_catalog_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        kind = "leave" if "leave" in runtime.capability else "expense_material"
+        return NodeDirective(
+            "ready",
+            actions=[self._read_action("workflow.catalog", {"keyword": self.workflow_registry.catalog_keyword(kind)})],
+        )
+
+    def _read_workflow_schema_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        kind = "leave" if "leave" in runtime.capability else "expense_material"
+        return NodeDirective(
+            "ready",
+            actions=[self._read_action("workflow.schema", {"workflow_id": self._workflow_id(kind)})],
+        )
+
+    def _read_workflow_source_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        return NodeDirective(
+            "ready",
+            actions=[self._read_action("oa.done.list", {"keyword": self.workflow_registry.oa_keyword("leave")})],
+        )
+
+    def _read_attachment_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        directory = self._leave_attachment_directory(state)
+        if not directory:
+            return NodeDirective("passed", evidence_refs=["user_text:no_attachment_required"])
+        return NodeDirective("ready", actions=[self._read_action("file.list", {"directory": directory})])
+
+    def _read_approver_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        plan = state.workflow.evidence.get("leave_plan") if isinstance(state.workflow.evidence.get("leave_plan"), dict) else {}
+        args = self._next_approver_search_args(state, plan, mark_attempt=False) if plan else None
+        return self._read_actions_directive([self._read_action("workflow.search_person", args)] if args else [])
+
+    def _read_project_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        evidence = state.workflow.evidence
+        if evidence.get("verified_project"):
+            return NodeDirective("passed", evidence_refs=["workflow.project_search"])
+        projects = evidence.get("project_candidates") if isinstance(evidence.get("project_candidates"), list) else []
+        if projects:
+            selected = self._select_project_candidate_with_llm(state, projects)
+            if selected:
+                evidence["verified_project"] = selected
+                self._bind_expense_project(state, selected, "skill_project_candidate_selection")
+                return NodeDirective("passed", evidence_refs=["workflow.project_search"])
+            return NodeDirective("failed", reason="ambiguous_project")
+        expense = self._expense_slots(state)
+        tasks: list[ReadTask] = []
+        if not self._append_project_empty_retry_tasks(state, tasks, expense):
+            self._append_project_search_fanout_tasks(state, tasks, expense)
+        return self._read_actions_directive(self._actions_from_read_tasks(tasks))
+
+    def _read_expense_category_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        if state.workflow.evidence.get("category_options"):
+            return NodeDirective("passed", evidence_refs=["workflow.browser_search:category"])
+        field_id = self._expense_category_field_id(state)
+        if not field_id:
+            return NodeDirective("failed", reason="workflow_schema_lookup_contract_missing")
+        return NodeDirective(
+            "ready",
+            actions=[
+                self._read_action(
+                    "workflow.browser_search",
+                    {"workflow_id": self._workflow_id("expense_material"), "field_id": field_id},
+                )
+            ],
+        )
+
+    def _read_expense_subclass_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        tasks: list[ReadTask] = []
+        self._append_expense_subclass_read_task(state, tasks)
+        return self._read_actions_directive(self._actions_from_read_tasks(tasks))
+
+    def _read_oa_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        tool = str(node.get("tool") or "")
+        if tool not in {"oa.todo.list", "oa.done.list"}:
+            return NodeDirective("failed", reason="oa_lookup_error")
+        workflow_kind = "leave" if "leave" in runtime.capability else "expense_material"
+        return NodeDirective(
+            "ready",
+            actions=[self._read_action(tool, {"keyword": self.workflow_registry.oa_keyword(workflow_kind)})],
+        )
+
+    def _read_booking_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        mr = state.meetingroom
+        node_id = str(node.get("id") or "")
+        if node_id == "query_booking":
+            args: dict[str, Any] = {}
+            day = runtime.slots.get("day") or self._meeting_day(state)
+            if day:
+                args["day"] = day
+            if runtime.slots.get("keyword"):
+                args["keyword"] = runtime.slots["keyword"]
+        elif runtime.capability.startswith("meeting.participant_"):
+            args = self._next_participant_booking_list_args(state) or {}
+        else:
+            args = self._next_booking_list_args(state) or {}
+        if node_id == "locate" and (runtime.slots.get("order_id") or mr.evidence.get("selected_booking")):
+            return NodeDirective("passed", evidence_refs=["user_text:order_id"])
+        return NodeDirective("ready", actions=[self._read_action("meetingroom.booking.list", args)])
+
+    def _read_rooms_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        tasks: list[ReadTask] = []
+        self._append_room_list_read_tasks(state, tasks)
+        return self._read_actions_directive(self._actions_from_read_tasks(tasks))
+
+    def _read_schedule_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        tasks: list[ReadTask] = []
+        self._append_schedule_read_tasks(state, tasks)
+        return self._read_actions_directive(self._actions_from_read_tasks(tasks))
+
+    def _read_occupancy_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        if not self._requires_room_occupancy_read(state):
+            return NodeDirective("passed", evidence_refs=["selected_booking:no_extra_occupancy_read"])
+        selected = state.meetingroom.evidence.get("selected_booking") or {}
+        day = str(selected.get("day") or self._meeting_day(state) or "")
+        room_id = str(selected.get("room_id") or "")
+        if not day or not room_id:
+            return NodeDirective("failed", reason="existing_booking_not_found")
+        return NodeDirective(
+            "ready",
+            actions=[self._read_action("meetingroom.room.bookings", {"day": day, "room_id": room_id})],
+        )
+
+    def _read_participant_people_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        people = runtime.slots.get("participants") if isinstance(runtime.slots.get("participants"), list) else []
+        actions: list[StepAction] = []
+        for index, person in enumerate(people):
+            if not isinstance(person, dict) or person.get("user_id") or person.get("employee_no"):
+                continue
+            if state.meetingroom.evidence.get(f"participant_user_{index}"):
+                continue
+            keyword = self._participant_lookup_keyword(person)
+            if keyword:
+                actions.append(
+                    self._read_action(
+                        "user.get_info",
+                        {"keyword": keyword},
+                        owner_metadata={"participant_index": index},
+                    )
+                )
+        if not actions:
+            validation = self._validate_meetingroom_skill_node(state, node)
+            return NodeDirective(
+                str(validation.get("status") or "waiting"),
+                reason=str(validation.get("reason") or ""),
+                evidence_refs=list(validation.get("evidence_refs") or []),
+            )
+        return NodeDirective("ready", actions=actions)
+
+    def _read_participants_node(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> NodeDirective:
+        if str(node.get("validator") or "") == "meeting.participants_optional" and (
+            runtime.capability != "meeting.participant_add" or not self._participant_duplicate_check_required(state)
+        ):
+            return NodeDirective("passed", evidence_refs=["task.slots:no_duplicate_check_required"])
+        selected = state.meetingroom.evidence.get("selected_booking") or {}
+        order_id = runtime.slots.get("order_id") or selected.get("order_id")
+        if not order_id:
+            return NodeDirective("failed", reason="existing_booking_not_found")
+        return NodeDirective(
+            "ready",
+            actions=[self._read_action("meetingroom.booking.participant.list", {"order_id": order_id})],
+        )
+
     def _default_skill_compute(
         self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]
     ) -> NodeDirective:
-        self._prepare_skill_compute(state, runtime, node)
+        self._activate_task_runtime_view(state, runtime)
+        node_id = str(node.get("id") or "")
+        cache_key = self._json_hash(
+            {
+                "task_id": runtime.task_id,
+                "handler": str(node.get("decision_handler") or "default_compute"),
+                "node_id": node_id,
+                "slots": runtime.slots,
+                "evidence": self._skill_compute_evidence(state, runtime, node_id),
+            }
+        )
+        cached = state.skill_decision_cache.get(cache_key)
+        if isinstance(cached, dict):
+            return NodeDirective(
+                str(cached.get("status") or "waiting"),
+                reason=str(cached.get("reason") or ""),
+                evidence_refs=list(cached.get("evidence_refs") or []),
+            )
+        decision = self._compute_skill_node(state, runtime, node)
         result = self._validate_registered_skill_node(state, runtime, node)
-        return NodeDirective(str(result.get("status") or "waiting"), reason=str(result.get("reason") or ""))
+        if decision and result.get("status") == "pending":
+            result = self._skill_validation("failed", decision)
+        state.skill_decision_cache[cache_key] = dict(result)
+        return NodeDirective(
+            str(result.get("status") or "waiting"),
+            reason=str(result.get("reason") or ""),
+            evidence_refs=list(result.get("evidence_refs") or []),
+        )
 
     def _collect_input_skill_node(
         self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]
     ) -> NodeDirective:
         self._activate_task_runtime_view(state, runtime)
+        self.slot_resolver.resolve(state, runtime)
         missing = self._missing_task_slots(state, runtime)
         if not missing:
             return NodeDirective("passed", evidence_refs=["task.slots"])
@@ -2621,17 +3157,29 @@ class MyAgent:
             missing.append("participants")
         elif capability.startswith("workflow.leave"):
             leave = slots.get("leave") if isinstance(slots.get("leave"), dict) else slots
-            for key in ("day_text", "start", "end", "leave_type_label"):
+            # Business enums are resolved by leave_form from the runtime schema.
+            # collect_input only blocks facts that cannot be derived or looked up.
+            for key in ("day_text", "start", "end"):
+                if key == "day_text" and (leave.get("day_text") or leave.get("day")):
+                    continue
                 if not leave.get(key):
                     missing.append(key)
-            if not (leave.get("approver_keyword") or leave.get("approver_title") or leave.get("approver_employee_no")):
+            if not (
+                leave.get("approver_keyword") or leave.get("approver_title") or leave.get("approver_employee_no")
+                or leave.get("approver_name_hint") or leave.get("approver_title_hint") or leave.get("approver_raw")
+            ):
                 missing.append("approver")
         elif capability.startswith("workflow.expense"):
             expense = slots.get("expense") if isinstance(slots.get("expense"), dict) else slots
-            if not (expense.get("project_name") or expense.get("project_code") or expense.get("project_keywords")):
-                missing.append("project_hint")
-            if not (expense.get("material_category_hint") or expense.get("material_subclass_hint") or expense.get("items")):
-                missing.append("material_hint")
+            if state.obs.get("mode") == "multi_turn":
+                missing_name = self._expense_missing_slot_name(state)
+                if missing_name:
+                    missing.append(missing_name)
+            else:
+                if not (expense.get("project_name") or expense.get("project_code") or expense.get("project_keywords")):
+                    missing.append("project_hint")
+                if not expense.get("total_amount") and not expense.get("items"):
+                    missing.append("total_amount")
         return missing
 
     def _task_write_confirmed(self, state: RuntimeState, runtime: TaskRuntime) -> bool:
@@ -2643,19 +3191,83 @@ class MyAgent:
             return True
         return bool(state.meetingroom.evidence.get("confirmed_create"))
 
-    def _plan_node_action(
+    def _skill_node_tool_action(
         self,
         state: RuntimeState,
         runtime: TaskRuntime,
         node: dict[str, Any],
     ) -> StepAction | None:
         self._activate_task_runtime_view(state, runtime)
-        planner = self.skill_capability_planners.get(runtime.capability)
-        if planner is None:
-            return StepAction(f"block_{runtime.domain}", args={"reason": "unsupported_capability"})
-        action = planner(state)
-        if action is None or action.kind != "tool":
-            return action
+        tool = str(node.get("tool") or "")
+        if not tool:
+            return None
+        action: StepAction | None = None
+        mr = state.meetingroom
+        wf = state.workflow
+        selected_booking = mr.evidence.get("selected_booking") if isinstance(mr.evidence.get("selected_booking"), dict) else {}
+        selected_room = mr.evidence.get("pending_selected_room") if isinstance(mr.evidence.get("pending_selected_room"), dict) else {}
+
+        if tool == "meetingroom.booking.create" and selected_room:
+            next_segment = self._next_segment_to_create(mr)
+            if next_segment:
+                if next_segment.get("day"):
+                    mr.slots["day"] = next_segment["day"]
+                mr.slots["start"] = next_segment.get("start")
+                mr.slots["end"] = next_segment.get("end")
+                mr.slots["title"] = next_segment.get("title")
+            action = StepAction("tool", tool, self._booking_create_args(state, selected_room))
+        elif tool == "meetingroom.booking.cancel" and selected_booking.get("order_id"):
+            if runtime.capability in {"meeting.cancel_rebook", "meeting.rebook_larger"}:
+                if not selected_room.get("room_id"):
+                    return StepAction("block_meetingroom", args={"reason": "replacement_room_not_verified"})
+                if state.step_budget - state.steps_used < 2:
+                    return StepAction("block_meetingroom", args={"reason": "insufficient_step_budget"})
+            action = StepAction("tool", tool, {"order_id": selected_booking["order_id"]})
+        elif tool == "meetingroom.booking.extend" and selected_booking.get("order_id"):
+            action = StepAction(
+                "tool",
+                tool,
+                {"order_id": selected_booking["order_id"], "minutes": mr.slots.get("duration_minutes") or 30},
+            )
+        elif tool in {"meetingroom.booking.participant.add", "meetingroom.booking.participant.remove"}:
+            participants = mr.slots.get("participants") if isinstance(mr.slots.get("participants"), list) else []
+            index = int(mr.evidence.get("participant_index") or 0)
+            person = participants[index] if index < len(participants) and isinstance(participants[index], dict) else {}
+            users = (mr.evidence.get(f"participant_user_{index}") or {}).get("users") or []
+            user_id = person.get("user_id") or (users[0].get("user_id") if users else None)
+            order_id = mr.slots.get("order_id") or selected_booking.get("order_id")
+            if order_id and user_id:
+                participant_tool = (
+                    "meetingroom.booking.participant.remove"
+                    if runtime.capability == "meeting.participant_remove"
+                    else "meetingroom.booking.participant.add"
+                )
+                action = StepAction("tool", participant_tool, {"order_id": order_id, "user_id": user_id})
+        elif tool == "workflow.delete":
+            source = self._replacement_leave_source_item(state)
+            if source and source.get("request_id"):
+                action = StepAction("tool", tool, {"request_id": source["request_id"]})
+        elif tool == "workflow.save":
+            draft = wf.evidence.get("workflow_skill_draft_ir") if isinstance(wf.evidence.get("workflow_skill_draft_ir"), dict) else {}
+            save_args = draft.get("save_args") if isinstance(draft.get("save_args"), dict) else {}
+            if runtime.intent == "leave" and wf.evidence.get("save_done"):
+                next_plan = self._next_recurring_leave_plan(state)
+                approver = wf.evidence.get("selected_approver") if isinstance(wf.evidence.get("selected_approver"), dict) else {}
+                if next_plan and approver:
+                    save_args = self._leave_save_args(state, next_plan, approver)
+                    wf.evidence["workflow_skill_draft_ir"] = {
+                        "workflow_id": self._workflow_id("leave"),
+                        "submit": save_args.get("submit"),
+                        "save_args": save_args,
+                    }
+            if save_args:
+                action = StepAction("tool", tool, save_args)
+        elif tool in {"oa.todo.list", "oa.done.list"}:
+            workflow_kind = "leave" if "leave" in runtime.capability else "expense_material"
+            action = StepAction("tool", tool, {"keyword": self.workflow_registry.oa_keyword(workflow_kind)})
+
+        if action is None:
+            return None
         capability = self.capability_registry.spec(runtime.capability)
         capability_tools = set(capability.get("read_tools") or []) | set(capability.get("write_tools") or [])
         if capability.get("post_check"):
@@ -2665,33 +3277,84 @@ class MyAgent:
         allowed_tools = {str(node.get("tool") or ""), *[str(item) for item in node.get("tools") or []]}
         return action if action.tool in allowed_tools else None
 
-    def _prepare_skill_compute(self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]) -> None:
-        self._activate_task_runtime_view(state, runtime)
+    def _skill_compute_evidence(
+        self, state: RuntimeState, runtime: TaskRuntime, node_id: str
+    ) -> dict[str, Any]:
+        evidence = state.meetingroom.evidence if runtime.domain == "meetingroom" else state.workflow.evidence
+        keys_by_node = {
+            "select_room": ["room_candidates", "schedules", "selected_booking"],
+            "leave_form": ["schema"],
+            "approver_resolved": ["approver_searches", "approver_search_attempts"],
+            "select_category": ["category_options", "verified_project", "expense_bindings"],
+            "draft_ir": [
+                "applicant", "schema", "verified_project", "selected_material_category",
+                "subclass_options", "expense_bindings", "selected_approver", "leave_plan",
+            ],
+        }
+        return {key: evidence.get(key) for key in keys_by_node.get(node_id, []) if key in evidence}
+
+    def _compute_skill_node(
+        self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]
+    ) -> str:
         node_id = str(node.get("id") or "")
         if runtime.domain == "meetingroom" and node_id == "select_room":
             selected = self._select_room_for_booking(state)
             if selected:
                 state.meetingroom.evidence["pending_selected_room"] = selected
-            return
-        planner = self.skill_capability_planners.get(runtime.capability)
-        if planner is not None:
-            planner(state)
+                return ""
+            return "no_bookable_room"
+        if runtime.domain != "workflow":
+            return ""
 
-    def _plan_workspace_skill_action(self, state: RuntimeState) -> StepAction | None:
-        if "workspace" not in state.meetingroom.evidence:
-            return StepAction("tool", "user.get_workspace", {})
-        workspace = state.meetingroom.evidence.get("workspace") or {}
-        state.meetingroom.status = "done"
-        state.meetingroom.result = {
-            key: value
-            for key, value in {"status": "queried", "office_address": workspace.get("office_address")}.items()
-            if value not in (None, "")
-        }
-        return None
-
-    def _plan_leave_replace_task_action(self, state: RuntimeState) -> StepAction | None:
-        action = self._plan_leave_replace_skill_action(state)
-        return action if action is not None else self._plan_leave_skill_action(state)
+        wf = state.workflow
+        if node_id == "leave_form":
+            plan = self._leave_plan(state)
+            if not plan:
+                return "invalid_leave_form"
+            wf.evidence["leave_plan"] = dict(plan)
+            wf.evidence["leave_plans"] = self._leave_plans(state, plan)
+            return ""
+        if node_id == "approver_resolved":
+            people = self._deterministic_leave_people(state, self._collected_approver_people(wf))
+            if len(people) > 1:
+                people = self._select_leave_people(state, people)
+            if len(people) != 1 or not people[0].get("user_id"):
+                return "ambiguous_approver"
+            wf.evidence["selected_approver"] = dict(people[0])
+            return ""
+        if node_id == "select_category":
+            category = self._select_material_category(state)
+            if not category:
+                return "ambiguous_material_category"
+            self._bind_expense_category(state, category, "skill_compute")
+            return ""
+        if node_id == "draft_ir" and runtime.intent == "leave":
+            plan = wf.evidence.get("leave_plan") if isinstance(wf.evidence.get("leave_plan"), dict) else {}
+            approver = wf.evidence.get("selected_approver") if isinstance(wf.evidence.get("selected_approver"), dict) else {}
+            if not plan or not approver:
+                return "invalid_leave_form" if not plan else "ambiguous_approver"
+            save_args = self._leave_save_args(state, plan, approver)
+            wf.evidence["workflow_skill_draft_ir"] = {
+                "workflow_id": self._workflow_id("leave"),
+                "submit": save_args.get("submit"),
+                "save_args": save_args,
+            }
+            return ""
+        if node_id == "draft_ir" and runtime.intent == "expense_material":
+            project = wf.evidence.get("verified_project") if isinstance(wf.evidence.get("verified_project"), dict) else {}
+            category = wf.evidence.get("selected_material_category") if isinstance(wf.evidence.get("selected_material_category"), dict) else {}
+            if not project or not category:
+                return "missing_required_info"
+            save_args_or_reason = self._expense_ir_save_args_or_block(state, project, category)
+            if isinstance(save_args_or_reason, str):
+                return save_args_or_reason
+            wf.evidence["workflow_skill_draft_ir"] = {
+                "workflow_id": self._workflow_id("expense_material"),
+                "submit": save_args_or_reason.get("submit"),
+                "total_amount": ((save_args_or_reason.get("data") or {}).get("total_amount")),
+                "save_args": save_args_or_reason,
+            }
+        return ""
 
     def _validate_registered_skill_node(
         self, state: RuntimeState, runtime: TaskRuntime, node: dict[str, Any]
@@ -2723,7 +3386,6 @@ class MyAgent:
                 tools=set(self.tool_registry.available_tools),
                 step_budget=int(obs.get("step_budget") or 0),
             )
-            state.deadline_at = state.started_at + self._case_deadline_seconds()
             debug_config = self._debug_llm_config()
             self._debug_log(
                 debug_config,
@@ -2731,7 +3393,6 @@ class MyAgent:
                     "event": "start",
                     "case_id": case_id,
                     "started_at": 0.0,
-                    "deadline_seconds": round(state.deadline_at - state.started_at, 3),
                     "step_budget": state.step_budget,
                     "tool_count": len(state.tools),
                     "obs": obs,
@@ -2768,10 +3429,11 @@ class MyAgent:
                 },
             )
 
-            max_iterations = max(4, state.step_budget + 4)
+            total_skill_nodes = sum(
+                len(runtime.skill_run.nodes) for runtime in state.task_runtimes if runtime.skill_run is not None
+            )
+            max_iterations = max(8, state.step_budget + total_skill_nodes * 2)
             for _ in range(max_iterations):
-                if state.steps_used >= state.step_budget:
-                    break
                 self._advance_task_runtimes(state)
                 self.skill_scheduler.sync(state, debug_config)
                 if self._all_done(state):
@@ -2783,15 +3445,44 @@ class MyAgent:
                     if self._all_done(state):
                         break
                     continue
-                action = self.skill_scheduler.next_action(state, debug_config)
-                if action is None:
+                decision = self.skill_scheduler.next_action(state, debug_config)
+                if decision.action is None:
                     self._advance_task_runtimes(state)
+                    if decision.progressed:
+                        continue
+                    if self.skill_scheduler.settle_exhausted_postchecks(state, debug_config):
+                        self._refresh_task_runtime_statuses(state)
+                        self._advance_task_runtimes(state)
+                        continue
+                    if self._all_done(state):
+                        break
+                    self._block_scheduler_stall(state, decision.diagnostic, debug_config)
                     break
-                self._execute(state, action, debug_config)
+                if decision.action.kind in {"tool", "reply"} and state.steps_used >= state.step_budget:
+                    diagnostic = self.skill_scheduler.stall_diagnostic(state)
+                    diagnostic["reason"] = "insufficient_step_budget"
+                    diagnostic["blocked_action"] = {
+                        "kind": decision.action.kind,
+                        "tool": decision.action.tool,
+                    }
+                    self._block_scheduler_stall(state, diagnostic, debug_config)
+                    break
+                self._execute(
+                    state,
+                    decision.action,
+                    debug_config,
+                    decision.action.execution_context,
+                )
                 self._advance_task_runtimes(state)
                 if self._all_done(state):
                     break
 
+            if not self._all_done(state) and not state.scheduler_stalls:
+                self._block_scheduler_stall(
+                    state,
+                    self.skill_scheduler.stall_diagnostic(state),
+                    debug_config,
+                )
             self._close_pending_domains(state)
             answer = self._build_final_answer(state)
             finished_at = time.monotonic()
@@ -2807,23 +3498,29 @@ class MyAgent:
                     "llm_calls_fast": state.llm_calls_fast,
                     "llm_calls_strong": state.llm_calls_strong,
                     "end_at": round(elapsed_seconds, 3),
-                    "remaining_seconds": round(max(0.0, state.deadline_at - finished_at), 3),
                     "elapsed": round(elapsed_seconds, 3),
                     "elapsed_seconds": round(elapsed_seconds, 3),
+                    "llm_elapsed": round(llm_elapsed_seconds, 3),
                     "llm_elapsed_seconds": round(llm_elapsed_seconds, 3),
+                    "semantic_elapsed": round(state.semantic_elapsed_seconds, 3),
                     "semantic_elapsed_seconds": round(state.semantic_elapsed_seconds, 3),
                     "semantic_attempts": state.semantic_attempts,
                     "llm_elapsed_fast_seconds": round(state.llm_elapsed_fast_seconds, 3),
                     "llm_elapsed_strong_seconds": round(state.llm_elapsed_strong_seconds, 3),
+                    "tool_elapsed": round(state.tool_elapsed_seconds, 3),
                     "tool_elapsed_seconds": round(state.tool_elapsed_seconds, 3),
                     "reply_elapsed_seconds": round(state.reply_elapsed_seconds, 3),
                     "cache_elapsed_seconds": round(state.cache_elapsed_seconds, 3),
                     "action_elapsed_seconds": round(state.action_elapsed_seconds, 3),
+                    "read_elapsed": round(state.read_elapsed_seconds, 3),
                     "read_elapsed_seconds": round(state.read_elapsed_seconds, 3),
                     "read_plan_batches": state.read_plan_batches,
                     "read_tasks_total": state.read_tasks_total,
                     "read_tasks_cached": state.read_tasks_cached,
                     "read_tasks_parallel_eligible": state.read_tasks_parallel_eligible,
+                    "read_tasks_failed": state.read_tasks_failed,
+                    "read_tasks_retried": state.read_tasks_retried,
+                    "read_retry_exhausted": state.read_retry_exhausted,
                     "empty_read_mappings_total": state.empty_read_mappings_total,
                     "empty_read_retry_tasks_total": state.empty_read_retry_tasks_total,
                     "task_runtimes": [runtime.to_dict() for runtime in state.task_runtimes],
@@ -2838,6 +3535,7 @@ class MyAgent:
                     "expense_line_evidence": state.workflow.evidence.get("expense_line_evidence") or {},
                     "project_resolution": state.workflow.evidence.get("project_resolution") or {},
                     "skill_runs": {task_id: run.summary() for task_id, run in state.skill_runs.items()},
+                    "non_llm_elapsed": round(max(0.0, elapsed_seconds - llm_elapsed_seconds), 3),
                     "non_llm_elapsed_seconds": round(max(0.0, elapsed_seconds - llm_elapsed_seconds), 3),
                     "answer": answer,
                     "history": state.history,
@@ -2912,14 +3610,6 @@ class MyAgent:
                 except Exception:
                     pass
         return config
-
-    def _case_deadline_seconds(self) -> float:
-        runtime = self.config.get("runtime") if isinstance(self.config.get("runtime"), dict) else {}
-        try:
-            value = float(os.getenv("CASE_DEADLINE_SECONDS") or runtime.get("case_deadline_seconds") or 55)
-        except Exception:
-            value = 55.0
-        return max(10.0, min(58.0, value))
 
     def _semantic_extraction_mode(self) -> str:
         runtime = self.config.get("runtime") if isinstance(self.config.get("runtime"), dict) else {}
@@ -3016,9 +3706,6 @@ class MyAgent:
     def _parallel_read_max_batch_size(self) -> int:
         return self._runtime_int("parallel_read_max_batch_size", 6, minimum=1, maximum=12)
 
-    def _parallel_read_min_remaining_seconds(self) -> float:
-        return self._runtime_float("parallel_read_min_remaining_seconds", 8.0, minimum=1.0, maximum=30.0)
-
     def _parallel_read_timeout_seconds(self) -> float:
         return self._runtime_float("parallel_read_timeout_seconds", 6.0, minimum=0.5, maximum=30.0)
 
@@ -3028,14 +3715,8 @@ class MyAgent:
     def _empty_read_mapping_max_variants(self) -> int:
         return self._runtime_int("empty_read_mapping_max_variants", 3, minimum=1, maximum=3)
 
-    def _task_graph_total_budget_seconds(self) -> float:
-        return self._runtime_float("task_graph_total_budget_seconds", 14.0, minimum=1.0, maximum=30.0)
-
-    def _task_graph_first_attempt_timeout_seconds(self) -> float:
-        return self._runtime_float("task_graph_first_attempt_timeout_seconds", 8.0, minimum=0.5, maximum=20.0)
-
     def _task_graph_max_attempts(self) -> int:
-        return self._runtime_int("task_graph_max_attempts", 2, minimum=1, maximum=2)
+        return 1
 
     def _debug_llm_config(self) -> dict[str, Any]:
         return self._llm_config("fast")
@@ -3074,7 +3755,7 @@ class MyAgent:
                 llm["api_key"] = str(fast["api_key"])
         if llm["api_key"] in {"your-api-key", "replace-with-your-api-key", "sk-xxx"}:
             llm["api_key"] = ""
-        llm["timeout"] = float(os.getenv(timeout_env) or os.getenv("OPENAI_TIMEOUT") or llm.get("timeout") or (1 if profile == "fast" else 15))
+        llm["timeout"] = 30.0
         llm["temperature"] = float(os.getenv("OPENAI_TEMPERATURE") or llm.get("temperature") or 0)
         seed_env = "OPENAI_FAST_SEED" if profile == "fast" else "OPENAI_STRONG_SEED"
         seed_value = os.getenv(seed_env) or os.getenv("OPENAI_SEED")
@@ -3085,7 +3766,7 @@ class MyAgent:
         except (TypeError, ValueError):
             llm["seed"] = None
         llm["max_llm_rounds"] = int(os.getenv("MAX_LLM_ROUNDS") or llm.get("max_llm_rounds") or 4)
-        llm["max_calls"] = int(llm.get("max_calls") or (1 if profile in {"fast", "strong"} else llm["max_llm_rounds"]))
+        llm["max_calls"] = 1 if profile == "fast" else 2
         try:
             llm["max_tokens"] = int(os.getenv(tokens_env) or os.getenv("OPENAI_MAX_TOKENS") or llm.get("max_tokens") or 0)
         except Exception:
@@ -3144,7 +3825,6 @@ class MyAgent:
         mode = self._semantic_extraction_mode()
         complexity = self._task_graph_complexity(baseline, obs)
         route = self._capability_route_from_baseline(baseline, obs, complexity)
-        llm_config["timeout"] = self._task_graph_timeout_for_complexity(complexity, llm_config)
         prompt_chars = 0
         response_chars = 0
         context_pack = self.static_context.for_intent_router()
@@ -3157,8 +3837,6 @@ class MyAgent:
         baseline_contract = self._semantic_contract_from_baseline(baseline, obs)
         baseline_graph = baseline_contract.get("task_graph")
         full_query = self._full_query(obs)
-        semantic_deadline = min(state.deadline_at - 3.0, stage_started + self._task_graph_total_budget_seconds())
-
         def finish(semantic: dict[str, Any], reason: str = "") -> dict[str, Any]:
             nonlocal fallback_reason, source, fast_llm_success
             if reason:
@@ -3201,8 +3879,8 @@ class MyAgent:
             fallback_reason = "disabled_or_no_key" if mode == "off" else "no_api_key"
             self._debug_log(llm_config, self._semantic_llm_event(state, fallback_reason, mode, llm_config, complexity))
             return finish({}, fallback_reason)
-        if not self._can_call_llm(state, "fast", min_remaining=6.0):
-            fallback_reason = "deadline_or_budget"
+        if not self._can_call_llm(state, "fast"):
+            fallback_reason = "call_budget_exhausted"
             self._debug_log(llm_config, self._semantic_llm_event(state, fallback_reason, mode, llm_config, complexity))
             return finish({}, fallback_reason)
         payload = {
@@ -3220,19 +3898,8 @@ class MyAgent:
         user_text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         prompt_chars = len(prompt_text) + len(user_text)
         max_attempts = self._task_graph_max_attempts()
-        first_timeout = min(self._task_graph_first_attempt_timeout_seconds(), float(llm_config.get("timeout") or 8.0))
         for attempt in range(1, max_attempts + 1):
-            remaining_budget = semantic_deadline - time.monotonic()
-            if remaining_budget < 0.5:
-                fallback_reason = fallback_reason or "semantic_total_budget_exhausted"
-                break
-            # urllib/socket timeouts can return slightly after their requested
-            # boundary. Reserve transport cleanup time on retries so the
-            # semantic stage remains close to its wall-clock budget.
-            retry_budget = max(0.5, remaining_budget - 1.0) if attempt > 1 else remaining_budget
-            attempt_timeout = min(first_timeout if attempt == 1 else retry_budget, retry_budget)
             attempt_config = dict(llm_config)
-            attempt_config["timeout"] = max(0.5, attempt_timeout)
             attempt_config["max_calls"] = max_attempts
             attempt_config["transport_max_attempts"] = 1
             attempt_config["seed"] = None
@@ -3262,18 +3929,15 @@ class MyAgent:
                 merged = self._merge_semantic(baseline, parsed)
                 source = "fast_llm"
                 fast_llm_success = True
-                self._log_semantic_attempt(state, attempt_config, attempt, attempt_started, True, "", semantic_deadline)
+                self._log_semantic_attempt(state, attempt_config, attempt, attempt_started, True, "")
                 return finish(merged)
             except Exception as exc:
                 fallback_reason = str(exc)[:200] or "fast_llm_error"
                 retryable = self._semantic_error_retryable(exc)
                 self._log_semantic_attempt(
-                    state, attempt_config, attempt, attempt_started, False, fallback_reason, semantic_deadline, retryable
+                    state, attempt_config, attempt, attempt_started, False, fallback_reason, retryable
                 )
                 if not retryable or attempt >= max_attempts:
-                    break
-                if semantic_deadline - time.monotonic() < 0.5:
-                    fallback_reason = "semantic_total_budget_exhausted"
                     break
         if fallback_reason:
             error_event = self._semantic_llm_event(state, fallback_reason, mode, llm_config, complexity)
@@ -3302,7 +3966,6 @@ class MyAgent:
         started_at: float,
         success: bool,
         error: str,
-        semantic_deadline: float,
         retryable: bool = False,
     ) -> None:
         now = time.monotonic()
@@ -3316,8 +3979,6 @@ class MyAgent:
                 "retryable": retryable,
                 "timeout_seconds": round(float(llm_config.get("timeout") or 0), 3),
                 "elapsed_seconds": round(max(0.0, now - started_at), 3),
-                "semantic_budget_remaining_seconds": round(max(0.0, semantic_deadline - now), 3),
-                "case_remaining_seconds": round(self._remaining_seconds(state), 3),
                 "error": str(error or "")[:240],
             },
         )
@@ -3400,7 +4061,6 @@ class MyAgent:
             "reason": reason,
             "mode": mode,
             "fast_timeout_seconds": round(float(llm_config.get("timeout") or 0), 3),
-            "remaining_seconds": round(self._remaining_seconds(state), 3),
             "complexity_level": complexity.get("level"),
             "complexity_score": complexity.get("score"),
             "complexity_reasons": complexity.get("reasons") or [],
@@ -3451,7 +4111,6 @@ class MyAgent:
             "source": source,
             "started_at": round(started_at - state.started_at, 3),
             "elapsed_seconds": round(now - started_at, 3),
-            "remaining_seconds": round(max(0.0, state.deadline_at - now), 3),
             "fast_timeout_seconds": round(float(llm_config.get("timeout") or 0), 3),
             "fast_max_tokens": int(llm_config.get("max_tokens") or 0),
             "complexity_level": complexity.get("level"),
@@ -3618,39 +4277,6 @@ class MyAgent:
                 f.write(json.dumps(self._redact(event), ensure_ascii=False, default=str) + "\n")
         except Exception:
             pass
-
-    def _task_graph_timeout_for_complexity(self, complexity: dict[str, Any], llm_config: dict[str, Any]) -> float:
-        runtime = self.config.get("runtime") if isinstance(self.config.get("runtime"), dict) else {}
-        intent_key = "task_graph_timeout_intent_seconds"
-        intent_env = os.getenv("TASK_GRAPH_TIMEOUT_INTENT_SECONDS")
-        if intent_env or runtime.get(intent_key) is not None:
-            try:
-                return max(0.75, float(intent_env or runtime.get(intent_key) or llm_config.get("timeout") or 12.0))
-            except Exception:
-                return 12.0
-        level = str(complexity.get("level") or "normal")
-        key = f"task_graph_timeout_{level}_seconds"
-        default_by_level = {"simple": 2.0, "normal": 3.0, "complex": 8.0}
-        env_timeout = os.getenv(key.upper())
-        try:
-            timeout = float(env_timeout or runtime.get(key) or default_by_level.get(level, 1.0))
-        except Exception:
-            timeout = default_by_level.get(level, 1.0)
-        try:
-            configured = float(llm_config.get("timeout") or timeout)
-        except Exception:
-            configured = timeout
-        target = timeout if env_timeout or runtime.get(key) is not None else configured
-        default_cap = max(default_by_level.get(level, 1.0), timeout, configured)
-        cap_env = os.getenv(f"{key.upper()}_CAP") or os.getenv("TASK_GRAPH_TIMEOUT_CAP_SECONDS")
-        if cap_env:
-            try:
-                cap = max(default_cap, float(cap_env))
-            except Exception:
-                cap = default_cap
-        else:
-            cap = default_cap
-        return max(0.75, min(target, cap))
 
     def _task_graph_complexity(self, baseline: dict[str, Any], obs: dict[str, Any]) -> dict[str, Any]:
         query = self._full_query(obs)
@@ -3888,14 +4514,10 @@ class MyAgent:
         self,
         state: RuntimeState | None,
         profile: str,
-        min_remaining: float = 8.0,
         max_calls: int | None = None,
     ) -> bool:
         if state is None:
             return True
-        remaining = state.deadline_at - time.monotonic()
-        if remaining < min_remaining:
-            return False
         if max_calls is None:
             max_calls = int(self._llm_config(profile).get("max_calls") or 1)
         if profile == "fast":
@@ -3904,17 +4526,10 @@ class MyAgent:
             return state.llm_calls_strong < max_calls
         return True
 
-    def _remaining_llm_timeout(self, state: RuntimeState | None, requested: int | float, reserve: float = 3.0) -> float:
-        try:
-            timeout = float(requested)
-        except Exception:
-            timeout = 10.0
-        if state is None:
-            return max(0.5, timeout)
-        remaining = state.deadline_at - time.monotonic() - reserve
-        if remaining < 0.5:
-            raise TimeoutError("case deadline too close for llm call")
-        return max(0.5, min(timeout, remaining))
+    @staticmethod
+    def _llm_request_timeout(requested: int | float) -> float:
+        _ = requested
+        return 30.0
 
     def _note_llm_call(self, state: RuntimeState | None, profile: str) -> None:
         if state is None:
@@ -3939,7 +4554,7 @@ class MyAgent:
         call_profile = profile or str(llm_config.get("profile") or "strong")
         call_limit = int(llm_config.get("max_calls") or 1)
         if state is not None and not self._can_call_llm(state, call_profile, max_calls=call_limit):
-            raise TimeoutError(f"{call_profile} llm budget exhausted or deadline too close")
+            raise RuntimeError(f"{call_profile} llm call budget exhausted")
         self._note_llm_call(state, call_profile)
         call_started = time.monotonic()
         if state is not None:
@@ -3996,42 +4611,19 @@ class MyAgent:
                 value = json.loads(response.read().decode("utf-8"))
                 return value if isinstance(value, dict) else {}
 
-        def send_with_transient_retry(request_body: dict[str, Any], request_timeout: float) -> dict[str, Any]:
-            max_transport_attempts = max(1, min(2, int(llm_config.get("transport_max_attempts") or 2)))
-            for retry_index in range(max_transport_attempts):
-                try:
-                    value = send_request(request_body, request_timeout)
-                    choices = value.get("choices") if isinstance(value, dict) else []
-                    content = ((choices or [{}])[0].get("message") or {}).get("content") if choices else ""
-                    if not isinstance(content, str) or not content.strip():
-                        raise ValueError("empty_llm_response")
-                    return value
-                except urllib.error.HTTPError:
-                    raise
-                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
-                    if retry_index + 1 >= max_transport_attempts or (state is not None and self._remaining_seconds(state) < 5.0):
-                        raise
-                    self._debug_log(
-                        llm_config,
-                        {
-                            "event": "llm_retry",
-                            "call_id": call_id,
-                            "case_id": state.obs.get("case_id") if state is not None else "",
-                            "profile": call_profile,
-                            "purpose": call_purpose,
-                            "reason": self._llm_error_class(str(exc)),
-                            "attempt": retry_index + 1,
-                        },
-                    )
-                    time.sleep(0.1)
-            raise RuntimeError("unreachable llm retry state")
+        def send_once(request_body: dict[str, Any], request_timeout: float) -> dict[str, Any]:
+            value = send_request(request_body, request_timeout)
+            choices = value.get("choices") if isinstance(value, dict) else []
+            content = ((choices or [{}])[0].get("message") or {}).get("content") if choices else ""
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("empty_llm_response")
+            return value
 
         timeout = 0.0
         payload: dict[str, Any] = {}
         try:
-            configured_timeout = float(llm_config.get("timeout") or 15)
-            timeout_cap = 8.0 if call_profile == "fast" else 10.0
-            timeout = self._remaining_llm_timeout(state, min(configured_timeout, timeout_cap))
+            configured_timeout = float(llm_config.get("timeout") or 30)
+            timeout = self._llm_request_timeout(configured_timeout)
             if state is not None:
                 self._debug_log(
                     llm_config,
@@ -4043,7 +4635,6 @@ class MyAgent:
                         "purpose": call_purpose,
                         "model": llm_config.get("model"),
                         "timeout_seconds": round(timeout, 3),
-                        "remaining_seconds": round(self._remaining_seconds(state), 3),
                         "prompt_chars": int(prompt_chars or 0),
                         "context_chars": int(context_chars or 0),
                         "request_bytes": len(json.dumps(body, ensure_ascii=False).encode("utf-8")),
@@ -4052,7 +4643,7 @@ class MyAgent:
                     },
                 )
             try:
-                payload = send_with_transient_retry(body, timeout)
+                payload = send_once(body, timeout)
             except urllib.error.HTTPError as exc:
                 error_text = ""
                 try:
@@ -4068,9 +4659,11 @@ class MyAgent:
                 if not seed_rejected:
                     setattr(exc, "_agent_error_text", error_text)
                     raise
-                body.pop("seed", None)
+                # A rejected optional seed is still one failed logical HTTP call.
+                # The next model decision can omit seed, but this call is not retried.
                 seed_fallback = True
-                payload = send_with_transient_retry(body, self._remaining_llm_timeout(state, timeout, reserve=2.0))
+                setattr(exc, "_agent_error_text", error_text)
+                raise
         except urllib.error.HTTPError as exc:
             text = str(getattr(exc, "_agent_error_text", "") or "")
             if not text:
@@ -4237,7 +4830,6 @@ class MyAgent:
                 "elapsed_seconds": round(elapsed, 3),
                 "started_at": round(started_at - state.started_at, 3),
                 "end_at": round(now - state.started_at, 3),
-                "remaining_seconds": round(self._remaining_seconds(state), 3),
                 "context_pack_type": context_pack_type,
                 "context_chars": int(context_chars or 0),
                 "prompt_chars": int(prompt_chars or 0),
@@ -4557,18 +5149,11 @@ class MyAgent:
             start = "09:00"
         if not end and "上午" in leave_text:
             end = "11:00" if "后天上午" in leave_text or "请假的草稿" in leave_text else "12:00"
-        leave_type_label = self._target_leave_type_label(leave_text) or self._first_match(
-            leave_text,
-            ["陪产假", "婚假", "丧假", "育儿假", "年休假", "年假", "病假", "事假"],
-        ) or ("事假" if "私事" in leave_text or "个人" in leave_text else "")
-        reason_label = self._first_match(leave_text, ["住院", "孩子", "私事", "个人事情", "个人事务", "本人有事", "身体不适"]) or leave_type_label
         return {
             "day_text": day_text,
             "start": start,
             "end": end,
             "duration_hours": self._extract_duration_hours(leave_text),
-            "leave_type_label": leave_type_label,
-            "reason_label": reason_label,
             **self._extract_approver_hints(leave_text),
         }
 
@@ -4998,10 +5583,7 @@ class MyAgent:
             node_id = str(node.get("id") or "")
             if skill.statuses.get(node_id) in SkillRun.TERMINAL_STATUSES:
                 continue
-            operation = str(node.get("operation") or node.get("phase") or "")
-            if operation in {"compute", "reply"} and skill.statuses.get(node_id) != "running":
-                continue
-            if operation in {"write", "postcheck"} and skill.statuses.get(node_id) != "running":
+            if skill.statuses.get(node_id) != "running":
                 continue
             skill.apply_validation(node_id, self._validate_workflow_skill_node(state, node))
 
@@ -5013,10 +5595,7 @@ class MyAgent:
             node_id = str(node.get("id") or "")
             if skill.statuses.get(node_id) in SkillRun.TERMINAL_STATUSES:
                 continue
-            operation = str(node.get("operation") or node.get("phase") or "")
-            if operation in {"compute", "reply"} and skill.statuses.get(node_id) != "running":
-                continue
-            if operation in {"write", "postcheck"} and skill.statuses.get(node_id) != "running":
+            if skill.statuses.get(node_id) != "running":
                 continue
             skill.apply_validation(node_id, self._validate_meetingroom_skill_node(state, node))
 
@@ -5052,7 +5631,8 @@ class MyAgent:
             catalog = evidence.get("catalog") if isinstance(evidence.get("catalog"), dict) else {}
             if not catalog:
                 return self._skill_validation("pending")
-            expected = self._workflow_id(self._workflow_kind(wf.intent))
+            capability = self._active_task_capability(state, "workflow")
+            expected = self._workflow_id("leave" if "leave" in capability else "expense_material")
             workflows = [item for item in catalog.get("workflows") or [] if isinstance(item, dict)]
             if any(int(item.get("workflow_id") or 0) == expected for item in workflows):
                 return self._skill_validation("passed", evidence_refs=["workflow.catalog"])
@@ -5078,7 +5658,7 @@ class MyAgent:
                 return self._skill_validation("passed", evidence_refs=["workflow.delete"])
             return self._skill_validation("pending")
         if validator == "workflow.leave_form_valid":
-            plan = self._leave_plan(state)
+            plan = evidence.get("leave_plan") if isinstance(evidence.get("leave_plan"), dict) else {}
             if not plan:
                 return self._skill_validation("pending")
             required = ["start_time", "end_time", "leave_type", "reason", "duration"]
@@ -5091,9 +5671,8 @@ class MyAgent:
                 return self._skill_validation("passed", evidence_refs=["user_text:no_attachment_required"])
             if not evidence.get("file_list_attempted"):
                 return self._skill_validation("pending")
-            plan = self._leave_plan(state)
-            attachment = self._select_leave_attachment(state, plan or {})
-            if attachment:
+            files = (evidence.get("file_list") or {}).get("files") or []
+            if files:
                 return self._skill_validation("passed", evidence_refs=["file.list"])
             return self._skill_validation("failed", "leave_attachment_not_found", fingerprint_value=evidence.get("file_list_attempted"))
         if validator == "workflow.approver_search_verified":
@@ -5102,17 +5681,11 @@ class MyAgent:
                 return self._skill_validation("pending")
             if self._collected_approver_people(wf):
                 return self._skill_validation("passed", evidence_refs=["workflow.search_person"])
-            plan = self._leave_plan(state)
-            next_args = self._next_approver_search_args(state, plan, mark_attempt=False) if plan else None
-            if next_args is not None:
-                return self._skill_validation("failed", "empty_approver_result", fingerprint_value=len(attempts))
-            return self._skill_validation("passed", evidence_refs=["workflow.search_person"])
+            return self._skill_validation("failed", "empty_approver_result", fingerprint_value=len(attempts))
         if validator == "workflow.approver_resolved":
-            people = self._deterministic_leave_people(state, self._collected_approver_people(wf))
-            if len(people) == 1 and people[0].get("user_id"):
+            selected = evidence.get("selected_approver") if isinstance(evidence.get("selected_approver"), dict) else {}
+            if selected.get("user_id"):
                 return self._skill_validation("passed", evidence_refs=["workflow.search_person"])
-            if evidence.get("approver_search_attempts") and self._next_approver_search_args(state, self._leave_plan(state) or {}, mark_attempt=False) is None:
-                return self._skill_validation("failed", "ambiguous_approver", fingerprint_value=[p.get("user_id") for p in people])
             return self._skill_validation("pending")
         if validator == "workflow.expense_project_verified":
             project = evidence.get("verified_project") if isinstance(evidence.get("verified_project"), dict) else {}
@@ -5131,6 +5704,13 @@ class MyAgent:
             if selected_id and selected_id in allowed:
                 return self._skill_validation("passed", evidence_refs=["workflow.browser_search:category"])
             return self._skill_validation("failed", "invalid_material_category", fingerprint_value={"selected": selected_id, "allowed": sorted(allowed)})
+        if validator == "workflow.expense_category_candidates":
+            options = (evidence.get("category_options") or {}).get("options") or []
+            return (
+                self._skill_validation("passed", evidence_refs=["workflow.browser_search:category"])
+                if options
+                else self._skill_validation("pending")
+            )
         if validator == "workflow.expense_subclass_verified":
             options = (evidence.get("subclass_options") or {}).get("options") or []
             if not options:
@@ -5160,10 +5740,7 @@ class MyAgent:
             if result.get("draft_saved"):
                 save_args = saved.get("args") if isinstance(saved.get("args"), dict) else {}
                 if self.workflow_registry.kind_for_id(save_args.get("workflow_id")) == "leave":
-                    plans = evidence.get("leave_plans")
-                    if not isinstance(plans, list):
-                        plans = self._leave_plans(state)
-                        evidence["leave_plans"] = plans
+                    plans = evidence.get("leave_plans") if isinstance(evidence.get("leave_plans"), list) else []
                     if len(evidence.get("saved_leave_requests") or []) < max(1, len(plans)):
                         return self._skill_validation("pending")
                 return self._skill_validation("passed", evidence_refs=["workflow.save"])
@@ -5205,10 +5782,6 @@ class MyAgent:
             if selected:
                 return self._skill_validation("passed", evidence_refs=["meetingroom.room.list"])
             if evidence.get("room_candidates"):
-                selected = self._select_room_for_booking(state)
-                if selected:
-                    evidence["pending_selected_room"] = selected
-                    return self._skill_validation("passed", evidence_refs=["meetingroom.room.list"])
                 return self._skill_validation("failed", "no_bookable_room", fingerprint_value=evidence.get("room_candidates"))
             return self._skill_validation("pending")
         if validator == "meeting.booking_created":
@@ -5250,7 +5823,7 @@ class MyAgent:
         if validator == "meeting.participants_read":
             return self._skill_validation("passed", evidence_refs=["meetingroom.booking.participant.list"]) if evidence.get("participants") else self._skill_validation("pending")
         if validator == "meeting.participants_optional":
-            if mr.intent != "participant_add" or not self._participant_duplicate_check_required(state):
+            if self._active_task_capability(state, "meetingroom") != "meeting.participant_add" or not self._participant_duplicate_check_required(state):
                 return self._skill_validation("passed", evidence_refs=["task.slots:no_duplicate_check_required"])
             return self._skill_validation("passed", evidence_refs=["meetingroom.booking.participant.list"]) if evidence.get("participants") else self._skill_validation("pending")
         if validator == "meeting.participants_resolved":
@@ -5345,13 +5918,16 @@ class MyAgent:
             allocated -= 1
 
     def _owner_task_is_runnable(self, state: RuntimeState, task: ReadTask) -> bool:
-        if not task.owner_task_id:
+        if not task.owners:
             return True
-        owner = self._task_runtime(state, task.owner_task_id)
-        if owner is None or owner.status in TaskRuntime.TERMINAL_STATUSES:
-            return False
         by_id = {runtime.task_id: runtime for runtime in state.task_runtimes}
-        return all(by_id.get(task_id) is None or by_id[task_id].status == "completed" for task_id in owner.depends_on)
+        for item in task.owners:
+            owner = by_id.get(str(item.get("task_id") or ""))
+            if owner is None or owner.status in TaskRuntime.TERMINAL_STATUSES:
+                continue
+            if all(by_id.get(task_id) is None or by_id[task_id].status == "completed" for task_id in owner.depends_on):
+                return True
+        return False
 
     def _task_dependencies_completed(
         self,
@@ -5371,17 +5947,26 @@ class MyAgent:
         task_id = state.active_task_ids.get(domain) or ""
         return self._task_runtime(state, task_id) if task_id else None
 
+    def _active_task_capability(self, state: RuntimeState, domain: str) -> str:
+        runtime = self._active_task_runtime(state, domain)
+        if runtime is not None:
+            return runtime.capability
+        domain_state = state.meetingroom if domain == "meetingroom" else state.workflow
+        return str(domain_state.intent or "")
+
     def _activate_task_runtime_view(self, state: RuntimeState, runtime: TaskRuntime) -> DomainState:
         domain_state = state.meetingroom if runtime.domain == "meetingroom" else state.workflow
         previous_id = state.active_task_ids.get(runtime.domain) or ""
         previous = self._task_runtime(state, previous_id) if previous_id else None
         local_keys = self._task_local_evidence_keys(runtime.domain, domain_state.evidence)
         if previous is not None and previous is not runtime:
-            previous.local_evidence = {
-                key: domain_state.evidence[key]
-                for key in local_keys
-                if key in domain_state.evidence
-            }
+            previous.local_evidence.update(
+                {
+                    key: domain_state.evidence[key]
+                    for key in local_keys
+                    if key in domain_state.evidence
+                }
+            )
             for key in local_keys:
                 domain_state.evidence.pop(key, None)
             domain_state.evidence.update(runtime.local_evidence)
@@ -5402,18 +5987,20 @@ class MyAgent:
         return runtime.skill_run if runtime is not None else None
 
     def _task_local_evidence_keys(self, domain: str, evidence: dict[str, Any]) -> set[str]:
-        if domain == "meetingroom":
-            fixed = {
-                "pending_selected_room", "create_done", "created_segments", "cancel_done", "extend_done",
-                "extend_attempted", "participant_results", "participant_index", "confirmed_create",
-                "booking_create_failures", "booking_retry_available",
+        # Runtime evidence belongs to the task that produced it. Cached reads
+        # are re-applied for another owner, so no mutable business evidence has
+        # to leak through DomainState to make read de-duplication work.
+        return set(evidence)
+
+    def _capture_task_runtime_evidence(self, state: RuntimeState, runtime: TaskRuntime) -> None:
+        domain_state = state.meetingroom if runtime.domain == "meetingroom" else state.workflow
+        runtime.local_evidence.update(
+            {
+                key: domain_state.evidence[key]
+                for key in self._task_local_evidence_keys(runtime.domain, domain_state.evidence)
+                if key in domain_state.evidence
             }
-            return fixed | {key for key in evidence if key.startswith("participant_user_")}
-        return {
-            "workflow_skill_draft_ir", "save_done", "saved_leave_requests", "oa_checked",
-            "replacement_delete_done", "replacement_source_lookup", "leave_plans",
-            "selected_attachment", "leave_attachment_directory",
-        }
+        )
 
     def _next_runnable_task(self, state: RuntimeState, domain: str) -> TaskRuntime | None:
         by_id = {runtime.task_id: runtime for runtime in state.task_runtimes}
@@ -5448,14 +6035,16 @@ class MyAgent:
             if runtime.status not in TaskRuntime.TERMINAL_STATUSES or runtime.task_id in recorded:
                 continue
             self._activate_task_runtime_view(state, runtime)
-            runtime.local_evidence = {
-                key: (state.meetingroom if runtime.domain == "meetingroom" else state.workflow).evidence[key]
-                for key in self._task_local_evidence_keys(
-                    runtime.domain,
-                    (state.meetingroom if runtime.domain == "meetingroom" else state.workflow).evidence,
-                )
-                if key in (state.meetingroom if runtime.domain == "meetingroom" else state.workflow).evidence
-            }
+            runtime.local_evidence.update(
+                {
+                    key: (state.meetingroom if runtime.domain == "meetingroom" else state.workflow).evidence[key]
+                    for key in self._task_local_evidence_keys(
+                        runtime.domain,
+                        (state.meetingroom if runtime.domain == "meetingroom" else state.workflow).evidence,
+                    )
+                    if key in (state.meetingroom if runtime.domain == "meetingroom" else state.workflow).evidence
+                }
+            )
             runtime.result = self._task_terminal_result(state, runtime)
             state.task_results.append(
                 {
@@ -5471,15 +6060,28 @@ class MyAgent:
     def _task_terminal_result(self, state: RuntimeState, runtime: TaskRuntime) -> dict[str, Any]:
         if runtime.status == "blocked":
             terminal = runtime.skill_run.terminal_result if runtime.skill_run is not None else {}
-            return dict(terminal) if terminal else {"status": "blocked", "reason": runtime.blocked_reason or "execution_incomplete"}
-        evidence = state.meetingroom.evidence if runtime.domain == "meetingroom" else state.workflow.evidence
+            return dict(terminal) if terminal else {
+                "status": "blocked",
+                "reason": runtime.blocked_reason or self._pending_runtime_reason(state, runtime),
+            }
+        evidence = runtime.local_evidence or (
+            state.meetingroom.evidence if runtime.domain == "meetingroom" else state.workflow.evidence
+        )
         capability = runtime.capability
         if capability == "meeting.query_workspace":
             workspace = evidence.get("workspace") or {}
             return {key: value for key, value in {"status": "queried", "office_address": workspace.get("office_address")}.items() if value not in (None, "")}
         if capability == "meeting.query_booking":
-            bookings = (evidence.get("booking_query") or {}).get("bookings") or []
-            return {"status": "queried", "count": len(bookings)}
+            query_result = evidence.get("booking_query") if isinstance(evidence.get("booking_query"), dict) else {}
+            bookings = query_result.get("bookings") or []
+            result = {
+                "status": "queried",
+                "day": runtime.slots.get("day") or self._meeting_day(state),
+                "keyword": runtime.slots.get("keyword") or "",
+                "count": len(bookings),
+                "bookings": bookings,
+            }
+            return {key: value for key, value in result.items() if value not in (None, "")}
         if capability == "meeting.query_room_schedule":
             return {"status": "queried", "room_ids": list((evidence.get("schedules") or {}).keys())}
         if capability == "meeting.participant_list":
@@ -5916,8 +6518,6 @@ class MyAgent:
     def _drain_read_plan(self, state: RuntimeState, llm_config: dict[str, Any]) -> bool:
         if not self._parallel_read_planner_enabled():
             return False
-        if self._remaining_seconds(state) < self._parallel_read_min_remaining_seconds():
-            return False
         if state.steps_used >= state.step_budget:
             return False
         # In multi-turn expense flows, ask for the next missing user slot
@@ -5931,7 +6531,11 @@ class MyAgent:
             return False
         ready_candidates = [
             task
-            for task in plan.ready_tasks(state.read_task_keys_completed, max_batch)
+            for task in plan.ready_tasks(
+                state.read_task_keys_completed,
+                max_batch,
+                state.read_task_owner_keys_completed,
+            )
             if self._read_task_allowed(state, task)
         ]
         ready = self._fair_read_batch(state, ready_candidates, max_batch)
@@ -5945,7 +6549,6 @@ class MyAgent:
                 "case_id": state.obs.get("case_id"),
                 "task_count": len(plan.tasks),
                 "ready_count": len(ready),
-                "remaining_seconds": round(self._remaining_seconds(state), 3),
                 "steps_remaining": max(0, state.step_budget - state.steps_used),
                 "domain_estimates": {
                     domain: self._domain_remaining_step_estimate(state, domain)
@@ -6001,100 +6604,77 @@ class MyAgent:
         return selected
 
     def _domain_remaining_step_estimate(self, state: RuntimeState, domain: str) -> dict[str, int]:
-        reads = 0
-        writes = 0
-        if domain == "workflow" and state.workflow.needed and state.workflow.status in {"pending", "ready", "done"}:
-            self._sync_workflow_skill(state)
-            skill = self._domain_skill_run(state, "workflow")
-            if skill is not None:
-                reads = skill.remaining_cost({"read", "postcheck"})
-                writes = skill.remaining_cost({"write"})
-            else:
-                wf = state.workflow
-                reads += int(not bool(wf.evidence.get("applicant")))
-                reads += int(not bool(wf.evidence.get("catalog")))
-                reads += int(not bool(wf.evidence.get("schema")))
-                writes += int(not bool(wf.evidence.get("save_done")))
-        elif domain == "meetingroom" and state.meetingroom.needed and state.meetingroom.status in {"pending", "ready"}:
-            self._sync_meetingroom_skill(state)
-            skill = self._domain_skill_run(state, "meetingroom")
-            if skill is not None:
-                reads = skill.remaining_cost({"read", "postcheck"})
-                writes = skill.remaining_cost({"write"})
-            else:
-                mr = state.meetingroom
-                if mr.intent in {"query_booking", "cancel_existing", "extend_existing", "cancel_rebook_existing", "rebook_larger_existing"}:
-                    reads += int(not bool(mr.evidence.get("booking_query")))
-                elif mr.intent in {"participant_add", "participant_remove", "participant_list"}:
-                    reads += int(not bool(mr.evidence.get("booking_query")))
-                else:
-                    reads += int("room_candidates" not in mr.evidence)
-                if mr.intent not in {"query_booking", "query", "query_room_schedule", "participant_list"}:
-                    writes += 2 if self._is_rebook_intent(mr.intent) and not mr.evidence.get("cancel_done") else 1
+        runtimes = [
+            runtime
+            for runtime in state.task_runtimes
+            if runtime.domain == domain
+            and runtime.status not in TaskRuntime.TERMINAL_STATUSES
+            and runtime.skill_run is not None
+        ]
+        reads = sum(runtime.skill_run.remaining_cost({"read", "postcheck"}) for runtime in runtimes)
+        writes = sum(runtime.skill_run.remaining_cost({"write"}) for runtime in runtimes)
         return {"reads": reads, "writes": writes, "total": reads + writes}
 
     def _read_plan_step_reserve(self, state: RuntimeState) -> int:
-        if state.task_runtimes:
-            reserve = 0
-            for runtime in state.task_runtimes:
-                if runtime.status in TaskRuntime.TERMINAL_STATUSES or runtime.skill_run is None:
-                    continue
-                reserve += runtime.skill_run.remaining_cost({"write", "postcheck"})
-                if runtime.capability.startswith("workflow.expense"):
-                    self._activate_task_runtime_view(state, runtime)
-                    reserve += self._expense_downstream_read_reserve(state)
-            return reserve
         reserve = 0
-        mr = state.meetingroom
-        if mr.needed and mr.status in {"pending", "ready"}:
-            self._sync_meetingroom_skill(state)
-            skill = self._domain_skill_run(state, "meetingroom")
-            if skill is not None:
-                reserve += skill.remaining_cost({"write", "postcheck"})
-            elif self._is_rebook_intent(mr.intent) and not mr.evidence.get("cancel_done"):
-                reserve += 2
-            elif mr.intent in {"participant_add", "participant_remove"}:
-                participants = mr.slots.get("participants") if isinstance(mr.slots.get("participants"), list) else []
-                completed = len(mr.evidence.get("participant_results") or [])
-                reserve += max(1, len(participants) - completed)
-            elif mr.intent not in {"query_booking", "query", "query_room_schedule", "participant_list"}:
-                segments = mr.slots.get("multi_segments") if isinstance(mr.slots.get("multi_segments"), list) else []
-                created = mr.evidence.get("created_segments") if isinstance(mr.evidence.get("created_segments"), list) else []
-                reserve += max(1, len(segments) - len(created))
-        wf = state.workflow
-        if wf.needed and wf.status in {"pending", "ready"}:
-            self._sync_workflow_skill(state)
-            skill = self._domain_skill_run(state, "workflow")
-            if skill is not None:
-                reserve += skill.remaining_cost({"write", "postcheck"})
-                if wf.intent == "expense_material" and not wf.evidence.get("save_done"):
-                    reserve += self._expense_downstream_read_reserve(state)
-            elif wf.intent in {"leave", "expense_material"} and not wf.evidence.get("save_done"):
-                reserve += 1
-        return reserve
-
-    def _expense_downstream_read_reserve(self, state: RuntimeState) -> int:
-        evidence = state.workflow.evidence
-        reserve = 0
-        if not evidence.get("verified_project"):
-            reserve += 2  # category and dependent subclass
-        elif not evidence.get("selected_material_category"):
-            reserve += 1  # dependent subclass after category selection
-        return reserve
+        for runtime in state.task_runtimes:
+            if runtime.status in TaskRuntime.TERMINAL_STATUSES or runtime.skill_run is None:
+                continue
+            # Reserve irreversible writes. Postchecks are best-effort after a
+            # successful write and must not starve evidence reads needed to
+            # reach that write within the simulator's step budget.
+            reserve += runtime.skill_run.remaining_cost({"write"})
+        return max(0, reserve)
 
     def _build_read_plan(self, state: RuntimeState) -> ReadPlan:
         tasks: list[ReadTask] = []
         previous_active = dict(state.active_task_ids)
-        for runtime in state.task_runtimes:
-            if runtime.status in TaskRuntime.TERMINAL_STATUSES or runtime.skill_run is None:
-                continue
-            if not self._task_dependencies_completed(state, runtime, writes_only=False):
-                continue
-            self._activate_task_runtime_view(state, runtime)
-            if runtime.domain == "workflow":
-                self._append_workflow_read_tasks(state, tasks)
-            elif runtime.domain == "meetingroom":
-                self._append_meetingroom_read_tasks(state, tasks)
+        transition_limit = max(1, sum(len(run.nodes) for run in state.skill_runs.values()))
+        for _ in range(transition_limit):
+            declarative_progress = False
+            for runtime in state.task_runtimes:
+                if runtime.status in TaskRuntime.TERMINAL_STATUSES or runtime.skill_run is None:
+                    continue
+                if not self._task_dependencies_completed(state, runtime, writes_only=False):
+                    continue
+                self._activate_task_runtime_view(state, runtime)
+                for node in runtime.skill_run.ready_nodes({"read", "postcheck"}):
+                    handler = self.node_args_handlers.get(str(node.get("args_handler") or ""))
+                    if handler is None:
+                        runtime.skill_run.mark_blocked("missing_args_handler", str(node.get("id") or ""))
+                        continue
+                    directive = handler(state, runtime, node)
+                    node_id = str(node.get("id") or "")
+                    if directive.status in {"passed", "failed", "skipped"}:
+                        validation = self._skill_validation(
+                            "passed" if directive.status in {"passed", "skipped"} else "failed",
+                            directive.reason,
+                            directive.evidence_refs,
+                            fingerprint_value={"task_id": runtime.task_id, "node_id": node_id},
+                        )
+                        transition = runtime.skill_run.apply_validation(node_id, validation)
+                        declarative_progress = declarative_progress or transition.get("status") in {"completed", "skipped", "retry"}
+                        continue
+                    for action in directive.actions:
+                        if not isinstance(action, StepAction) or action.kind != "tool" or action.tool not in READ_TOOLS:
+                            continue
+                        options = action.read_options if isinstance(action.read_options, dict) else {}
+                        self._append_read_task(
+                            state,
+                            tasks,
+                            action.tool,
+                            action.args,
+                            runtime.domain,
+                            parallel_eligible=bool(options.get("parallel_eligible", True)),
+                            group_key=str(options.get("group_key") or ""),
+                            stop_group_on_success=bool(options.get("stop_group_on_success")),
+                            mapping_score=float(options.get("mapping_score") or 0.0),
+                            owner_task_id=runtime.task_id,
+                            owner_node_id=node_id,
+                            owner_metadata=options.get("owner_metadata") if isinstance(options.get("owner_metadata"), dict) else {},
+                        )
+            if tasks or not declarative_progress:
+                break
         for domain, task_id in previous_active.items():
             previous = self._task_runtime(state, task_id)
             if previous is not None:
@@ -6110,24 +6690,25 @@ class MyAgent:
         domain: str,
         depends_on: list[str] | None = None,
         evidence_handler: str = "apply_tool_result",
-        deadline_min_remaining: float | None = None,
         parallel_eligible: bool = True,
         group_key: str = "",
         stop_group_on_success: bool = False,
         mapping_score: float = 0.0,
         owner_task_id: str = "",
         owner_node_id: str = "",
+        owner_metadata: dict[str, Any] | None = None,
     ) -> None:
         clean_args = self._clean_args(args or {})
         task_key = self._read_task_key(tool, clean_args)
-        if not task_key or task_key in state.read_task_keys_completed or task_key in state.read_task_keys_attempted:
+        if not task_key:
             return
         if group_key and group_key in state.read_task_groups_succeeded:
             return
-        if any(existing.task_key == task_key for existing in tasks):
-            return
         resolved_owner_id = owner_task_id or state.active_task_ids.get(domain, "")
         resolved_node_id = owner_node_id or self._ready_skill_node_id(state, domain, tool)
+        owner_key = self._read_task_owner_key(task_key, resolved_owner_id, resolved_node_id)
+        if owner_key in state.read_task_owner_keys_completed:
+            return
         owner = self._task_runtime(state, resolved_owner_id) if resolved_owner_id else None
         if owner is not None:
             capability = self.capability_registry.spec(owner.capability)
@@ -6136,6 +6717,10 @@ class MyAgent:
                 allowed_tools.add(str(capability.get("post_check")))
             if tool not in allowed_tools or not resolved_node_id:
                 return
+        existing = next((item for item in tasks if item.task_key == task_key), None)
+        if existing is not None:
+            existing.add_owner(resolved_owner_id, resolved_node_id, domain, owner_metadata)
+            return
         tasks.append(
             ReadTask(
                 task_key=task_key,
@@ -6144,15 +6729,20 @@ class MyAgent:
                 domain=domain,
                 depends_on=depends_on or [],
                 evidence_handler=evidence_handler,
-                deadline_min_remaining=deadline_min_remaining
-                if deadline_min_remaining is not None
-                else self._parallel_read_min_remaining_seconds(),
                 parallel_eligible=parallel_eligible,
                 group_key=group_key,
                 stop_group_on_success=stop_group_on_success,
                 mapping_score=mapping_score,
                 owner_task_id=resolved_owner_id,
                 owner_node_id=resolved_node_id,
+                owners=[
+                    {
+                        "task_id": resolved_owner_id,
+                        "node_id": resolved_node_id,
+                        "domain": domain,
+                        "metadata": dict(owner_metadata or {}),
+                    }
+                ],
             )
         )
 
@@ -6165,66 +6755,6 @@ class MyAgent:
             if tool in tools:
                 return str(node.get("id") or "")
         return ""
-
-    def _append_workflow_read_tasks(self, state: RuntimeState, tasks: list[ReadTask]) -> None:
-        wf = state.workflow
-        if not wf.needed or wf.status not in {"pending", "ready"}:
-            return
-        if wf.intent not in {"leave", "expense_material"}:
-            return
-        self._sync_workflow_skill(state)
-        skill = self._domain_skill_run(state, "workflow")
-
-        def ready(node_id: str) -> bool:
-            return skill is None or skill.is_ready(node_id)
-
-        workflow_kind = self._workflow_kind(wf.intent)
-        workflow_id = self._workflow_id(workflow_kind)
-        catalog_keyword = self.workflow_registry.catalog_keyword(workflow_kind)
-        if not wf.evidence.get("applicant") and ready("applicant"):
-            self._append_read_task(state, tasks, "user.get_info", {}, "workflow")
-        if not wf.evidence.get("catalog") and ready("catalog"):
-            self._append_read_task(state, tasks, "workflow.catalog", {"keyword": catalog_keyword}, "workflow")
-        if not wf.evidence.get("schema") and ready("schema"):
-            self._append_read_task(state, tasks, "workflow.schema", {"workflow_id": workflow_id}, "workflow")
-
-        if wf.intent == "leave":
-            if ready("source_lookup") and not wf.evidence.get("replacement_source_lookup"):
-                self._append_read_task(
-                    state,
-                    tasks,
-                    "oa.done.list",
-                    {"keyword": self.workflow_registry.oa_keyword("leave")},
-                    "workflow",
-                    deadline_min_remaining=5.0,
-                )
-            plan = self._leave_plan(state)
-            if plan and not self._collected_approver_people(wf) and ready("approver_search"):
-                args = self._next_approver_search_args(state, plan, mark_attempt=False)
-                if args is not None:
-                    self._append_read_task(state, tasks, "workflow.search_person", args, "workflow")
-        elif wf.intent == "expense_material":
-            expense = self._expense_slots(state)
-            if ready("project") and not wf.evidence.get("verified_project") and not wf.evidence.get("project_candidates"):
-                if not self._append_project_empty_retry_tasks(state, tasks, expense):
-                    self._append_project_search_fanout_tasks(state, tasks, expense)
-            if ready("category") and wf.evidence.get("verified_project") and not wf.evidence.get("category_options"):
-                field_id = self._expense_category_field_id(state)
-                if field_id:
-                    self._append_read_task(
-                        state,
-                        tasks,
-                        "workflow.browser_search",
-                        {"workflow_id": self._workflow_id("expense_material"), "field_id": field_id},
-                        "workflow",
-                    )
-            if ready("subclass"):
-                self._append_expense_subclass_read_task(state, tasks)
-
-        if self._workflow_needs_oa_check(state) and self._remaining_seconds(state) > 6.0:
-            action = self._plan_oa_postcheck_action(state, self._oa_keyword_for_workflow(state))
-            if action is not None and action.kind == "tool":
-                self._append_read_task(state, tasks, action.tool, action.args, "workflow", deadline_min_remaining=5.0)
 
     def _append_project_search_fanout_tasks(self, state: RuntimeState, tasks: list[ReadTask], expense: dict[str, Any]) -> bool:
         args = self._next_project_search_args(state, expense, allow_llm=False)
@@ -6544,7 +7074,7 @@ class MyAgent:
 
     def _append_expense_subclass_read_task(self, state: RuntimeState, tasks: list[ReadTask]) -> None:
         wf = state.workflow
-        if wf.intent != "expense_material" or wf.evidence.get("subclass_options"):
+        if wf.evidence.get("subclass_options"):
             return
         projects = [wf.evidence["verified_project"]] if wf.evidence.get("verified_project") else (wf.evidence.get("project", {}).get("projects") or [])
         if len(projects) != 1:
@@ -6597,7 +7127,7 @@ class MyAgent:
         if remaining_steps <= 3:
             return False
         llm_config = self._llm_config("strong")
-        if not llm_config.get("api_key") or not self._can_call_llm(state, "strong", min_remaining=14.0):
+        if not llm_config.get("api_key") or not self._can_call_llm(state, "strong"):
             return False
         scored_variants = self._project_empty_mapping_variants(state, expense)
         wf.evidence["empty_project_mapping_done"] = True
@@ -6807,7 +7337,7 @@ class MyAgent:
         if cache_key in expense:
             return list(expense.get(cache_key) or [])
         llm_config = self._llm_config("strong")
-        if not llm_config.get("api_key") or not self._can_call_llm(state, "strong", min_remaining=14.0):
+        if not llm_config.get("api_key") or not self._can_call_llm(state, "strong"):
             expense[cache_key] = []
             return []
         history = state.workflow.evidence.get("project_search_history") or []
@@ -6925,93 +7455,6 @@ class MyAgent:
             return False
         return self._valid_project_search_candidate(candidate, allow_short=True)
 
-    def _append_meetingroom_read_tasks(self, state: RuntimeState, tasks: list[ReadTask]) -> None:
-        mr = state.meetingroom
-        if not mr.needed or mr.status not in {"pending", "ready"}:
-            return
-        if mr.intent == "unknown":
-            return
-        if mr.intent == "query_workspace":
-            if "workspace" not in mr.evidence:
-                self._append_read_task(state, tasks, "user.get_workspace", {}, "meetingroom")
-            return
-        if mr.slots.get("needs_workspace") and "workspace" not in mr.evidence:
-            self._append_read_task(state, tasks, "user.get_workspace", {}, "meetingroom")
-            if not (mr.slots.get("office_candidates") or mr.slots.get("office_address_candidates")):
-                return
-        if mr.intent in {"query_booking", "query"} and "booking_query" not in mr.evidence:
-            args: dict[str, Any] = {}
-            day = self._meeting_day(state)
-            if day:
-                args["day"] = day
-            if mr.slots.get("keyword"):
-                args["keyword"] = mr.slots["keyword"]
-            self._append_read_task(state, tasks, "meetingroom.booking.list", args, "meetingroom")
-            return
-        if mr.intent in {"cancel_existing", "extend_existing", "rebook_larger_existing", "cancel_rebook_existing", "cancel", "extend", "rebook_larger", "cancel_rebook"}:
-            if "selected_booking" not in mr.evidence:
-                args = self._next_booking_list_args(state)
-                if args is not None:
-                    self._append_read_task(state, tasks, "meetingroom.booking.list", args, "meetingroom")
-            selected_booking = mr.evidence.get("selected_booking") if isinstance(mr.evidence.get("selected_booking"), dict) else {}
-            if selected_booking and self._requires_room_occupancy_read(state) and not mr.evidence.get("room_occupancy"):
-                day = str(selected_booking.get("day") or self._meeting_day(state) or "")
-                room_id = str(selected_booking.get("room_id") or "")
-                if day and room_id:
-                    self._append_read_task(
-                        state,
-                        tasks,
-                        "meetingroom.room.bookings",
-                        {"day": day, "room_id": room_id},
-                        "meetingroom",
-                    )
-            if self._is_rebook_intent(mr.intent) or self._is_rebook_larger_intent(mr.intent):
-                self._append_room_list_read_tasks(state, tasks)
-            return
-        if mr.intent.startswith("participant_"):
-            order_id = self._extract_order_id(self._full_query(state.obs)) or mr.slots.get("order_id")
-            if not order_id and not mr.evidence.get("selected_booking"):
-                args = self._next_participant_booking_list_args(state)
-                if args is not None:
-                    self._append_read_task(state, tasks, "meetingroom.booking.list", args, "meetingroom")
-                return
-            if not order_id:
-                order_id = (mr.evidence.get("selected_booking") or {}).get("order_id")
-            if mr.intent == "participant_list" and "participants" not in mr.evidence and order_id:
-                self._append_read_task(
-                    state,
-                    tasks,
-                    "meetingroom.booking.participant.list",
-                    {"order_id": order_id},
-                    "meetingroom",
-                )
-            elif mr.intent in {"participant_add", "participant_remove"}:
-                index = int(mr.evidence.get("participant_index") or 0)
-                people = mr.slots.get("participants") if isinstance(mr.slots.get("participants"), list) else []
-                person = people[index] if index < len(people) and isinstance(people[index], dict) else {}
-                if (
-                    order_id
-                    and mr.intent == "participant_add"
-                    and "participants" not in mr.evidence
-                    and self._participant_duplicate_check_required(state)
-                ):
-                    self._append_read_task(
-                        state,
-                        tasks,
-                        "meetingroom.booking.participant.list",
-                        {"order_id": order_id},
-                        "meetingroom",
-                    )
-                if person and not person.get("user_id") and not mr.evidence.get(f"participant_user_{index}"):
-                    keyword = self._participant_lookup_keyword(person)
-                    if keyword:
-                        self._append_read_task(state, tasks, "user.get_info", {"keyword": keyword}, "meetingroom")
-            return
-        if self._explicit_schedule_then_book(state) or mr.intent in {"book_by_schedule_analysis", "query_room_schedule", "schedule_book"}:
-            self._append_schedule_read_tasks(state, tasks)
-            return
-        self._append_room_list_read_tasks(state, tasks)
-
     def _append_room_list_read_tasks(self, state: RuntimeState, tasks: list[ReadTask]) -> None:
         mr = state.meetingroom
         before_count = len(tasks)
@@ -7081,6 +7524,10 @@ class MyAgent:
             return ""
         return tool + ":" + json.dumps(self._clean_args(args or {}), ensure_ascii=False, sort_keys=True)
 
+    @staticmethod
+    def _read_task_owner_key(task_key: str, task_id: str, node_id: str) -> str:
+        return f"{task_key}|{task_id or ''}|{node_id or ''}"
+
     def _read_task_allowed(self, state: RuntimeState, task: ReadTask) -> bool:
         if task.tool not in READ_TOOLS or task.tool not in state.tools:
             return False
@@ -7088,13 +7535,19 @@ class MyAgent:
             return False
         if not isinstance(self.tool_registry, EffectiveToolRegistry) and not self.tool_registry.is_read(task.tool):
             return False
-        if task.task_key in state.read_task_keys_completed or task.task_key in state.read_task_keys_attempted:
+        owner_keys = {
+            self._read_task_owner_key(
+                task.task_key,
+                str(item.get("task_id") or ""),
+                str(item.get("node_id") or ""),
+            )
+            for item in task.owners
+        }
+        if owner_keys and owner_keys.issubset(state.read_task_owner_keys_completed):
             return False
         if task.group_key and task.group_key in state.read_task_groups_succeeded:
             return False
         if state.steps_used >= state.step_budget:
-            return False
-        if self._remaining_seconds(state) < task.deadline_min_remaining:
             return False
         if any(dep and dep not in state.read_task_keys_completed for dep in task.depends_on):
             return False
@@ -7122,6 +7575,8 @@ class MyAgent:
             "mapping_score": round(task.mapping_score, 3),
             "owner_task_id": task.owner_task_id,
             "owner_node_id": task.owner_node_id,
+            "owners": list(task.owners),
+            "attempt": int(state_attempt) if (state_attempt := getattr(task, "attempt", 0)) else 0,
         }
 
     def _execute_read_plan(self, state: RuntimeState, plan: ReadPlan, llm_config: dict[str, Any]) -> int:
@@ -7197,22 +7652,51 @@ class MyAgent:
                 owner.skill_run.mark_running(task.owner_node_id)
         cache_key = self._cache_key(task.tool, self._clean_args(task.args))
         cached = bool(cache_key and cache_key in state.cache)
+        previous_attempts = int(state.read_task_attempt_counts.get(task.task_key) or 0)
+        attempt = previous_attempts or 1 if cached else previous_attempts + 1
+        state.read_task_attempt_counts[task.task_key] = max(previous_attempts, attempt)
         state.read_task_keys_attempted.add(task.task_key)
         state.read_tasks_total += 1
+        if not cached and attempt > 1:
+            state.read_tasks_retried += 1
         if task.parallel_eligible:
             state.read_tasks_parallel_eligible += 1
         if cached:
             state.read_tasks_cached += 1
-        self._execute(state, StepAction("tool", task.tool, task.args), llm_config)
-        group_success = self._read_task_group_success(state, task)
+        context = ToolExecutionContext(
+            owner_task_id=task.owner_task_id,
+            owner_node_id=task.owner_node_id,
+            domain=task.domain,
+            attempt=attempt,
+            metadata=dict((task.owners[0] if task.owners else {}).get("metadata") or {}),
+        )
+        outcome = self._execute(state, StepAction("tool", task.tool, task.args), llm_config, context)
+        state.read_task_outcomes[task.task_key] = outcome
+        if outcome.success:
+            state.read_task_keys_completed.add(task.task_key)
+            for item in task.owners:
+                state.read_task_owner_keys_completed.add(
+                    self._read_task_owner_key(
+                        task.task_key,
+                        str(item.get("task_id") or ""),
+                        str(item.get("node_id") or ""),
+                    )
+                )
+        else:
+            state.read_tasks_failed += 1
+            self._ensure_primary_read_failure_recorded(state, task, outcome, context)
+        self._fan_out_read_outcome(state, task, outcome, context)
+        group_success = outcome.success and self._read_task_group_success(state, task)
         if task.group_key and task.stop_group_on_success and group_success:
             state.read_task_groups_succeeded.add(task.group_key)
         elapsed = max(0.0, time.monotonic() - started)
         state.read_elapsed_seconds += elapsed
-        state.read_task_keys_completed.add(task.task_key)
         if owner is not None and owner.status == "reading":
+            self._activate_task_runtime_view(state, owner)
             owner.slots = (state.meetingroom if owner.domain == "meetingroom" else state.workflow).slots
             owner.status = "pending"
+        if not outcome.success and self._read_failure_retry_exhausted(state, task):
+            state.read_retry_exhausted += 1
         self._debug_log(
             llm_config,
             {
@@ -7223,17 +7707,83 @@ class MyAgent:
                 "args": task.args,
                 "domain": task.domain,
                 "cached": cached,
-                "success": True,
+                "success": outcome.success,
+                "error_class": outcome.error_class,
+                "attempt": attempt,
                 "group_key": task.group_key,
                 "group_success": group_success,
                 "mapping_score": round(task.mapping_score, 3),
                 "owner_task_id": task.owner_task_id,
                 "owner_node_id": task.owner_node_id,
+                "owners": list(task.owners),
                 "elapsed_seconds": round(elapsed, 3),
                 "steps_used": state.steps_used,
-                "remaining_seconds": round(self._remaining_seconds(state), 3),
             },
         )
+
+    def _ensure_primary_read_failure_recorded(
+        self,
+        state: RuntimeState,
+        task: ReadTask,
+        outcome: ToolExecutionOutcome,
+        context: ToolExecutionContext,
+    ) -> None:
+        owner = self._task_runtime(state, context.owner_task_id) if context.owner_task_id else None
+        skill = owner.skill_run if owner is not None else None
+        if skill is None or not context.owner_node_id:
+            return
+        fingerprint = self._skill_invocation_fingerprint(task.tool, task.args)
+        if not skill.invocation_status(context.owner_node_id, fingerprint):
+            self._record_skill_tool_outcome(state, task.tool, task.args, outcome.result, context)
+
+    def _read_failure_retry_exhausted(self, state: RuntimeState, task: ReadTask) -> bool:
+        owners = [
+            self._task_runtime(state, str(item.get("task_id") or ""))
+            for item in task.owners
+            if item.get("task_id")
+        ]
+        return bool(owners) and all(
+            owner is None
+            or owner.status in TaskRuntime.TERMINAL_STATUSES
+            or owner.skill_run is None
+            or bool(owner.skill_run.blocked_reason)
+            for owner in owners
+        )
+
+    def _fan_out_read_outcome(
+        self,
+        state: RuntimeState,
+        task: ReadTask,
+        outcome: ToolExecutionOutcome,
+        primary_context: ToolExecutionContext,
+    ) -> None:
+        for item in task.owners:
+            task_id = str(item.get("task_id") or "")
+            node_id = str(item.get("node_id") or "")
+            domain = str(item.get("domain") or task.domain or "")
+            owner = self._task_runtime(state, task_id) if task_id else None
+            if owner is None:
+                continue
+            self._activate_task_runtime_view(state, owner)
+            node_result = {
+                "tool": task.tool,
+                "args": dict(task.args),
+                "result": dict(outcome.result),
+                "success": outcome.success,
+            }
+            owner.local_evidence.setdefault("_node_results", {})[node_id] = node_result
+            domain_state = state.meetingroom if domain == "meetingroom" else state.workflow
+            domain_state.evidence.setdefault("_node_results", {})[node_id] = node_result
+            if task_id == primary_context.owner_task_id and node_id == primary_context.owner_node_id:
+                continue
+            extra_context = ToolExecutionContext(
+                owner_task_id=task_id,
+                owner_node_id=node_id,
+                domain=domain,
+                attempt=primary_context.attempt,
+                metadata=dict(item.get("metadata") or {}),
+            )
+            self._apply_tool_result(state, task.tool, task.args, outcome.result, extra_context)
 
     def _read_task_group_success(self, state: RuntimeState, task: ReadTask) -> bool:
         if task.tool == "workflow.project_search":
@@ -7254,593 +7804,17 @@ class MyAgent:
             and state.workflow.status in {"pending", "ready"}
         )
 
-    def _workflow_write_likely_ready(self, state: RuntimeState) -> bool:
-        wf = state.workflow
-        self._sync_workflow_skill(state)
-        skill = self._domain_skill_run(state, "workflow")
-        if skill is not None:
-            ready = skill.ready_nodes({"compute", "write", "postcheck"})
-            if any(str(node.get("id") or "") in {"draft_ir", "delete_source", "save", "verify"} for node in ready):
-                return True
-        if wf.evidence.get("save_done"):
-            return bool(self._workflow_needs_oa_check(state))
-        if wf.intent == "leave":
-            return bool(wf.evidence.get("applicant") and wf.evidence.get("schema") and self._collected_approver_people(wf))
-        if wf.intent == "expense_material":
-            return bool(
-                wf.evidence.get("applicant")
-                and wf.evidence.get("schema")
-                and wf.evidence.get("verified_project")
-                and wf.evidence.get("category_options")
-                and wf.evidence.get("subclass_options")
-            )
-        return False
-
-    def _meeting_write_likely_ready(self, state: RuntimeState) -> bool:
-        mr = state.meetingroom
-        if mr.intent in {"cancel_existing", "extend_existing", "rebook_larger_existing", "cancel_rebook_existing", "cancel", "extend", "rebook_larger", "cancel_rebook"}:
-            if mr.evidence.get("cancel_done") and mr.evidence.get("room_candidates"):
-                return True
-            return bool(mr.evidence.get("selected_booking"))
-        if mr.intent.startswith("participant_"):
-            return bool(mr.evidence.get("selected_booking") or mr.slots.get("order_id"))
-        if mr.intent in {"query_booking", "query", "query_room_schedule"}:
-            return False
-        return bool((mr.evidence.get("room_candidates") or {}).get("rooms") and mr.slots.get("start") and mr.slots.get("end"))
-
-    def _task_write_likely_ready(self, state: RuntimeState, runtime: TaskRuntime) -> bool:
-        if runtime.domain == "workflow":
-            return self._workflow_write_likely_ready(state)
-        if runtime.domain == "meetingroom":
-            return self._meeting_write_likely_ready(state)
-        return False
-
-    def _plan_booking_skill_action(self, state: RuntimeState) -> StepAction | None:
-        mr = state.meetingroom
-        slots = mr.slots
-        if state.obs.get("mode") == "multi_turn":
-            ask = self._meeting_missing_slot(state)
-            if ask:
-                return ask
-        if slots.get("needs_workspace") and "workspace" not in mr.evidence:
-            return StepAction("tool", "user.get_workspace", {})
-        if self._multi_day_intersection_needed(state):
-            for day in self._schedule_required_days(state):
-                if day not in mr.evidence.get("room_lists_by_day", {}):
-                    args = self._room_list_args(state, day=day)
-                    if args is None:
-                        return self._block_meetingroom(state, "missing_required_info")
-                    return StepAction("tool", "meetingroom.room.list", args)
-            selected = self._select_room_from_multi_day_lists(state)
-            if selected is None:
-                return self._block_meetingroom(state, "no_bookable_room")
-            mr.evidence["pending_selected_room"] = selected
-        if "room_candidates" not in mr.evidence:
-            args = self._next_room_list_args(state)
-            if args is None:
-                return self._block_meetingroom(state, "missing_required_info")
-            return StepAction("tool", "meetingroom.room.list", args)
-        if str(slots.get("fallback_policy") or "") == "block_if_unavailable" and not (slots.get("day_text") and slots.get("start") and slots.get("end")):
-            return self._block_meetingroom(state, "no_bookable_room")
-        selected = self._select_room_for_booking(state)
-        if selected is None:
-            next_office = self._advance_room_candidate(state)
-            if next_office is not None:
-                mr.evidence.pop("room_candidates", None)
-                mr.evidence.pop("pending_selected_room", None)
-                return StepAction("tool", "meetingroom.room.list", next_office)
-            return self._block_meetingroom(state, "no_bookable_room")
-        if state.obs.get("mode") == "multi_turn" and not mr.evidence.get("confirmed_create"):
-            return self._ask_confirmation(state, selected)
-        next_segment = self._next_segment_to_create(mr)
-        if next_segment:
-            if next_segment.get("day"):
-                slots["day"] = next_segment["day"]
-            slots["start"] = next_segment["start"]
-            slots["end"] = next_segment["end"]
-            slots["title"] = next_segment["title"]
-            return StepAction("tool", "meetingroom.booking.create", self._booking_create_args(state, selected))
-        if mr.evidence.get("create_done"):
-            return None
-        return StepAction("tool", "meetingroom.booking.create", self._booking_create_args(state, selected))
-
-    def _plan_schedule_skill_action(self, state: RuntimeState) -> StepAction | None:
-        mr = state.meetingroom
-        slots = mr.slots
-        schedules = mr.evidence.setdefault("schedules", {})
-        room_ids = slots.get("room_ids") or []
-        if mr.intent == "query_room_schedule":
-            if not room_ids:
-                return self._block_meetingroom(state, "missing_required_info")
-            for room_id in room_ids:
-                if room_id not in schedules:
-                    start_date, end_date = self._schedule_range(state)
-                    return StepAction(
-                        "tool",
-                        "meetingroom.room.schedule",
-                        {"room_id": room_id, "start_date": start_date, "end_date": end_date},
-                    )
-            start_date, end_date = self._schedule_range(state)
-            mr.status = "done"
-            mr.result = {
-                "status": "queried",
-                "room_id": room_ids[0] if len(room_ids) == 1 else None,
-                "room_ids": room_ids if len(room_ids) > 1 else None,
-                "start_date": start_date,
-                "end_date": end_date,
-            }
-            mr.result = {key: value for key, value in mr.result.items() if value is not None}
-            return None
-        if room_ids and self._explicit_schedule_then_book(state):
-            for room_id in room_ids:
-                if room_id not in schedules:
-                    start_date, end_date = self._schedule_range(state)
-                    return StepAction("tool", "meetingroom.room.schedule", {"room_id": room_id, "start_date": start_date, "end_date": end_date})
-            selected = self._select_named_room_from_schedules(state)
-            if selected:
-                mr.evidence["pending_selected_room"] = selected
-                return StepAction("tool", "meetingroom.booking.create", self._booking_create_args(state, selected))
-            return self._block_meetingroom(state, "no_bookable_room")
-        if slots.get("needs_workspace") and "workspace" not in mr.evidence:
-            return StepAction("tool", "user.get_workspace", {})
-        if self._multi_day_intersection_needed(state):
-            for day in self._schedule_required_days(state):
-                if day not in mr.evidence.get("room_lists_by_day", {}):
-                    args = self._room_list_args(state, day=day)
-                    if args is None:
-                        return self._block_meetingroom(state, "missing_required_info")
-                    return StepAction("tool", "meetingroom.room.list", args)
-            selected = self._select_room_from_multi_day_lists(state)
-            if selected:
-                mr.evidence["pending_selected_room"] = selected
-                return StepAction("tool", "meetingroom.booking.create", self._booking_create_args(state, selected))
-            return self._block_meetingroom(state, "no_bookable_room")
-        if not room_ids and "room_candidates" not in mr.evidence:
-            args = self._next_room_list_args(state)
-            if args is None:
-                return self._block_meetingroom(state, "missing_required_info")
-            return StepAction("tool", "meetingroom.room.list", args)
-        if not room_ids and mr.evidence.get("room_candidates") and self._schedule_analysis_needed(state):
-            rooms = (mr.evidence.get("room_candidates") or {}).get("rooms") or []
-            if self._requires_full_schedule_analysis(state):
-                for room in rooms:
-                    room_id = room.get("room_id")
-                    if room_id and room_id not in schedules:
-                        start_date, end_date = self._schedule_range(state)
-                        return StepAction(
-                            "tool",
-                            "meetingroom.room.schedule",
-                            {"room_id": room_id, "start_date": start_date, "end_date": end_date},
-                        )
-            selected = self._select_room_from_schedule_analysis(state)
-            if selected:
-                mr.evidence["pending_selected_room"] = selected
-                return StepAction("tool", "meetingroom.booking.create", self._booking_create_args(state, selected))
-            return self._block_meetingroom(state, "no_bookable_room")
-        for room_id in room_ids:
-            if room_id not in schedules:
-                start_date, end_date = self._schedule_range(state)
-                return StepAction("tool", "meetingroom.room.schedule", {"room_id": room_id, "start_date": start_date, "end_date": end_date})
-        if room_ids and self._schedule_analysis_needed(state):
-            selected = self._select_named_room_from_schedules(state)
-            if selected:
-                mr.evidence["pending_selected_room"] = selected
-                return StepAction("tool", "meetingroom.booking.create", self._booking_create_args(state, selected))
-            return self._block_meetingroom(state, "no_bookable_room")
-        if "room_candidates" not in mr.evidence:
-            rooms = []
-            for item in schedules.values():
-                if item.get("room_id"):
-                    rooms.append(
-                        {
-                            "room_id": item.get("room_id"),
-                            "officeId": self._office_id_from_room_id(item.get("room_id")),
-                            "busy_slots": item.get("busy_slots") or [],
-                            "bookable": True,
-                            "capacity": 999,
-                            "hasScreen": True,
-                        }
-                    )
-            mr.evidence["room_candidates"] = {"rooms": rooms, "day": self._meeting_day(state)}
-        return self._plan_booking_skill_action(state)
-
-    def _explicit_schedule_then_book(self, state: RuntimeState) -> bool:
-        query = self._meeting_query(state)
-        return bool(state.meetingroom.slots.get("room_ids")) and any(word in query for word in ["查一下", "查询", "日程", "安排"]) and any(
-            word in query for word in ["订", "预订", "然后"]
-        )
-
-    def _plan_meeting_query_skill_action(self, state: RuntimeState) -> StepAction | None:
-        mr = state.meetingroom
-        if "booking_query" in mr.evidence:
-            bookings = (mr.evidence.get("booking_query") or {}).get("bookings") or []
-            mr.status = "done"
-            mr.result = {"status": "queried", "day": self._meeting_day(state), "count": len(bookings)}
-            keyword = mr.slots.get("keyword")
-            if keyword:
-                mr.result["keyword"] = keyword
-            return None
-        args: dict[str, Any] = {}
-        day = self._meeting_day(state)
-        if day:
-            args["day"] = day
-        if mr.slots.get("keyword"):
-            args["keyword"] = mr.slots["keyword"]
-        return StepAction("tool", "meetingroom.booking.list", args)
-
-    def _plan_existing_booking_skill_action(self, state: RuntimeState) -> StepAction | None:
-        mr = state.meetingroom
-        if state.obs.get("mode") == "multi_turn" and not (self._extract_order_id(self._full_query(state.obs)) or mr.slots.get("order_id")):
-            dialogue = state.obs.get("dialogue_state") if isinstance(state.obs.get("dialogue_state"), dict) else {}
-            if "order_id" in (dialogue.get("missing_slots") or []) and "order_id" not in state.asked_slots:
-                state.asked_slots.add("order_id")
-                return StepAction("reply", message="请提供需要处理的会议订单号。")
-        if "selected_booking" not in mr.evidence:
-            args = self._next_booking_list_args(state)
-            if args is None:
-                return self._block_meetingroom(state, "missing_required_info")
-            return StepAction("tool", "meetingroom.booking.list", args)
-
-        booking = mr.evidence["selected_booking"]
-        # Existing-booking operations must inherit factual values from
-        # booking.list. Natural-language requests often omit the exact time.
-        inherit_keys = ("day", "start") if mr.evidence.get("cancel_done") else ("day", "start", "end")
-        for key in inherit_keys:
-            if booking.get(key):
-                mr.slots[key] = booking.get(key)
-        if booking.get("title"):
-            mr.slots["title"] = self._normalize_meeting_title(booking.get("title"))
-        if self._is_cancel_intent(mr.intent):
-            if self._existing_booking_write_requires_confirmation(state):
-                return self._block_meetingroom(state, "need_confirmation")
-            if mr.evidence.get("cancel_done"):
-                return None
-            return StepAction("tool", "meetingroom.booking.cancel", {"order_id": booking.get("order_id")})
-        if self._is_extend_intent(mr.intent):
-            if self._requires_room_occupancy_read(state) and not mr.evidence.get("room_occupancy"):
-                canonical_args = self._canonical_selected_booking_list_args(state)
-                if canonical_args is not None:
-                    return StepAction("tool", "meetingroom.booking.list", canonical_args)
-                day = str(booking.get("day") or self._meeting_day(state) or "")
-                room_id = str(booking.get("room_id") or "")
-                if day and room_id:
-                    return StepAction("tool", "meetingroom.room.bookings", {"day": day, "room_id": room_id})
-            if mr.evidence.get("extend_attempted"):
-                if mr.evidence.get("extend_done"):
-                    return None
-                return self._block_meetingroom(state, "conflict_after_requested_extension", order_id=booking.get("order_id"))
-            if self._extension_has_known_conflict(state, booking):
-                mr.evidence["extend_attempted"] = True
-                return self._block_meetingroom(state, "conflict_after_requested_extension", order_id=booking.get("order_id"))
-            return StepAction("tool", "meetingroom.booking.extend", {"order_id": booking.get("order_id"), "minutes": mr.slots.get("duration_minutes") or 30})
-        if self._is_rebook_intent(mr.intent):
-            if self._is_cancel_rebook_intent(mr.intent) and not mr.evidence.get("extend_attempted") and "延" in self._full_query(state.obs):
-                if self._extension_has_known_conflict(state, booking):
-                    mr.evidence["extend_attempted"] = True
-                    if booking.get("end"):
-                        mr.slots["end"] = self._add_minutes(str(booking["end"]), int(mr.slots.get("duration_minutes") or 30))
-                else:
-                    return StepAction("tool", "meetingroom.booking.extend", {"order_id": booking.get("order_id"), "minutes": mr.slots.get("duration_minutes") or 30})
-            if self._is_cancel_rebook_intent(mr.intent) and mr.evidence.get("extend_done"):
-                return None
-            if not mr.evidence.get("cancel_done") and self._existing_booking_write_requires_confirmation(state):
-                return self._block_meetingroom(state, "need_confirmation")
-            if not mr.evidence.get("cancel_done"):
-                selected = self._select_room_for_booking(state)
-                if selected is None:
-                    args = self._next_room_list_args(state)
-                    if args is not None:
-                        return StepAction("tool", "meetingroom.room.list", args)
-                    return self._block_meetingroom(state, "no_bookable_room")
-                mr.evidence["pending_selected_room"] = selected
-                if state.step_budget - state.steps_used < 2:
-                    return self._block_meetingroom(state, "insufficient_step_budget")
-                return StepAction("tool", "meetingroom.booking.cancel", {"order_id": booking.get("order_id")})
-            return self._plan_booking_skill_action(state)
-        return self._block_meetingroom(state, "missing_required_info")
-
-    def _plan_participant_skill_action(self, state: RuntimeState) -> StepAction | None:
-        mr = state.meetingroom
-        slots = mr.slots
-        order_id = self._extract_order_id(self._full_query(state.obs)) or slots.get("order_id")
-        if not order_id and "selected_booking" not in mr.evidence:
-            args = self._next_participant_booking_list_args(state)
-            if args is None:
-                return self._block_meetingroom(state, "missing_required_info")
-            return StepAction("tool", "meetingroom.booking.list", args)
-        if not order_id and "selected_booking" in mr.evidence:
-            order_id = mr.evidence["selected_booking"].get("order_id")
-        if not order_id:
-            return self._block_meetingroom(state, "missing_required_info")
-        slots["order_id"] = order_id
-
-        if mr.intent == "participant_list":
-            if mr.evidence.get("participants"):
-                mr.status = "done"
-                participants = mr.evidence.get("participants", {}).get("participants") or []
-                mr.result = {"status": "queried", "order_id": order_id, "participants": participants}
-                return None
-            return StepAction("tool", "meetingroom.booking.participant.list", {"order_id": order_id})
-
-        participants = slots.get("participants") or []
-        if not participants:
-            return self._block_meetingroom(state, "missing_required_info")
-        index = int(mr.evidence.get("participant_index") or 0)
-        if index >= len(participants):
-            if self._post_participant_extend_needed(state):
-                if mr.evidence.get("extend_attempted"):
-                    if mr.evidence.get("extend_done"):
-                        mr.status = "done"
-                        mr.result = {
-                            "status": "extended",
-                            "order_id": order_id,
-                            "end": mr.evidence.get("extend_done", {}).get("end"),
-                        }
-                        return None
-                    return self._block_meetingroom(state, "conflict_after_requested_extension", order_id=order_id)
-                return StepAction(
-                    "tool",
-                    "meetingroom.booking.extend",
-                    {"order_id": order_id, "minutes": slots.get("duration_minutes") or 30},
-                )
-            mr.status = "done"
-            mr.result = {"status": "updated", "order_id": order_id}
-            return None
-        person = participants[index]
-        user_id = person.get("user_id")
-        if not user_id:
-            key = f"participant_user_{index}"
-            users = mr.evidence.get(key, {}).get("users") or []
-            if not users and not mr.evidence.get(f"{key}_name_retry"):
-                keyword = self._participant_lookup_keyword(person)
-                mr.evidence[f"{key}_last_keyword"] = keyword
-                return StepAction("tool", "user.get_info", {"keyword": keyword})
-            if not users:
-                name = str(person.get("name") or "").strip()
-                last_keyword = str(mr.evidence.get(f"{key}_last_keyword") or "")
-                if name and name != last_keyword:
-                    mr.evidence[f"{key}_name_retry"] = True
-                    mr.evidence[f"{key}_last_keyword"] = name
-                    return StepAction("tool", "user.get_info", {"keyword": name})
-            users = mr.evidence[key].get("users") or []
-            if not users:
-                existing_user = self._participant_user_from_selected_booking(mr, person)
-                if existing_user:
-                    user_id = existing_user.get("user_id")
-                elif person.get("employee_no"):
-                    user_id = person.get("employee_no")
-                else:
-                    return self._block_meetingroom(state, "missing_required_info")
-            else:
-                user_id = users[0].get("user_id")
-        if mr.intent == "participant_add" and self._participant_duplicate_check_required(state):
-            if "participants" not in mr.evidence:
-                return StepAction("tool", "meetingroom.booking.participant.list", {"order_id": order_id})
-            if self._participant_already_in_booking(mr, user_id, person):
-                mr.evidence.setdefault("participant_results", []).append(
-                    {
-                        "status": "already_exists",
-                        "order_id": order_id,
-                        "user_id": user_id,
-                        "name": person.get("name") or self._participant_name_from_evidence(mr, user_id),
-                    }
-                )
-                mr.evidence["participant_index"] = index + 1
-                return self._plan_participant_skill_action(state)
-        tool = "meetingroom.booking.participant.add" if mr.intent == "participant_add" else "meetingroom.booking.participant.remove"
-        return StepAction("tool", tool, {"order_id": order_id, "user_id": user_id})
-
-    def _plan_leave_replace_skill_action(self, state: RuntimeState) -> StepAction | None:
-        wf = state.workflow
-        if not wf.evidence.get("applicant"):
-            return StepAction("tool", "user.get_info", {})
-        if not wf.evidence.get("replacement_source_lookup"):
-            return StepAction("tool", "oa.done.list", {"keyword": self.workflow_registry.oa_keyword("leave")})
-        source = self._replacement_leave_source_item(state)
-        if not source:
-            return self._block_workflow(state, "existing_workflow_not_found")
-        if not wf.evidence.get("replacement_delete_done"):
-            return StepAction("tool", "workflow.delete", {"request_id": source.get("request_id")})
-        return None
-
-    def _plan_leave_skill_action(self, state: RuntimeState) -> StepAction | None:
-        wf = state.workflow
-        if not wf.evidence.get("applicant"):
-            return StepAction("tool", "user.get_info", {})
-        if not wf.evidence.get("catalog"):
-            return StepAction("tool", "workflow.catalog", {"keyword": self.workflow_registry.catalog_keyword("leave")})
-        if not wf.evidence.get("schema"):
-            return StepAction("tool", "workflow.schema", {"workflow_id": self._workflow_id("leave")})
-        if state.obs.get("mode") == "multi_turn":
-            ask = self._leave_missing_slot(state)
-            if ask:
-                return ask
-        plan = self._leave_plan(state)
-        if not plan:
-            return self._block_workflow(state, "missing_required_info")
-        attachment_directory = self._leave_attachment_directory(state)
-        if attachment_directory and not wf.evidence.get("file_list_attempted"):
-            wf.evidence["leave_attachment_directory"] = attachment_directory
-            return StepAction("tool", "file.list", {"directory": attachment_directory})
-        people = self._collected_approver_people(wf)
-        if not people:
-            args = self._next_approver_search_args(state, plan)
-            if args is None:
-                return self._block_workflow(state, "ambiguous_approver")
-            return StepAction("tool", "workflow.search_person", args)
-        people = self._select_leave_people(state, people)
-        if len(people) != 1:
-            return self._block_workflow(state, "ambiguous_approver")
-        if wf.evidence.get("save_done"):
-            next_plan = self._next_recurring_leave_plan(state)
-            if next_plan:
-                save_args = self._leave_save_args(state, next_plan, people[0])
-                wf.evidence["workflow_skill_draft_ir"] = {
-                    "workflow_id": self._workflow_id("leave"),
-                    "submit": save_args.get("submit"),
-                    "save_args": save_args,
-                }
-                self._sync_workflow_skill(state)
-                return StepAction("tool", "workflow.save", save_args)
-            return self._plan_oa_postcheck_action(state, self.workflow_registry.oa_keyword("leave"))
-        save_args = self._leave_save_args(state, plan, people[0])
-        wf.evidence["workflow_skill_draft_ir"] = {
-            "workflow_id": self._workflow_id("leave"),
-            "submit": save_args.get("submit"),
-            "save_args": save_args,
-        }
-        self._sync_workflow_skill(state)
-        return StepAction("tool", "workflow.save", save_args)
-
-    def _plan_expense_skill_action(self, state: RuntimeState) -> StepAction | None:
-        wf = state.workflow
-        if state.obs.get("mode") == "multi_turn":
-            ask = self._expense_missing_slot(state)
-            if ask:
-                return ask
-        if not wf.evidence.get("applicant"):
-            return StepAction("tool", "user.get_info", {})
-        if not wf.evidence.get("catalog"):
-            return StepAction("tool", "workflow.catalog", {"keyword": self.workflow_registry.catalog_keyword("expense_material")})
-        if not wf.evidence.get("schema"):
-            return StepAction("tool", "workflow.schema", {"workflow_id": self._workflow_id("expense_material")})
-        category_field_id = self._expense_category_field_id(state)
-        subclass_field_id = self._expense_subclass_field_id(state)
-        if not category_field_id or not subclass_field_id:
-            return self._block_workflow(state, "workflow_schema_lookup_contract_missing")
-        expense = self._expense_slots(state)
-        if not wf.evidence.get("verified_project"):
-            singleton_project = self._verified_singleton_project_candidate(state)
-            if singleton_project and self._can_adopt_singleton_project_candidate(state, expense):
-                wf.evidence["verified_project"] = singleton_project
-                self._transition_project_resolution(
-                    self._project_resolution(state),
-                    "verified_ranked",
-                    query="candidate_registry",
-                    selected_id=self._expense_project_fingerprint(singleton_project),
-                )
-                self._bind_expense_project(state, singleton_project, "singleton_candidate")
-        if not wf.evidence.get("verified_project") and not wf.evidence.get("project"):
-            args = self._next_project_search_args(state, expense)
-            if args is None:
-                args = self._project_search_args_from_llm(state, expense, force=True)
-            if args is None:
-                return self._block_workflow(state, "missing_required_info")
-            return StepAction("tool", "workflow.project_search", args)
-        projects = [wf.evidence["verified_project"]] if wf.evidence.get("verified_project") else (wf.evidence.get("project", {}).get("projects") or [])
-        if not projects:
-            args = self._next_project_search_args(state, expense)
-            if args is None:
-                args = self._project_search_args_from_llm(state, expense, force=True)
-            if args is not None:
-                return StepAction("tool", "workflow.project_search", args)
-        if len(projects) != 1:
-            args = self._disambiguating_project_search_args(state, expense, projects)
-            if args is None:
-                args = self._next_project_search_args(state, expense, allow_llm=not bool(wf.evidence.get("project_candidates")))
-            if args is None and not wf.evidence.get("project_candidates"):
-                args = self._project_search_args_from_llm(state, expense, force=True)
-            if args is not None:
-                return StepAction("tool", "workflow.project_search", args)
-            singleton_project = self._verified_singleton_project_candidate(state)
-            if singleton_project:
-                wf.evidence["verified_project"] = singleton_project
-                self._transition_project_resolution(
-                    self._project_resolution(state),
-                    "verified_ranked",
-                    query="candidate_registry",
-                    selected_id=self._expense_project_fingerprint(singleton_project),
-                )
-                self._bind_expense_project(state, singleton_project, "singleton_candidate")
-                projects = [singleton_project]
-            elif len(projects) != 1:
-                selected_project = self._select_project_candidate_with_llm(state, projects)
-                if selected_project:
-                    projects = [selected_project]
-                    wf.evidence["verified_project"] = selected_project
-                    self._transition_project_resolution(
-                        self._project_resolution(state),
-                        "verified_ranked",
-                        query="candidate_ranker",
-                        selected_id=self._expense_project_fingerprint(selected_project),
-                    )
-                    self._bind_expense_project(state, selected_project, "llm_candidate_selection")
-                else:
-                    return self._block_workflow(state, "ambiguous_project")
-        if len(projects) != 1:
-            return self._block_workflow(state, "ambiguous_project")
-        refine_args = self._project_refine_search_args(state, projects[0])
-        if refine_args is not None:
-            return StepAction("tool", "workflow.project_search", refine_args)
-        if not wf.evidence.get("category_options"):
-            return StepAction("tool", "workflow.browser_search", {"workflow_id": self._workflow_id("expense_material"), "field_id": category_field_id})
-        category = self._select_material_category(state)
-        if not category:
-            return self._block_workflow(state, "ambiguous_material_subclass")
-        if not wf.evidence.get("subclass_options"):
-            project = projects[0]
-            if self._subclass_lookup_failed(state, project, category):
-                # A dependent browser lookup rejects this category for the
-                # current WBS; it is not evidence that the project is wrong.
-                self._reject_expense_category_after_subclass_failure(state, {
-                    "dep": {"wbscode": project.get("wbs_code"), "wzlb": self._expense_category_id(category)}
-                }, "previous_lookup_failure")
-                category = self._select_material_category(state)
-                if not category:
-                    return self._block_workflow(state, "ambiguous_material_subclass")
-            return StepAction(
-                "tool",
-                "workflow.browser_search",
-                {
-                    "workflow_id": self._workflow_id("expense_material"),
-                    "field_id": subclass_field_id,
-                    "dep": {"wbscode": project.get("wbs_code"), "wzlb": category.get("value") or category.get("code")},
-                },
-            )
-        if wf.evidence.get("save_done"):
-            return self._plan_oa_postcheck_action(state, self._oa_keyword_for_workflow(state))
-        save_args_or_reason = self._expense_ir_save_args_or_block(state, projects[0], category)
-        if isinstance(save_args_or_reason, str):
-            return self._block_workflow(state, save_args_or_reason)
-        wf.evidence["workflow_skill_draft_ir"] = {
-            "workflow_id": self._workflow_id("expense_material"),
-            "submit": save_args_or_reason.get("submit"),
-            "total_amount": ((save_args_or_reason.get("data") or {}).get("total_amount")),
-            "save_args": save_args_or_reason,
-        }
-        self._sync_workflow_skill(state)
-        return StepAction("tool", "workflow.save", save_args_or_reason)
-
-    def _plan_oa_postcheck_action(self, state: RuntimeState, keyword: str) -> StepAction | None:
-        wf = state.workflow
-        if wf.evidence.get("oa_checked"):
-            return None
-        if self._remaining_seconds(state) <= 5.0:
-            return None
-        submit = bool(wf.slots.get("submit"))
-        if submit and "oa.done.list" in state.tools and state.steps_used < state.step_budget:
-            return StepAction("tool", "oa.done.list", {"keyword": keyword})
-        if not submit and "oa.todo.list" in state.tools and state.steps_used < state.step_budget:
-            return StepAction("tool", "oa.todo.list", {"keyword": keyword})
-        return None
-
-    def _remaining_seconds(self, state: RuntimeState) -> float:
-        return max(0.0, state.deadline_at - time.monotonic())
-
-    def _oa_keyword_for_workflow(self, state: RuntimeState) -> str:
-        if state.workflow.intent == "expense_material":
-            query = self._full_query(state.obs)
-            if not state.workflow.slots.get("submit") and "待办" in query:
-                return self.workflow_registry.catalog_keyword("expense_material")
-            return self.workflow_registry.oa_keyword("expense_material")
-        return self.workflow_registry.oa_keyword("leave")
-
-    # ------------------------------------------------------------------
-    # Execution and observation updates
-    # ------------------------------------------------------------------
-
-    def _execute(self, state: RuntimeState, action: StepAction, llm_config: dict[str, Any]) -> None:
+    def _execute(
+        self,
+        state: RuntimeState,
+        action: StepAction,
+        llm_config: dict[str, Any],
+        context: ToolExecutionContext | None = None,
+    ) -> ToolExecutionOutcome:
         action_started = time.monotonic()
+        owner = self._task_runtime(state, context.owner_task_id) if context and context.owner_task_id else None
+        if owner is not None and owner.status not in TaskRuntime.TERMINAL_STATUSES:
+            self._activate_task_runtime_view(state, owner)
         if action.kind == "block_meetingroom":
             state.meetingroom.status = "blocked"
             state.meetingroom.blocked_reason = action.args.get("reason", "missing_required_info")
@@ -7854,7 +7828,7 @@ class MyAgent:
             state.last_action_domain = "meetingroom"
             state.history.append(record)
             self._debug_log(llm_config, {"event": "block_meetingroom", **record})
-            return
+            return ToolExecutionOutcome(success=True, result=result)
         if action.kind == "block_workflow":
             state.workflow.status = "blocked"
             state.workflow.blocked_reason = action.args.get("reason", "missing_required_info")
@@ -7865,8 +7839,11 @@ class MyAgent:
             state.last_action_domain = "workflow"
             state.history.append(record)
             self._debug_log(llm_config, {"event": "block_workflow", **record})
-            return
+            return ToolExecutionOutcome(success=True, result=result)
         if action.kind == "reply":
+            if state.steps_used >= state.step_budget:
+                result = {"error": "insufficient_step_budget"}
+                return ToolExecutionOutcome(success=False, result=result, error_class="insufficient_step_budget")
             if not self._reply_available(state, action.message):
                 domain = self._reply_domain(state)
                 target = state.meetingroom if domain == "meetingroom" else state.workflow
@@ -7881,7 +7858,7 @@ class MyAgent:
                 self._annotate_action_record(state, record, action_started, bucket="program")
                 state.history.append(record)
                 self._debug_log(llm_config, {"event": "reply_blocked", **record})
-                return
+                return ToolExecutionOutcome(success=False, result=record["result"], error_class="reply_unavailable")
             state.reply_messages_attempted.add(action.message)
             try:
                 result = self.env.reply(action.message)
@@ -7893,16 +7870,29 @@ class MyAgent:
             state.history.append(record)
             self._apply_reply_result(state, action.message, result)
             self._debug_log(llm_config, {"event": "reply", **record})
-            return
+            return ToolExecutionOutcome(
+                success=isinstance(result, dict) and not result.get("error"),
+                result=result if isinstance(result, dict) else {"value": result},
+                error_class=self._tool_result_error_class(result),
+                step_consumed=True,
+            )
 
         if action.kind != "tool" or action.tool not in state.tools:
             record = {"tool": action.tool, "args": action.args, "result": {"error": "unauthorized_or_invalid_action"}}
             self._annotate_action_record(state, record, action_started, bucket="program")
             state.history.append(record)
             self._debug_log(llm_config, {"event": "invalid_action", **record})
-            return
+            return ToolExecutionOutcome(
+                success=False,
+                result=record["result"],
+                error_class="unauthorized_or_invalid_action",
+            )
+        if state.steps_used >= state.step_budget:
+            result = {"error": "insufficient_step_budget"}
+            return ToolExecutionOutcome(success=False, result=result, error_class="insufficient_step_budget")
         args = self.tool_adapter.adapt(action.tool, self._clean_args(action.args))
-        self._mark_workflow_skill_action_running(state, action.tool)
+        if context is None:
+            self._mark_workflow_skill_action_running(state, action.tool)
         validation = self.tool_registry.validate_call(action.tool, args, state.tools)
         if validation.get("errors") or validation.get("warnings") or validation.get("missing_required"):
             self._debug_log(
@@ -7924,7 +7914,11 @@ class MyAgent:
             self._annotate_action_record(state, record, action_started, bucket="program")
             state.history.append(record)
             self._debug_log(llm_config, {"event": "invalid_action", **record})
-            return
+            return ToolExecutionOutcome(
+                success=False,
+                result=record["result"],
+                error_class="tool_contract_validation_failed",
+            )
         if self.tool_registry.risk(action.tool) == "unknown":
             record = {
                 "tool": action.tool,
@@ -7934,10 +7928,14 @@ class MyAgent:
             self._annotate_action_record(state, record, action_started, bucket="program")
             state.history.append(record)
             self._debug_log(llm_config, {"event": "invalid_action", **record})
-            return
+            return ToolExecutionOutcome(
+                success=False,
+                result=record["result"],
+                error_class="unmapped_runtime_tool_not_executable",
+            )
         preflight_id = None
         if self.tool_registry.is_write(action.tool):
-            action_domain = self._ledger_domain_for_tool(state, action.tool)
+            action_domain = self._ledger_domain_for_tool(state, action.tool, context)
             active_runtime = self._active_task_runtime(state, action_domain)
             if active_runtime is not None and active_runtime.status not in TaskRuntime.TERMINAL_STATUSES:
                 active_runtime.status = "writing"
@@ -7960,35 +7958,41 @@ class MyAgent:
                 record = {"tool": action.tool, "args": args, "result": result, "preflight": preflight}
                 self._annotate_action_record(state, record, action_started, bucket="program")
                 self._mark_domain_blocked_after_preflight(state, action.tool, str(result["reason"]))
-                self._mark_last_action_domain(state, action.tool)
+                self._mark_last_action_domain(state, action.tool, context)
                 state.history.append(record)
                 self._debug_log(llm_config, {"event": "tool_preflight_blocked", **record})
-                return
+                return ToolExecutionOutcome(
+                    success=False,
+                    result=result,
+                    error_class="preflight_failed",
+                )
         cache_key = self._cache_key(action.tool, args)
         if cache_key and cache_key in state.cache:
             result = json.loads(json.dumps(state.cache[cache_key], ensure_ascii=False))
             record = {"tool": action.tool, "args": args, "result": result, "cached": True}
             self._annotate_action_record(state, record, action_started, bucket="cache")
-            self._mark_last_action_domain(state, action.tool)
+            self._mark_last_action_domain(state, action.tool, context)
             state.history.append(record)
-            self._apply_tool_result(state, action.tool, args, result)
+            self._apply_tool_result(state, action.tool, args, result, context)
             state.ledger.record_tool(
                 tool=action.tool,
                 args=args,
                 result=result,
                 kind="read",
-                domain=self._ledger_domain_for_tool(state, action.tool),
+                domain=self._ledger_domain_for_tool(state, action.tool, context),
                 cached=True,
                 preflight_id=preflight_id,
+                owner_task_id=context.owner_task_id if context is not None else "",
+                owner_node_id=context.owner_node_id if context is not None else "",
             )
             self._debug_log(llm_config, {"event": "tool_cache", **record})
-            return
+            return ToolExecutionOutcome(success=True, result=result, cached=True)
         try:
             result = self.env.call_tool(action.tool, args)
         except Exception as exc:
             result = {"error": str(exc)}
         state.steps_used += 1
-        action_domain = self._ledger_domain_for_tool(state, action.tool)
+        action_domain = self._ledger_domain_for_tool(state, action.tool, context)
         if action_domain in state.domain_steps_used:
             state.domain_steps_used[action_domain] += 1
             if action.tool in READ_TOOLS:
@@ -7997,22 +8001,46 @@ class MyAgent:
             state.cache[cache_key] = json.loads(json.dumps(result, ensure_ascii=False))
         record = {"tool": action.tool, "args": args, "result": result}
         self._annotate_action_record(state, record, action_started, bucket="tool")
-        self._mark_last_action_domain(state, action.tool)
+        self._mark_last_action_domain(state, action.tool, context)
         state.history.append(record)
-        self._apply_tool_result(state, action.tool, args, result)
+        self._apply_tool_result(state, action.tool, args, result, context)
         state.ledger.record_tool(
             tool=action.tool,
             args=args,
             result=result if isinstance(result, dict) else {"value": result},
             kind="write" if self.tool_registry.is_write(action.tool) else "read",
-            domain=self._ledger_domain_for_tool(state, action.tool),
+            domain=self._ledger_domain_for_tool(state, action.tool, context),
             cached=False,
             preflight_id=preflight_id,
+            owner_task_id=context.owner_task_id if context is not None else "",
+            owner_node_id=context.owner_node_id if context is not None else "",
         )
         self._debug_log(llm_config, {"event": "tool", **record})
+        return ToolExecutionOutcome(
+            success=isinstance(result, dict) and not result.get("error"),
+            result=result if isinstance(result, dict) else {"value": result},
+            error_class=self._tool_result_error_class(result),
+            step_consumed=True,
+        )
 
-    def _mark_last_action_domain(self, state: RuntimeState, tool: str) -> None:
-        domain = self._ledger_domain_for_tool(state, tool)
+    @staticmethod
+    def _tool_result_error_class(result: Any) -> str:
+        if not isinstance(result, dict) or not result.get("error"):
+            return ""
+        text = str(result.get("error") or "").lower()
+        if "timeout" in text or "timed out" in text:
+            return "timeout"
+        if "contract" in text or "schema" in text:
+            return "contract_error"
+        return "tool_error"
+
+    def _mark_last_action_domain(
+        self,
+        state: RuntimeState,
+        tool: str,
+        context: ToolExecutionContext | None = None,
+    ) -> None:
+        domain = self._ledger_domain_for_tool(state, tool, context)
         if domain in {"meetingroom", "workflow"}:
             state.last_action_domain = domain
 
@@ -8022,7 +8050,6 @@ class MyAgent:
         record["started_at"] = round(started_at - state.started_at, 3)
         record["end_at"] = round(now - state.started_at, 3)
         record["elapsed_seconds"] = round(elapsed, 3)
-        record["remaining_seconds"] = round(self._remaining_seconds(state), 3)
         record["steps_used"] = state.steps_used
         state.action_elapsed_seconds += elapsed
         if bucket == "tool":
@@ -8049,7 +8076,14 @@ class MyAgent:
             state.workflow.blocked_reason = reason
             state.workflow.result = {"status": "blocked", "reason": reason}
 
-    def _ledger_domain_for_tool(self, state: RuntimeState, tool: str) -> str:
+    def _ledger_domain_for_tool(
+        self,
+        state: RuntimeState,
+        tool: str,
+        context: ToolExecutionContext | None = None,
+    ) -> str:
+        if context is not None and context.domain in {"meetingroom", "workflow"}:
+            return context.domain
         if tool.startswith("meetingroom.") or tool == "user.get_workspace":
             return "meetingroom"
         if tool.startswith("workflow.") or tool.startswith("oa."):
@@ -8073,6 +8107,18 @@ class MyAgent:
                 domain = self._reply_domain(state)
                 target = state.meetingroom if domain == "meetingroom" else state.workflow
                 target.evidence.setdefault("unresolved_slots", set()).add(action_slot)
+                runtime = self._active_task_runtime(state, domain)
+                if runtime is not None:
+                    runtime.status = "blocked"
+                    runtime.blocked_reason = "unresolved_user_input"
+                    runtime.result = {
+                        "status": "blocked",
+                        "reason": "unresolved_user_input",
+                        "slot": action_slot,
+                    }
+                    if runtime.skill_run is not None:
+                        runtime.skill_run.mark_blocked("unresolved_user_input")
+                        runtime.skill_run.terminal_result = dict(runtime.result)
             return
         state.asked_slots.add(str(resolved))
         text = user_message
@@ -8174,8 +8220,7 @@ class MyAgent:
     def _reply_available(self, state: RuntimeState, message: str) -> bool:
         return bool(
             state.obs.get("mode") == "multi_turn"
-            and isinstance(state.obs.get("dialogue_state"), dict)
-            and isinstance(state.obs.get("user_simulator"), dict)
+            and callable(getattr(self.env, "reply", None))
             and message not in state.reply_messages_unresolved
         )
 
@@ -8189,28 +8234,61 @@ class MyAgent:
             return "meetingroom"
         return "workflow"
 
-    def _apply_tool_result(self, state: RuntimeState, tool: str, args: dict[str, Any], result: dict[str, Any]) -> None:
-        if tool.startswith("meetingroom.") or tool == "user.get_workspace" or (
-            tool == "user.get_info" and state.meetingroom.intent.startswith("participant_")
-        ):
-            self._apply_meeting_tool_result(state, tool, args, result)
-        if tool.startswith("workflow.") or tool.startswith("oa.") or tool in {"user.get_info", "file.list"}:
+    def _apply_tool_result(
+        self,
+        state: RuntimeState,
+        tool: str,
+        args: dict[str, Any],
+        result: dict[str, Any],
+        context: ToolExecutionContext | None = None,
+    ) -> None:
+        owner_domain = context.domain if context is not None else ""
+        route_meetingroom = owner_domain == "meetingroom" or (
+            not owner_domain
+            and (
+                tool.startswith("meetingroom.")
+                or tool == "user.get_workspace"
+                or (tool == "user.get_info" and state.meetingroom.intent.startswith("participant_"))
+            )
+        )
+        route_workflow = owner_domain == "workflow" or (
+            not owner_domain and (tool.startswith("workflow.") or tool.startswith("oa.") or tool in {"user.get_info", "file.list"})
+        )
+        if route_meetingroom:
+            self._apply_meeting_tool_result(state, tool, args, result, context)
+        if route_workflow:
             self._apply_workflow_tool_result(state, tool, args, result)
         if isinstance(result, dict) and not result.get("error"):
             state.completed_tools.add(tool)
-        self._record_skill_tool_outcome(state, tool, args, result)
-        self._sync_meetingroom_skill(state)
-        self._sync_workflow_skill(state)
+        self._record_skill_tool_outcome(state, tool, args, result, context)
+        if route_meetingroom:
+            self._sync_meetingroom_skill(state)
+        if route_workflow:
+            self._sync_workflow_skill(state)
+        if context is not None and context.owner_task_id:
+            owner = self._task_runtime(state, context.owner_task_id)
+            if owner is not None:
+                self._capture_task_runtime_evidence(state, owner)
 
-    def _record_skill_tool_outcome(self, state: RuntimeState, tool: str, args: dict[str, Any], result: dict[str, Any]) -> None:
+    def _record_skill_tool_outcome(
+        self,
+        state: RuntimeState,
+        tool: str,
+        args: dict[str, Any],
+        result: dict[str, Any],
+        context: ToolExecutionContext | None = None,
+    ) -> None:
         if not isinstance(result, dict):
             return
-        skill = self._domain_skill_run(state, "meetingroom") if tool.startswith("meetingroom.") else self._domain_skill_run(state, "workflow")
-        if tool == "user.get_info":
+        owner = self._task_runtime(state, context.owner_task_id) if context and context.owner_task_id else None
+        skill = owner.skill_run if owner is not None else (
+            self._domain_skill_run(state, "meetingroom") if tool.startswith("meetingroom.") else self._domain_skill_run(state, "workflow")
+        )
+        if tool == "user.get_info" and context is None:
             skill = self._domain_skill_run(state, "meetingroom") if state.meetingroom.intent.startswith("participant_") else self._domain_skill_run(state, "workflow")
         if skill is None:
             return
-        node = next(
+        node = skill.node(context.owner_node_id) if context and context.owner_node_id else next(
             (
                 item
                 for item in skill.nodes
@@ -8263,14 +8341,30 @@ class MyAgent:
             skill.resolve_failure(
                 node_id,
                 reason,
-                fingerprint=self._json_hash({"tool": tool, "args": args, "result": result, "node": node_id}),
+                fingerprint=self._json_hash(
+                    {
+                        "tool": tool,
+                        "args": args,
+                        "result": result,
+                        "node": node_id,
+                        "attempt": context.attempt if context is not None else 0,
+                    }
+                ),
             )
 
     def _skill_invocation_fingerprint(self, tool: str, args: dict[str, Any]) -> str:
         return self._json_hash({"tool": str(tool or ""), "args": self._clean_args(args)})
 
-    def _apply_meeting_tool_result(self, state: RuntimeState, tool: str, args: dict[str, Any], result: dict[str, Any]) -> None:
+    def _apply_meeting_tool_result(
+        self,
+        state: RuntimeState,
+        tool: str,
+        args: dict[str, Any],
+        result: dict[str, Any],
+        context: ToolExecutionContext | None = None,
+    ) -> None:
         mr = state.meetingroom
+        capability = self._active_task_capability(state, "meetingroom")
         if tool == "meetingroom.booking.extend" and result.get("conflict"):
             mr.evidence["extend_attempted"] = True
         if tool == "meetingroom.booking.create" and not result.get("success"):
@@ -8288,8 +8382,11 @@ class MyAgent:
                 mr.evidence.pop("booking_retry_available", None)
         if result.get("error"):
             return
-        if tool == "user.get_info" and mr.intent.startswith("participant_"):
-            index = int(mr.evidence.get("participant_index") or 0)
+        if tool == "user.get_info" and (
+            (context is not None and context.owner_node_id == "resolve_people")
+            or (context is None and mr.intent.startswith("participant_"))
+        ):
+            index = int((context.metadata if context is not None else {}).get("participant_index", mr.evidence.get("participant_index") or 0))
             mr.evidence[f"participant_user_{index}"] = result
         elif tool == "user.get_workspace":
             mr.evidence["workspace"] = result
@@ -8307,7 +8404,7 @@ class MyAgent:
             if tool == "meetingroom.room.bookings":
                 mr.evidence["room_occupancy"] = result
             mr.evidence.setdefault("schedules", {})[args.get("room_id")] = result
-            if mr.intent != "query_room_schedule" and args.get("room_id"):
+            if capability not in {"meeting.query_room_schedule", "query_room_schedule"} and args.get("room_id"):
                 room = dict(self.meetingroom_index.room(args.get("room_id")) or {})
                 if room:
                     room.setdefault("room_id", args.get("room_id"))
@@ -8327,9 +8424,14 @@ class MyAgent:
                 if self._booking_list_requires_confirmation_before_write(state, bookings):
                     return
                 mr.evidence["selected_booking"] = self._select_booking(state, bookings)
+                if self._is_rebook_larger_intent(capability) and mr.evidence["selected_booking"]:
+                    selected = mr.evidence["selected_booking"]
+                    for key in ("day", "start", "end", "title"):
+                        if selected.get(key) not in (None, ""):
+                            mr.slots[key] = selected[key]
         elif tool == "meetingroom.booking.cancel" and result.get("cancelled"):
             mr.evidence["cancel_done"] = result
-            if self._is_cancel_intent(mr.intent):
+            if self._is_cancel_intent(capability):
                 mr.status = "done"
                 mr.result = {"status": "cancelled", "order_id": result.get("order_id")}
         elif tool == "meetingroom.booking.extend":
@@ -8389,6 +8491,7 @@ class MyAgent:
 
     def _apply_workflow_tool_result(self, state: RuntimeState, tool: str, args: dict[str, Any], result: dict[str, Any]) -> None:
         wf = state.workflow
+        capability = self._active_task_capability(state, "workflow")
         if tool == "file.list":
             wf.evidence["file_list_attempted"] = {"args": dict(args), "result": result}
         if tool == "workflow.search_person":
@@ -8415,16 +8518,13 @@ class MyAgent:
             users = result.get("users") or []
             if users and not args.get("keyword"):
                 wf.evidence["applicant"] = users[0]
-            elif state.meetingroom.intent.startswith("participant_"):
-                index = int(state.meetingroom.evidence.get("participant_index") or 0)
-                state.meetingroom.evidence[f"participant_user_{index}"] = result
         elif tool == "workflow.catalog":
             wf.evidence["catalog"] = result
             workflows = result.get("workflows") or []
             if workflows:
-                if wf.intent == "leave":
+                if "leave" in capability:
                     wf.evidence["workflow_id"] = workflows[0].get("workflow_id", self._workflow_id("leave"))
-                elif wf.intent == "expense_material":
+                elif "expense" in capability:
                     wf.evidence["workflow_id"] = workflows[0].get("workflow_id", self._workflow_id("expense_material"))
         elif tool == "workflow.schema":
             wf.evidence["schema"] = result
@@ -8540,7 +8640,7 @@ class MyAgent:
             for runtime in state.task_runtimes:
                 if runtime.status in TaskRuntime.TERMINAL_STATUSES:
                     continue
-                reason = runtime.blocked_reason or "execution_incomplete"
+                reason = runtime.blocked_reason or self._pending_runtime_reason(state, runtime)
                 if runtime.skill_run is not None:
                     runtime.skill_run.mark_blocked(reason)
                 runtime.status = "blocked"
@@ -8553,7 +8653,10 @@ class MyAgent:
                 domain_state = state.meetingroom if domain == "meetingroom" else state.workflow
                 domain_state.status = "done" if any(runtime.status == "completed" for runtime in domain_tasks) else "blocked"
                 if domain_state.status == "blocked":
-                    domain_state.blocked_reason = next((runtime.blocked_reason for runtime in domain_tasks if runtime.blocked_reason), "execution_incomplete")
+                    domain_state.blocked_reason = next(
+                        (runtime.blocked_reason for runtime in domain_tasks if runtime.blocked_reason),
+                        "scheduler_stalled",
+                    )
             return
         if state.meetingroom.needed and state.meetingroom.status in {"pending", "ready"}:
             state.meetingroom.status = "blocked"
@@ -8572,6 +8675,65 @@ class MyAgent:
             if skill is not None:
                 skill.mark_blocked(state.workflow.blocked_reason)
 
+    def _pending_runtime_reason(self, state: RuntimeState, runtime: TaskRuntime) -> str:
+        skill = runtime.skill_run
+        if skill is not None:
+            if skill.terminal_result.get("reason"):
+                return str(skill.terminal_result["reason"])
+            if skill.blocked_reason:
+                return str(skill.blocked_reason)
+            if skill.failures:
+                reason = str(skill.failures[-1].get("reason") or "")
+                if reason:
+                    return reason
+        evidence = state.meetingroom.evidence if runtime.domain == "meetingroom" else state.workflow.evidence
+        if evidence.get("unresolved_slots"):
+            return "unresolved_user_input"
+        if runtime.domain == "meetingroom":
+            if "room_candidates" in evidence and not (evidence.get("room_candidates") or {}).get("rooms"):
+                return "no_bookable_room"
+            if "booking_query" in evidence and not (evidence.get("booking_query") or {}).get("bookings"):
+                return "existing_booking_not_found"
+        else:
+            if evidence.get("project_search_history") and not evidence.get("verified_project"):
+                return "ambiguous_project"
+            if evidence.get("subclass_options") and not evidence.get("workflow_skill_draft_ir"):
+                return "ambiguous_material_subclass"
+        if state.steps_used >= state.step_budget:
+            return "insufficient_step_budget"
+        return "scheduler_stalled"
+
+    def _block_scheduler_stall(
+        self,
+        state: RuntimeState,
+        diagnostic: dict[str, Any],
+        llm_config: dict[str, Any],
+    ) -> None:
+        reason = str(diagnostic.get("reason") or "scheduler_stalled")
+        state.scheduler_stalls.append(dict(diagnostic))
+        self._debug_log(
+            llm_config,
+            {
+                "event": "scheduler_stalled",
+                "case_id": state.obs.get("case_id"),
+                **diagnostic,
+            },
+        )
+        for runtime in state.task_runtimes:
+            if runtime.status in TaskRuntime.TERMINAL_STATUSES:
+                continue
+            runtime.status = "blocked"
+            runtime.blocked_reason = reason
+            if runtime.skill_run is not None:
+                runtime.skill_run.mark_blocked(reason)
+                if not runtime.skill_run.terminal_result:
+                    runtime.skill_run.terminal_result = {
+                        "status": "blocked",
+                        "reason": reason,
+                        "diagnostic": diagnostic,
+                    }
+        self._advance_task_runtimes(state)
+
     def _workflow_pending_block_reason(self, state: RuntimeState) -> str:
         wf = state.workflow
         if wf.intent == "expense_material":
@@ -8586,16 +8748,16 @@ class MyAgent:
     # ------------------------------------------------------------------
 
     def _is_cancel_intent(self, intent: str) -> bool:
-        return intent in {"cancel", "cancel_existing"}
+        return str(intent or "") in {"cancel", "cancel_existing", "meeting.cancel"}
 
     def _is_extend_intent(self, intent: str) -> bool:
-        return intent in {"extend", "extend_existing"}
+        return str(intent or "") in {"extend", "extend_existing", "meeting.extend"}
 
     def _is_rebook_larger_intent(self, intent: str) -> bool:
-        return intent in {"rebook_larger", "rebook_larger_existing"}
+        return str(intent or "") in {"rebook_larger", "rebook_larger_existing", "meeting.rebook_larger"}
 
     def _is_cancel_rebook_intent(self, intent: str) -> bool:
-        return intent in {"cancel_rebook", "cancel_rebook_existing"}
+        return str(intent or "") in {"cancel_rebook", "cancel_rebook_existing", "meeting.cancel_rebook"}
 
     def _is_rebook_intent(self, intent: str) -> bool:
         return self._is_rebook_larger_intent(intent) or self._is_cancel_rebook_intent(intent)
@@ -9194,6 +9356,7 @@ class MyAgent:
 
     def _select_room_for_booking(self, state: RuntimeState) -> dict[str, Any] | None:
         mr = state.meetingroom
+        capability = self._active_task_capability(state, "meetingroom")
         current_day = str((mr.evidence.get("room_candidates") or {}).get("day") or mr.slots.get("day") or "") or self._meeting_day(state)
         if not current_day:
             return None
@@ -9215,7 +9378,7 @@ class MyAgent:
         for room in rooms:
             if not room.get("bookable", True):
                 continue
-            if self._is_rebook_larger_intent(mr.intent) and mr.evidence.get("selected_booking"):
+            if self._is_rebook_larger_intent(capability) and mr.evidence.get("selected_booking"):
                 original_room_id = str((mr.evidence.get("selected_booking") or {}).get("room_id") or "")
                 if original_room_id and str(room.get("room_id") or "") == original_room_id:
                     continue
@@ -9238,7 +9401,7 @@ class MyAgent:
             return None
         if mr.slots.get("needs_workspace") and mr.evidence.get("workspace"):
             return sorted(legal, key=lambda r: self._room_booking_sort_key(state, r))[0]
-        if self._is_rebook_intent(mr.intent) and mr.evidence.get("selected_booking"):
+        if self._is_rebook_intent(capability) and mr.evidence.get("selected_booking"):
             old_capacity = mr.evidence.get("selected_room_capacity") or 0
             old_attendees = int((mr.evidence.get("selected_booking") or {}).get("attendees") or 0)
             bigger_than = max(int(old_capacity or 0), old_attendees)
@@ -9372,20 +9535,22 @@ class MyAgent:
 
     def _next_booking_list_args(self, state: RuntimeState) -> dict[str, Any] | None:
         mr = state.meetingroom
+        capability = self._active_task_capability(state, "meetingroom")
+        query_only = capability == "meeting.query_booking" or capability in {"query_booking", "query"}
         tried = [item.get("args") for item in mr.evidence.get("tried_booking_lists", [])]
         keyword = str(mr.slots.get("keyword") or "")
         for day in self._meeting_day_candidates(state):
             args: dict[str, Any] = {}
-            if mr.intent not in {"query_booking", "query"}:
+            if not query_only:
                 args["status"] = "active"
             if day:
                 args["day"] = day
-            if keyword and not (self._is_extend_intent(mr.intent) or self._is_rebook_intent(mr.intent)):
+            if keyword and not (self._is_extend_intent(capability) or self._is_rebook_intent(capability)):
                 args["keyword"] = keyword
             if args not in tried:
                 return args
-        args = {} if mr.intent in {"query_booking", "query"} else {"status": "active"}
-        if keyword and not (self._is_extend_intent(mr.intent) or self._is_rebook_intent(mr.intent)):
+        args = {} if query_only else {"status": "active"}
+        if keyword and not (self._is_extend_intent(capability) or self._is_rebook_intent(capability)):
             args["keyword"] = keyword
         if args not in tried:
             return args
@@ -9431,7 +9596,8 @@ class MyAgent:
 
     def _requires_room_occupancy_read(self, state: RuntimeState) -> bool:
         mr = state.meetingroom
-        if not (self._is_extend_intent(mr.intent) or self._is_cancel_rebook_intent(mr.intent)):
+        capability = self._active_task_capability(state, "meetingroom")
+        if not (self._is_extend_intent(capability) or self._is_cancel_rebook_intent(capability)):
             return False
         query = self._meeting_query(state)
         return str(mr.slots.get("fallback_policy") or "") == "keep_if_extend_conflict" or any(
@@ -9468,7 +9634,7 @@ class MyAgent:
         if self._is_rebook_intent(mr.intent) and mr.evidence.get("cancel_done") and mr.evidence.get("selected_booking"):
             cancelled = mr.evidence.get("cancel_done") or {}
             selected = mr.evidence.get("selected_booking") or {}
-            projected["status"] = "rebooked"
+            projected["status"] = "success"
             projected["cancelled_order_id"] = cancelled.get("order_id") or selected.get("order_id")
         return projected
 
@@ -9523,6 +9689,7 @@ class MyAgent:
 
     def _select_booking(self, state: RuntimeState, bookings: list[dict[str, Any]]) -> dict[str, Any]:
         mr = state.meetingroom
+        capability = self._active_task_capability(state, "meetingroom")
         start = mr.slots.get("start")
         end = mr.slots.get("end")
         office_candidates = set(mr.slots.get("office_candidates") or [])
@@ -9545,12 +9712,13 @@ class MyAgent:
         state.meetingroom.evidence["selected_room_capacity"] = int(selected.get("capacity") or selected.get("attendees") or 0)
         if selected.get("attendees") and mr.slots.get("capacity_delta"):
             mr.slots["capacity"] = int(selected.get("attendees") or 0) + int(mr.slots.get("capacity_delta") or 0)
-        if selected.get("attendees") and int(mr.slots.get("capacity") or 0) <= int(selected.get("attendees") or 0) and self._is_rebook_larger_intent(mr.intent):
+        if selected.get("attendees") and int(mr.slots.get("capacity") or 0) <= int(selected.get("attendees") or 0) and self._is_rebook_larger_intent(capability):
             mr.slots["capacity"] = int(selected.get("attendees") or 0) + 4
         return selected
 
     def _existing_booking_write_requires_confirmation(self, state: RuntimeState) -> bool:
         mr = state.meetingroom
+        capability = self._active_task_capability(state, "meetingroom")
         query = self._meeting_query(state)
         bookings = (mr.evidence.get("booking_query") or {}).get("bookings") or []
         active = [item for item in bookings if item.get("status") != "cancelled"]
@@ -9558,7 +9726,7 @@ class MyAgent:
             return False
         if self._extract_order_id(query) or mr.slots.get("order_id"):
             return False
-        if self._is_cancel_rebook_intent(mr.intent) and any(word in query for word in ["延", "重订", "重新预订", "不行就"]):
+        if self._is_cancel_rebook_intent(capability) and any(word in query for word in ["延", "重订", "重新预订", "不行就"]):
             return False
         if not (mr.slots.get("start") or mr.slots.get("end")):
             return True
@@ -9575,12 +9743,13 @@ class MyAgent:
 
     def _booking_list_requires_confirmation_before_write(self, state: RuntimeState, bookings: list[dict[str, Any]]) -> bool:
         mr = state.meetingroom
-        if not (self._is_cancel_intent(mr.intent) or self._is_cancel_rebook_intent(mr.intent)):
+        capability = self._active_task_capability(state, "meetingroom")
+        if not (self._is_cancel_intent(capability) or self._is_cancel_rebook_intent(capability)):
             return False
         query = self._meeting_query(state)
         if self._extract_order_id(query) or mr.slots.get("order_id"):
             return False
-        if self._is_cancel_rebook_intent(mr.intent) and any(word in query for word in ["延", "重订", "重新预订", "不行就"]):
+        if self._is_cancel_rebook_intent(capability) and any(word in query for word in ["延", "重订", "重新预订", "不行就"]):
             return False
         active = [item for item in bookings if item.get("status") != "cancelled"]
         if len(active) <= 1:
@@ -9888,8 +10057,12 @@ class MyAgent:
     def _resolve_month_day(self, day_value: Any, now_value: Any) -> str:
         return CaseCalendar(now_value).month_day(day_value)
 
-    def _leave_plans(self, state: RuntimeState) -> list[dict[str, Any]]:
-        plan = self._leave_plan(state)
+    def _leave_plans(
+        self,
+        state: RuntimeState,
+        plan: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        plan = plan or self._leave_plan(state)
         if not plan:
             return []
         query = self._full_query(state.obs)
@@ -10015,7 +10188,9 @@ class MyAgent:
         *,
         mark_attempt: bool = False,
     ) -> dict[str, Any] | None:
-        tried = state.workflow.evidence.setdefault("approver_search_tried", [])
+        tried = state.workflow.evidence.get("approver_search_tried") or []
+        if mark_attempt and "approver_search_tried" not in state.workflow.evidence:
+            state.workflow.evidence["approver_search_tried"] = tried
         leave = self._leave_slots(state)
         raw_keyword = self._clean_approver_phrase(plan.get("approver_employee_no") or plan.get("approver_keyword") or "")
         title = str(plan.get("approver_title") or "")
@@ -10196,7 +10371,7 @@ class MyAgent:
         strong_available = (
             allow_llm
             and bool(self._llm_config("strong").get("api_key"))
-            and self._can_call_llm(state, "strong", min_remaining=16.0)
+            and self._can_call_llm(state, "strong")
         )
         local_limit = 2 if strong_available else 6
         if strong_available and self._has_explicit_project_slot(expense):
@@ -10292,7 +10467,7 @@ class MyAgent:
         remaining_steps = max(0, state.step_budget - state.steps_used)
         if project_attempts >= 4 or remaining_steps <= 3:
             return None
-        if not self._can_call_llm(state, "strong", min_remaining=16.0):
+        if not self._can_call_llm(state, "strong"):
             return None
         if not force and not self._project_search_attempts_exhausted(state, expense):
             return None
@@ -10750,7 +10925,7 @@ class MyAgent:
         if cache_key in expense:
             return list(expense.get(cache_key) or [])
         llm_config = self._llm_config("strong")
-        if not llm_config.get("api_key") or not self._can_call_llm(state, "strong", min_remaining=16.0):
+        if not llm_config.get("api_key") or not self._can_call_llm(state, "strong"):
             expense[cache_key] = []
             return []
         history = state.workflow.evidence.get("project_search_history") or []
@@ -10868,7 +11043,7 @@ class MyAgent:
             return projects[0]
         if not projects:
             return None
-        if not self._can_call_llm(state, "strong", min_remaining=14.0):
+        if not self._can_call_llm(state, "strong"):
             return None
         expense = self._expense_slots(state)
         decision = self._rank_candidates_with_llm(
@@ -10932,7 +11107,7 @@ class MyAgent:
                     },
                 )
                 return literal
-        if len(options) > 1 and self._can_call_llm(state, "strong", min_remaining=12.0):
+        if len(options) > 1 and self._can_call_llm(state, "strong"):
             selected = self._select_candidate_with_llm(
                 state,
                 "选择费用物资大类",
@@ -11140,7 +11315,7 @@ class MyAgent:
         if isinstance(explicit_ir, ExpenseDraftIR):
             return self._expense_ir_to_save_args(state, project, category, explicit_ir)
         llm_config = self._llm_config("strong")
-        if llm_config.get("api_key") and self._can_call_llm(state, "strong", min_remaining=10.0):
+        if llm_config.get("api_key") and self._can_call_llm(state, "strong"):
             draft = self._llm_expense_draft_ir(state, llm_config, project, category, total)
             if isinstance(draft, dict):
                 evidence_reason = self._expense_draft_evidence_reason(state, draft)
@@ -12076,7 +12251,7 @@ class MyAgent:
         if not snapshot.get("subclass_options"):
             return None
         llm_config = self._llm_config("strong")
-        if llm_config.get("api_key") and self._can_call_llm(state, "strong", min_remaining=10.0):
+        if llm_config.get("api_key") and self._can_call_llm(state, "strong"):
             draft = self._llm_workflow_form_draft(state, llm_config, snapshot)
             if draft:
                 llm_args = self._validate_expense_form_draft(state, project, category, draft)
@@ -12810,7 +12985,7 @@ class MyAgent:
             key = next(iter(self._candidate_map(candidates, id_fields)))
             return {"decision": "select", "selected_id": key}
         llm_config = self._llm_config("strong")
-        if not llm_config.get("api_key") or not self._can_call_llm(state, "strong", min_remaining=12.0):
+        if not llm_config.get("api_key") or not self._can_call_llm(state, "strong"):
             return {"decision": "need_more_info", "selected_id": ""}
         by_key = self._candidate_map(candidates, id_fields)
         compact = self._compact_candidates(by_key)
@@ -13060,12 +13235,13 @@ class MyAgent:
 
     def _apply_participant_list_evidence(self, state: RuntimeState, result: dict[str, Any]) -> None:
         mr = state.meetingroom
-        if mr.intent == "participant_list":
+        capability = self._active_task_capability(state, "meetingroom")
+        if capability in {"meeting.participant_list", "participant_list"}:
             participants = result.get("participants") if isinstance(result.get("participants"), list) else []
             mr.status = "done"
             mr.result = {"status": "queried", "order_id": result.get("order_id"), "participants": participants}
             return
-        if mr.intent != "participant_add" or not self._participant_duplicate_check_required(state):
+        if capability not in {"meeting.participant_add", "participant_add"} or not self._participant_duplicate_check_required(state):
             return
         participants = mr.slots.get("participants") if isinstance(mr.slots.get("participants"), list) else []
         index = int(mr.evidence.get("participant_index") or 0)
@@ -13137,6 +13313,8 @@ class MyAgent:
             if not all(runtime.status in TaskRuntime.TERMINAL_STATUSES for runtime in state.task_runtimes):
                 return False
             return not self._workflow_needs_oa_check(state)
+        if state.llm_semantic.get("semantic_error"):
+            return True
         domains = []
         if state.meetingroom.needed:
             domains.append(state.meetingroom.status in {"done", "blocked"})
@@ -13574,6 +13752,7 @@ class MyAgent:
 
     def _normalize_meeting_title(self, title: Any) -> str:
         value = str(title or "").strip("，。,. ")
+        value = re.sub(r"^(?:主题)?还是", "", value).strip("，。,. ")
         if value in {"复盘", "复盘会", "项目复盘会"}:
             return "项目复盘"
         return value
@@ -13733,28 +13912,20 @@ class MyAgent:
     def _extract_approver_hints(self, text: str) -> dict[str, str]:
         raw = self._extract_approver_keyword(text)
         if not raw:
-            raw = self._first_regex(text, r"审批人(?:必须是|要是|指定为|定为|选|找|是|还是|仍是|改成|改为|换成|换为)?([\u4e00-\u9fa5]{1,4}(?:经理|主管|总监)?)")
+            raw = self._first_regex(
+                text,
+                r"审批人(?:必须是|要是|指定为|定为|选|找|是|还是|仍是|改成|改为|换成|换为)?([^，。；;]{1,16})",
+            )
         raw = self._clean_approver_phrase(raw)
-        title = ""
         name_hint = raw
         department_hint = self._first_regex(text, r"(?:找|审批人找)?([\u4e00-\u9fa5A-Za-z0-9]{2,8})(?:部门|部)的")
         department_hint = re.sub(r"^(找|审批人找)", "", department_hint)
-        for title_word in ["产品经理", "运营经理", "研发经理", "测试工程师", "工程师", "经理", "主管", "总监"]:
-            if title_word in raw or title_word in text:
-                title = title_word
-                if raw.endswith(title_word):
-                    name_hint = raw[: -len(title_word)]
-                break
-        if "刘工" in text and not title:
-            title = "工程师"
-        if name_hint in {"一个", "经", "经理", "一个经"}:
+        if name_hint in {"一个", "某个", "任意", "找一个"}:
             name_hint = ""
         return {
             "approver_raw": raw,
             "approver_keyword": name_hint or raw,
-            "approver_title": title,
             "approver_name_hint": name_hint,
-            "approver_title_hint": title,
             "approver_department_hint": department_hint,
             "approver_employee_no": self._first_regex(text, r"审批人.*?(\d{6,})"),
         }
@@ -13765,18 +13936,9 @@ class MyAgent:
         name_hint = self._clean_approver_phrase(str(leave.get("approver_name_hint") or "").strip())
         if not raw and not name_hint and not title:
             return
-        for title_word in ["产品经理", "运营经理", "研发经理", "测试工程师", "工程师", "经理", "主管", "总监"]:
-            if title_word in raw or title_word in title:
-                title = title_word
-                if raw.endswith(title_word):
-                    name_hint = raw[: -len(title_word)]
-                break
-        if raw.endswith("工") and len(raw) <= 3:
-            name_hint = raw[:-1]
-            title = title or "工程师"
         if not name_hint:
             name_hint = raw
-        if name_hint in {"一个", "某个", "任意", "找一个", "经", "经理", "一个经", "一个经理"}:
+        if name_hint in {"一个", "某个", "任意", "找一个"}:
             name_hint = ""
         if title and name_hint == title:
             name_hint = ""
@@ -14276,6 +14438,8 @@ class MyAgent:
         ]
         if len(exact) == 1:
             return str(exact[0].get("value") or exact[0].get("code") or "")
+        if len(options) == 1:
+            return str(options[0].get("value") or options[0].get("code") or "")
         if not allow_llm or not options:
             return ""
         selected = self._select_candidate_with_llm(
@@ -14452,6 +14616,11 @@ class MyAgent:
     def _schedule_required_days(self, state: RuntimeState) -> list[str]:
         query = self._meeting_query(state)
         now = state.obs.get("now")
+        selected_booking = state.meetingroom.evidence.get("selected_booking")
+        if self._is_rebook_larger_intent(self._active_task_capability(state, "meetingroom")) and isinstance(selected_booking, dict):
+            selected_day = str(selected_booking.get("day") or "")
+            if selected_day:
+                return [selected_day]
         days = [
             str(item.get("day") or "")
             for item in state.meetingroom.slots.get("multi_segments") or []
