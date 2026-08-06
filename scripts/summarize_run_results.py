@@ -88,6 +88,8 @@ def load_case_meta(split: str) -> dict[str, dict[str, Any]]:
             "mode": data.get("mode") or "single_turn",
             "primary_domains": data.get("primary_domains") or [],
             "step_budget": scoring.get("step_budget") or data.get("step_budget"),
+            "scoring": scoring,
+            "gold_trajectory": data.get("gold_trajectory") or [],
             "user_query": data.get("user_query") or "",
         }
     return meta

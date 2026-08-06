@@ -19,6 +19,7 @@ tests/                # pytest 测试
 scripts/
   run_agent.py        # 本地评估入口：拼装 tmp/contest_{split}/ 后调官方 test_runner.py
   summarize_run_results.py
+  dashboard.py        # tag 级回归看板（TSR/AS/ES/RS 通过率矩阵 + ES 审计 + §9.3 验收）
 ```
 
 ## 开发环境
@@ -67,6 +68,43 @@ pip install -r contest/simulator/requirements.base.txt pytest
 ```bash
 .venv/bin/python -m pytest tests/ -v
 ```
+
+## 基线评估（T1）
+
+全量基线跑分（train 200 + val 50，官方 baseline_agent）：
+
+```bash
+.venv/bin/python scripts/run_agent.py \
+  --agent contest/simulator/simulator/baseline_agent.py \
+  --split train --parallel 4 --python .venv/bin/python \
+  --output "$(pwd)/reports/baseline/baseline_agent_train.json"
+.venv/bin/python scripts/run_agent.py \
+  --agent contest/simulator/simulator/baseline_agent.py \
+  --split val --parallel 4 --python .venv/bin/python \
+  --output "$(pwd)/reports/baseline/baseline_agent_val.json"
+```
+
+tag 级回归看板（按 technical_design.md §9.2/§9.3 聚合：域/mode/难度/tag 的
+TSR/AS/ES/RS 通过率矩阵 + ES 审计 + 验收清单 + 低分 case）：
+
+```bash
+.venv/bin/python scripts/dashboard.py \
+  --results reports/baseline/baseline_agent_train.json \
+           reports/baseline/baseline_agent_val.json \
+  --split auto --label baseline_full
+```
+
+每次改动后回归对比（看板 `comparison` 段列出回退/提升 case）：
+
+```bash
+.venv/bin/python scripts/dashboard.py \
+  --results reports/baseline/my_agent_train.json \
+  --split train --compare-to reports/baseline/baseline_agent_train.json \
+  --label my_agent_vs_baseline
+```
+
+基线结果摘要（2026-08-06）：全量 avg 33.08，通过率 9.6%（24/250），
+AS 扣分 90.4%，forbidden 1。详细分析见 `reports/analysis/BASELINE_ANALYSIS.md`。
 
 ## 提交说明
 
