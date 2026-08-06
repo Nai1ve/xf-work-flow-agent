@@ -1,39 +1,13 @@
 {
-  "runtime": {
-    "semantic_extraction": "always",
-    "task_graph_log_path": "reports/runtime/task_graph.jsonl",
-    "task_graph_max_attempts": 1,
-    "static_context_enabled": true,
-    "static_context_path": "submission/static_context",
-    "static_context_max_chars": {
-      "intent": 700,
-      "task_graph": 3000,
-      "candidate": 6000,
-      "form": 7000
-    },
-    "parallel_read_planner_enabled": true,
-    "parallel_reads_enabled": false,
-    "async_read_execution_enabled": false,
-    "parallel_read_max_workers": 4,
-    "parallel_read_max_batch_size": 6,
-    "parallel_read_timeout_seconds": 6,
-    "empty_read_mapping_enabled": true,
-    "empty_read_mapping_max_variants": 3
-  },
-  "llm_fast": {
+  "llm": {
     "provider": "openai_compatible",
-    "timeout": 30,
+    "timeout_s": 12,
     "temperature": 0,
-    "max_calls": 1,
-    "max_history_items": 16,
-    "max_tokens": 256
-  },
-  "llm_strong": {
-    "provider": "openai_compatible",
-    "timeout": 30,
-    "temperature": 0,
-    "max_calls": 2,
-    "max_history_items": 16,
     "max_tokens": 1200
+  },
+  "runtime": {
+    "case_deadline_s": 52,
+    "llm_budget_s": 35,
+    "static_context_enabled": true
   }
 }

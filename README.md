@@ -1,118 +1,75 @@
-# NL2Workflow 比赛工作区
+# 企业流程 Agent（v3 重写）
 
-这个目录用于分析科大讯飞 NL2Workflow / 企业流程执行 Agent 比赛数据，运行官方离线模拟器，并开发后续提交方案。
+基于 [`technical_design.md`](technical_design.md) 从零实现的企业流程执行 Agent，面向「会议室操作 × 流程草稿/提交 × 多轮澄清与确认」任务面。设计原则：**模型提供鲁棒性与语义理解，程序提供流程化与确定性**（详见设计文档 §1.4）。
 
 ## 目录结构
 
 ```text
+technical_design.md   # 目标架构规格（本分支唯一的设计依据）
 contest/
-  simulator/          # 官方离线模拟器
-  source_zips/        # 本地原始 zip 文件，不提交
-  train/              # 本地公开训练集 cases、data、tool_specs.json，不提交
-  val/                # 本地公开验证集 cases、data、tool_specs.json，不提交
-reports/
-  analysis/           # 本地生成的数据集分析报告，不提交
-  baseline/           # 本地生成的跑分结果和日志，不提交
-scripts/
-  analyze_dataset.py  # 静态数据分析 + runner 结果汇总
-  run_agent.py        # 官方 test_runner.py 包装脚本
+  simulator/          # 官方离线模拟器：IFTKEnv、evaluator、tools、test_runner（纯 stdlib）
+  train/              # 本地公开训练集 200 case + data + tool_specs.json（gitignored）
+  val/                # 本地公开验证集 50 case + data + tool_specs.json（gitignored）
 submission/
-  my_agent.py         # V1 LLM Agent 主入口
-  config.json         # 可提交默认配置，不含真实 Key
-  config.local.example.json # 本地私密配置模板
-tmp/                  # 自动生成的 runner 临时目录
+  my_agent.py         # 提交入口：MyAgent（run 永不 raise、永不返回 None）
+  config.json         # 可提交默认配置，不含 API key
+  config.local.example.json  # 本地私密配置模板
+  utils/              # 分层实现模块（感知/理解/规划/执行/输出），逐步填充
+tests/                # pytest 测试
+scripts/
+  run_agent.py        # 本地评估入口：拼装 tmp/contest_{split}/ 后调官方 test_runner.py
+  summarize_run_results.py
 ```
 
-官方 runner 要求运行目录形态如下：
+## 开发环境
 
-```text
-contest_root/
-  cases/
-  data/
-  tool_specs.json
-  simulator/
-```
-
-`scripts/run_agent.py` 会根据 `train` 或 `val` 自动生成 `tmp/contest_train`、`tmp/contest_val`，避免手工拷贝目录造成路径错误。
-
-源码仓库不包含原始数据 zip、解压后的 `train/val`、本地跑分报告和真实 API Key。首次本地运行前，把比赛数据解压到 `contest/train`、`contest/val`，并按需复制 `submission/config.local.example.json` 为 `submission/config.local.json` 填写私密模型配置。
-
-## 环境要求
-
-需要使用 Python 3.11。模拟器代码使用了 `dict | None` 等新语法，系统自带 Python 3.9 会运行失败。
-
-当前机器可用解释器：
+- 需要 **Python 3.11**（模拟器使用 `dict | None` 等新语法）。
+- 创建并激活虚拟环境：
 
 ```bash
-/opt/homebrew/bin/python3.11
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r contest/simulator/requirements.base.txt pytest
 ```
+
+- 首次运行前需把比赛数据解压到 `contest/train`、`contest/val`（gitignored）。
+- LLM key 走环境变量（`OPENAI_API_KEY` / `DASHSCOPE_API_KEY` / `ANTHROPIC_API_KEY`），
+  或复制 `submission/config.local.example.json` 为 `submission/config.local.json`（gitignored）。
 
 ## 常用命令
 
-生成数据集分析报告：
+冒烟（5 个验证集 case，确认评估闭环）：
 
 ```bash
-/opt/homebrew/bin/python3.11 scripts/analyze_dataset.py
-```
-
-运行官方 baseline 验证集：
-
-```bash
-/opt/homebrew/bin/python3.11 scripts/run_agent.py \
-  --agent contest/simulator/simulator/baseline_agent.py \
-  --split val \
-  --output reports/baseline/baseline_val.json
-```
-
-结合 baseline 结果重新生成分析报告：
-
-```bash
-/opt/homebrew/bin/python3.11 scripts/analyze_dataset.py \
-  --runner-results reports/baseline/baseline_val.json \
-  --runner-split val
-```
-
-运行单个 case：
-
-```bash
-/opt/homebrew/bin/python3.11 scripts/run_agent.py \
-  --agent contest/simulator/simulator/baseline_agent.py \
-  --split val \
-  --case beta_mr_0011 \
-  --verbose
-```
-
-运行 V1 LLM Agent：
-
-```bash
-/opt/homebrew/bin/python3.11 scripts/run_agent.py \
+.venv/bin/python scripts/run_agent.py \
   --agent submission/my_agent.py \
-  --split val \
-  --case beta_mr_0011 \
-  --verbose
+  --split val --limit 5 --parallel 4 --python .venv/bin/python
 ```
 
-## V1 LLM Agent
+官方规则基线（正向得分对照）：
 
-`submission/my_agent.py` 当前实现为 OpenAI-compatible LLM 编排器：
+```bash
+.venv/bin/python scripts/run_agent.py \
+  --agent contest/simulator/simulator/baseline_agent.py \
+  --split val --limit 5 --parallel 4 --python .venv/bin/python
+```
 
-- 运行时读取 `submission/config.json`，本地优先叠加 `submission/config.local.json`，环境变量可覆盖 `OPENAI_BASE_URL`、`OPENAI_MODEL`、`OPENAI_API_KEY`、`OPENAI_TIMEOUT`、`OPENAI_TEMPERATURE`、`MAX_LLM_ROUNDS`。
-- `config.json` 是可提交默认配置，不包含真实 Key；`config.local.json` 只用于本地测试，已放入 `.gitignore`，不要打进提交包。
-- 可复制 `submission/config.local.example.json` 为 `submission/config.local.json`，再填写真实 `base_url`、`model` 和 `api_key`。
-- LLM 只允许输出 JSON action，本地校验工具白名单、参数对象、步数预算和异常。
-- 为降低慢模型多轮超时风险，本地实现了通用 scaffold：会议室预订/换房、请假草稿、费用类物资申请。scaffold 只使用用户请求和工具返回候选，不读取 `success_check`、`gold_trajectory`、`reference_final_answer`，也不按 case_id 分支。
+单个 case：
 
-## 当前结论
+```bash
+.venv/bin/python scripts/run_agent.py \
+  --agent submission/my_agent.py --split val \
+  --case beta_mr_0001 --verbose --python .venv/bin/python
+```
 
-- 本地 zip 实际包含训练集 200 条、验证集 50 条。
-- 所有公开 case 都包含 `reference_final_answer` 和 `gold_trajectory`；这些字段只用于分析任务模式，不应做 case id 记忆。
-- 真实选手环境 API 是 `reset`、`list_tools`、`call_tool`、`reply`；本地模拟器没有 `ask_user`。
-- workflow 是主要得分机会，也是官方 baseline 最弱的部分。
-- 隐藏测试应按“同一工具系统、同一业务域下的未见组合/别名/时间表达/改写”来设计，不要按公开 case 背答案。
+测试：
 
-## 已生成报告
+```bash
+.venv/bin/python -m pytest tests/ -v
+```
 
-- 数据分析报告：[reports/analysis/dataset_analysis.md](/Users/naive/code/work-flow-agent/reports/analysis/dataset_analysis.md)
-- 数据分析 JSON：[reports/analysis/dataset_analysis.json](/Users/naive/code/work-flow-agent/reports/analysis/dataset_analysis.json)
-- baseline 验证集结果：[reports/baseline/baseline_val.json](/Users/naive/code/work-flow-agent/reports/baseline/baseline_val.json)
-- baseline 验证集日志：[reports/baseline/baseline_val.stdout](/Users/naive/code/work-flow-agent/reports/baseline/baseline_val.stdout)
+## 提交说明
+
+- 提交包形态见 `contest/simulator/docs/submission_spec.md`；入口固定为 `submission/my_agent.py`。
+- `run_agent.py` 自动在 `tmp/contest_{split}/` 拼装官方 runner 目录形态，避免手工拷贝。
+- 禁止在代码/配置/prompt 中硬编码 API key；`config.local.json` 不打进提交包。

@@ -23,3 +23,12 @@ reports/
 # Local submission packages.
 submission*.zip
 submission/submission/
+
+# Local development environment.
+.venv/
+
+# IDE.
+.idea/
+
+# Local review/analysis artifacts.
+outputs/
