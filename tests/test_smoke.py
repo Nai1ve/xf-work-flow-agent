@@ -168,9 +168,15 @@ def test_meeting_plan_executed_once_for_multiple_meeting_units(monkeypatch) -> N
 
 
 def test_non_meeting_units_never_execute_ops(monkeypatch) -> None:
-    """leave/budget 单元安全空：跳过，不触发 execute_ops。"""
+    """leave 走 LeaveSkill（不触发 execute_ops）；缺工具时 blocked，不瞎写。
+
+    leave 单元由 LeaveSkill 独立执行（多域合并），从不进入 MeetingroomExecutor；
+    在未公开 user.get_info 等工具的受控环境下，应当以 blocked 落盘而非乱猜。
+    """
     module, state = _count_execute_ops_env(monkeypatch, [("leave", [], "请假")])
     agent = module.MyAgent(_FakeQueryEnv())
     result = agent.run("beta_mr_0001")
     assert state["execute_ops_calls"] == 0
-    assert result == {}
+    wf = result.get("workflow_draft_result")
+    assert wf is not None
+    assert wf.get("status") == "blocked"

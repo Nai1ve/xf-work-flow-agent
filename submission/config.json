@@ -15,5 +15,8 @@
     "llm": {
       "mode": "sequential"
     }
+  },
+  "leave": {
+    "enabled": true
   }
 }

@@ -25,12 +25,13 @@ from pathlib import Path
 from typing import Any
 
 from utils.executor import MeetingroomExecutor
+from utils.leave_skill import LeaveSkill
 from utils.llm_gateway import LLMGateway
 from utils.logger import ConsoleLogger, configure_console
 from utils.meeting_skill import MeetingSkill
 from utils.static_context import StaticContextStore
 from utils.tool_contract import ToolContractReconciler
-from utils.understanding import UNIT_MEETING
+from utils.understanding import UNIT_LEAVE, UNIT_MEETING
 
 
 class MyAgent:
@@ -87,6 +88,15 @@ class MyAgent:
             )
         except (OSError, ValueError):
             return "sequential"
+
+    def _leave_enabled(self) -> bool:
+        """读取 leave.enabled（默认 True）。"""
+        config_path = Path(__file__).resolve().parent / "config.json"
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            return bool(config.get("leave", {}).get("enabled", True))
+        except (OSError, ValueError):
+            return True
 
     def run(self, case_id: str) -> dict[str, Any]:
         """执行单个 case，返回结构化 final_answer。
@@ -158,7 +168,56 @@ class MyAgent:
                     f"LLM#2 统计: {json.dumps(llm2_stats, ensure_ascii=False)}"
                 )
 
-            # —— 执行层：meeting 单元走 execute_ops；leave/budget 安全空 ——
+            # —— 请假域：编排（LLM#2）→ 执行（确定性 SOP），多域合并 ——
+            leave_result: dict[str, Any] = {}
+            leave_llm2_stats: dict[str, Any] | None = None
+            leave_timings: dict[str, Any] = {}
+            if self._leave_enabled():
+                leave_subs = [
+                    u.sub_query
+                    for u in ir.ordered_units()
+                    if u.unit_type == UNIT_LEAVE and (u.sub_query or "").strip()
+                ]
+                if leave_subs:
+                    # 多域合并（leave + meeting/budget）：决定提交后是否 oa.done.list
+                    # 确认（仅多域 case 的 success_check 要求调用过）。
+                    multi_domain = len(ir.ordered_units()) > len(leave_subs)
+                    leave_skill = LeaveSkill(logger=understand_log)
+                    leave_result = leave_skill.run(
+                        leave_subs,
+                        user_query,
+                        now_iso,
+                        mode,
+                        gateway,
+                        self.env,
+                        registry,
+                        self.static_context,
+                        multi_domain=multi_domain,
+                    )
+                    leave_timings = leave_skill.last_timings
+                    leave_llm2_stats = (
+                        leave_skill.last_planner_gateway.stats_summary()
+                        if leave_skill.last_planner_gateway is not None
+                        else None
+                    )
+                    draft = leave_skill.planner.last_draft
+                    understand_log.info(
+                        f"请假编排: source={draft.source if draft else '-'} "
+                        f"confidence={draft.confidence if draft else 0.0} "
+                        f"elapsed={leave_timings.get('orchestrate_s', 0.0):.2f}s "
+                        f"type_hint={draft.leave_type_hint if draft else ''!r} "
+                        f"approver_hint={draft.approver_hint if draft else ''!r}"
+                    )
+                    understand_log.info(
+                        f"请假执行: {json.dumps(leave_result.get('workflow_draft_result', {}), ensure_ascii=False)} "
+                        f"elapsed={leave_timings.get('exec_s', 0.0):.2f}s"
+                    )
+                    if leave_llm2_stats is not None:
+                        understand_log.info(
+                            f"LLM#2(请假) 统计: {json.dumps(leave_llm2_stats, ensure_ascii=False)}"
+                        )
+
+            # —— 执行层：meeting 单元走 execute_ops；budget 安全空 ——
             executor = MeetingroomExecutor(
                 self.env,
                 registry,
@@ -170,8 +229,11 @@ class MyAgent:
             final_answer: dict[str, Any] = {}
             executed_meeting = False
             for unit in ir.ordered_units():
+                if unit.unit_type == UNIT_LEAVE:
+                    # 请假单元已由 LeaveSkill 独立执行（多域合并），循环内跳过。
+                    continue
                 if unit.unit_type != UNIT_MEETING:
-                    # 请假/预算流程 SOP 下一里程碑接入；本里程碑安全空，不猜测。
+                    # 预算流程 SOP 下一里程碑接入；本里程碑安全空，不猜测。
                     executor_log.info(
                         f"unit={unit.unit_type}: 流程 SOP 未接入，跳过（安全空）"
                     )
@@ -185,9 +247,12 @@ class MyAgent:
                     if result:
                         final_answer = result
             exec_elapsed = time.monotonic() - exec_start
+            if leave_result:
+                final_answer.update(leave_result)
             if final_answer:
-                result = final_answer.get("booking_result") or final_answer
-                executor_log.info(f"final_answer: {json.dumps(result, ensure_ascii=False)}")
+                executor_log.info(
+                    f"final_answer: {json.dumps(final_answer, ensure_ascii=False)}"
+                )
             else:
                 executor_log.info("final_answer: {}（本阶段不执行）")
 
@@ -199,9 +264,11 @@ class MyAgent:
                 f"整体={total_elapsed:.2f}s "
                 f"识别(LLM#1)={skill_timings.get('recognize_s', 0.0):.2f}s "
                 f"编排(LLM#2)={skill_timings.get('orchestrate_s', 0.0):.2f}s "
+                f"请假(LLM#2)={leave_timings.get('orchestrate_s', 0.0):.2f}s "
                 f"执行={exec_elapsed:.2f}s "
                 f"LLM#1={llm1_stats.get('llm_total_s', 0.0):.2f}s "
-                f"LLM#2={(llm2_stats or {}).get('llm_total_s', 0.0):.2f}s"
+                f"LLM#2={(llm2_stats or {}).get('llm_total_s', 0.0):.2f}s "
+                f"LLM#2(请假)={(leave_llm2_stats or {}).get('llm_total_s', 0.0):.2f}s"
             )
             return final_answer
         except Exception as exc:  # noqa: BLE001 —— 顶层兜底：永不 raise
