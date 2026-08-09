@@ -1,0 +1,469 @@
+{
+  "schema_version": "static-context-v1",
+  "counts": {
+    "tools": 22,
+    "write_tools": 7
+  },
+  "write_tools": [
+    "meetingroom.booking.cancel",
+    "meetingroom.booking.create",
+    "meetingroom.booking.extend",
+    "meetingroom.booking.participant.add",
+    "meetingroom.booking.participant.remove",
+    "workflow.delete",
+    "workflow.save"
+  ],
+  "by_name": {
+    "file.list": {
+      "name": "file.list",
+      "description": "列出指定目录中的文件",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "directory": {
+            "type": "string",
+            "description": "要查询的目录路径，例如 'documents'"
+          }
+        },
+        "required": [
+          "directory"
+        ]
+      }
+    },
+    "meetingroom.booking.cancel": {
+      "name": "meetingroom.booking.cancel",
+      "description": "取消会议室预订",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "order_id"
+        ]
+      }
+    },
+    "meetingroom.booking.create": {
+      "name": "meetingroom.booking.create",
+      "description": "创建会议室预订",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "day": {
+            "type": "string",
+            "format": "date"
+          },
+          "office_id": {
+            "type": "string"
+          },
+          "room_id": {
+            "type": "string"
+          },
+          "start": {
+            "type": "string",
+            "pattern": "^\\d{2}:\\d{2}$"
+          },
+          "end": {
+            "type": "string",
+            "pattern": "^\\d{2}:\\d{2}$"
+          },
+          "title": {
+            "type": "string"
+          },
+          "attendees": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "day",
+          "office_id",
+          "room_id",
+          "start",
+          "end",
+          "title"
+        ]
+      }
+    },
+    "meetingroom.booking.extend": {
+      "name": "meetingroom.booking.extend",
+      "description": "延长会议室预订时长",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string"
+          },
+          "minutes": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "order_id",
+          "minutes"
+        ]
+      }
+    },
+    "meetingroom.booking.list": {
+      "name": "meetingroom.booking.list",
+      "description": "查询当前用户的会议室预订",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "day": {
+            "type": "string",
+            "format": "date"
+          },
+          "keyword": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "meetingroom.booking.participant.add": {
+      "name": "meetingroom.booking.participant.add",
+      "description": "按 user_id 增加会议参会人",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "order_id",
+          "user_id"
+        ]
+      }
+    },
+    "meetingroom.booking.participant.list": {
+      "name": "meetingroom.booking.participant.list",
+      "description": "查询会议预订当前参会人列表",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "order_id"
+        ]
+      }
+    },
+    "meetingroom.booking.participant.remove": {
+      "name": "meetingroom.booking.participant.remove",
+      "description": "按 user_id 移除会议参会人",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "order_id",
+          "user_id"
+        ]
+      }
+    },
+    "meetingroom.room.bookings": {
+      "name": "meetingroom.room.bookings",
+      "description": "按天查询指定会议室的占用时段和预订记录（兼容旧接口）",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "day": {
+            "type": "string",
+            "format": "date"
+          },
+          "room_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "day",
+          "room_id"
+        ]
+      }
+    },
+    "meetingroom.room.list": {
+      "name": "meetingroom.room.list",
+      "description": "按日期和地点条件查询会议室候选",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "day": {
+            "type": "string",
+            "format": "date"
+          },
+          "office_id": {
+            "type": "string"
+          },
+          "office_address": {
+            "type": "string"
+          },
+          "office_name": {
+            "type": "string"
+          },
+          "capacity_gte": {
+            "type": "integer"
+          },
+          "capacity_lte": {
+            "type": "integer"
+          },
+          "has_screen": {
+            "type": "boolean"
+          },
+          "required_features": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "bookable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "day"
+        ]
+      }
+    },
+    "meetingroom.room.schedule": {
+      "name": "meetingroom.room.schedule",
+      "description": "查询指定会议室一段时间内的预订记录",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "room_id": {
+            "type": "string",
+            "description": "会议室ID"
+          },
+          "start_date": {
+            "type": "string",
+            "format": "date",
+            "description": "开始日期 (YYYY-MM-DD)"
+          },
+          "end_date": {
+            "type": "string",
+            "format": "date",
+            "description": "结束日期 (YYYY-MM-DD)"
+          }
+        },
+        "required": [
+          "room_id",
+          "start_date",
+          "end_date"
+        ]
+      }
+    },
+    "oa.done.list": {
+      "name": "oa.done.list",
+      "description": "查看 OA 已办列表，用于验证 workflow 是否已提交",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "keyword": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "oa.todo.list": {
+      "name": "oa.todo.list",
+      "description": "查看 OA 待办列表，用于验证 workflow 草稿是否已保存",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "keyword": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "user.get_info": {
+      "name": "user.get_info",
+      "description": "按姓名关键词查询用户信息，返回所有匹配用户的 user_id、姓名、工号、职位",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "keyword": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "keyword"
+        ]
+      }
+    },
+    "user.get_workspace": {
+      "name": "user.get_workspace",
+      "description": "获取当前用户默认办公地点信息",
+      "args_schema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    "workflow.browser_search": {
+      "name": "workflow.browser_search",
+      "description": "按 workflow、字段和依赖字段值查询当前 browser 字段候选项。支持 keyword 参数进行模糊过滤",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "workflow_id": {
+            "type": "integer"
+          },
+          "field_id": {
+            "type": "integer"
+          },
+          "keyword": {
+            "type": "string",
+            "description": "可选，按 label/value/code 模糊过滤候选项"
+          },
+          "dep": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "workflow_id",
+          "field_id"
+        ]
+      }
+    },
+    "workflow.catalog": {
+      "name": "workflow.catalog",
+      "description": "按关键词查流程目录",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "keyword": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "keyword"
+        ]
+      }
+    },
+    "workflow.delete": {
+      "name": "workflow.delete",
+      "description": "删除已有流程草稿或流程单据",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id"
+        ]
+      }
+    },
+    "workflow.project_search": {
+      "name": "workflow.project_search",
+      "description": "按项目名称或项目编码查询 SAP 项目信息，返回项目编码、WBS、项目经理、利润中心等字段",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "project_name": {
+            "type": "string",
+            "description": "项目名称关键词，支持模糊匹配"
+          },
+          "project_code": {
+            "type": "string",
+            "description": "项目编码，支持模糊匹配"
+          },
+          "company_id": {
+            "type": "integer",
+            "description": "可选，按归属公司 ID 过滤"
+          }
+        }
+      }
+    },
+    "workflow.save": {
+      "name": "workflow.save",
+      "description": "保存或提交流程草稿",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "workflow_id": {
+            "type": "integer"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "data": {
+            "type": "object"
+          },
+          "submit": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "data"
+        ]
+      }
+    },
+    "workflow.schema": {
+      "name": "workflow.schema",
+      "description": "按流程名或 workflow_id 获取表单结构",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "workflow_id": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "workflow.search_person": {
+      "name": "workflow.search_person",
+      "description": "搜索 workflow browser 人员字段候选值。keyword 按姓名/工号模糊匹配，title 按职位/职称过滤，两者可组合使用（AND 关系）",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "keyword": {
+            "type": "string",
+            "description": "按姓名或工号模糊匹配"
+          },
+          "title": {
+            "type": "string",
+            "description": "按职位/职称过滤，例如 '经理'、'工程师'"
+          },
+          "workflow_id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "field_id": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  }
+}

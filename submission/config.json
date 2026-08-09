@@ -9,5 +9,11 @@
     "case_deadline_s": 52,
     "llm_budget_s": 35,
     "static_context_enabled": true
+  },
+  "meeting": {
+    "skill_enabled": true,
+    "llm": {
+      "mode": "sequential"
+    }
   }
 }

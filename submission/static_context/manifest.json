@@ -1,0 +1,29 @@
+{
+  "schema_version": "static-context-v1",
+  "counts": {
+    "tools": 22,
+    "write_tools": 7,
+    "rooms": 139
+  },
+  "sources": {
+    "tool_specs": {
+      "path": "contest/train/tool_specs.json",
+      "sha256": "b34115cf241a3c4592780c5b9c141c814faa8c2da859543c2ff6ae35bf3a3af3"
+    },
+    "meetingroom_data": {
+      "path": "contest/train/data/meetingroom_data.json",
+      "sha256": "c09ac3253904a99f4bb3710791b00736009d9e36babf29364e8c44c32b94a5a7"
+    }
+  },
+  "split_hash_checks": [
+    {
+      "file": "data/meetingroom_data.json",
+      "same": true,
+      "train_sha256": "c09ac3253904a99f4bb3710791b00736009d9e36babf29364e8c44c32b94a5a7",
+      "val_sha256": "c09ac3253904a99f4bb3710791b00736009d9e36babf29364e8c44c32b94a5a7",
+      "train_missing": false,
+      "val_missing": false
+    }
+  ],
+  "generated_at": "2026-08-06 11:59:26"
+}
