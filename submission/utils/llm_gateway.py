@@ -37,8 +37,8 @@ def _load_config() -> dict[str, Any]:
     """合并默认/本地/环境三层 LLM 配置。
 
     优先级（低 → 高）：`config.json["llm"]` < `config.local.json` 各档位
-    （`llm_fast` > `llm` > `llm_strong`）< 环境变量。识别层是快速路径，优先取
-    `llm_fast` 档。`config.local.json` 只读加载，**不打印、不写入任何字段**。
+    （`llm_fast_new` > `llm_fast` > `llm` > `llm_strong`）< 环境变量。识别层是快速路径，优先取
+    `llm_fast_new`/`llm_fast` 档。`config.local.json` 只读加载，**不打印、不写入任何字段**。
     """
     submission_dir = Path(__file__).resolve().parent.parent
     merged: dict[str, Any] = {}
@@ -51,7 +51,7 @@ def _load_config() -> dict[str, Any]:
 
     merged.update(_read_json(submission_dir / "config.json").get("llm", {}))
     local = _read_json(submission_dir / "config.local.json")
-    for tier in ("llm_fast", "llm", "llm_strong"):
+    for tier in ("llm_fast", "llm", "llm_strong", "llm_fast_new"):
         if isinstance(local.get(tier), dict):
             merged.update(local[tier])
 
@@ -305,7 +305,7 @@ class LLMGateway:
         result: dict[str, Any] = dict(fallback or {})
         succeeded = False
 
-        for attempt in (1, 2):  # 最多两次：首次失败重试一次，再败走兜底
+        for attempt in (1, 2, 3):  # 最多三次（长跑瞬态 API 失败定案：2→3 次提升稳健）
             remaining = self._remaining_s()
             if remaining <= 0:
                 break
@@ -345,6 +345,8 @@ class LLMGateway:
                         succeeded = True
                         break
             self._spent_s += time.monotonic() - attempt_start
+            if attempt < 3:
+                time.sleep(0.25)  # 失败后短暂退避，避免长跑中对抖动供应商连续冲击
 
         call_elapsed = time.monotonic() - call_start
         if not succeeded:

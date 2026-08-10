@@ -298,6 +298,45 @@ class TestPlannerLLM:
         )
         assert plan.ops[0].target["addresses"] == ["0552_A1"]  # 模型已给，规则不覆盖
 
+    def test_llm_hallucinated_order_id_stripped(self) -> None:
+        """跨域 Fix A（zh_0019）：LLM 在 cancel target 编造 order_id（sub_query 无
+        SEED-*）→ 剥除，强制执行层走 booking.list 定位（gold 的 list-before-cancel）。"""
+        gateway = _gateway(
+            {
+                "ops": [
+                    {
+                        "action": "cancel",
+                        "target": {"order_id": "SEED-CANCEL-FUZZY-001",
+                                   "day": "2026-04-21", "keyword": "项目复盘"},
+                    },
+                ],
+                "confidence": 0.95,
+            }
+        )
+        plan = MeetingOpPlanner().plan(
+            "帮我取消我下周二下午2点到3点那个项目复盘会议室。",
+            NOW, "single_turn", gateway,
+        )
+        assert plan.source == "llm"
+        assert "order_id" not in plan.ops[0].target
+
+    def test_llm_order_id_literal_in_context_kept(self) -> None:
+        """原文字面出现 order_id（mr_0024/0222/0235）→ 保留直给，不误剥。"""
+        gateway = _gateway(
+            {
+                "ops": [
+                    {"action": "cancel",
+                     "target": {"order_id": "SEED-CANCEL-SELF-001"}},
+                ],
+                "confidence": 0.95,
+            }
+        )
+        plan = MeetingOpPlanner().plan(
+            "帮我取消我下周二下午2点到3点的项目复盘会议室，订单号是 SEED-CANCEL-SELF-001。",
+            NOW, "single_turn", gateway,
+        )
+        assert plan.ops[0].target.get("order_id") == "SEED-CANCEL-SELF-001"
+
     def test_llm_unusable_action_falls_back(self) -> None:
         """0223：LLM 判 compare_book 却无 compare_rooms/named_room → 规则兜底 multi_day。"""
         gateway = _gateway(

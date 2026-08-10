@@ -192,6 +192,10 @@ class MeetingOpPlanner:
             ops = self._parse_ops(raw.get("ops"))
             confidence = float(raw.get("confidence") or 0.0)
             if ops and confidence >= CONFIDENCE_FLOOR:
+                # 契约执行（跨域 Fix A 用户定案）：order_id 只透传 sub_query 原文
+                # 出现的标识符。LLM 编造 order_id（zh_0019 编 SEED-CANCEL-FUZZY-001）
+                # 会让执行层走直给分支、跳过 gold 要求的 booking.list 定位。
+                ops = self._sanitize_order_id(ops, context)
                 # 程序侧归一：同一会议不二订（0040 曾输出 ['earliest','book'] → 冗余
                 # book 重复搜索耗尽步数）。终态订房 op 之后的 book 确定性丢弃。
                 ops = self._dedup_terminal_booking(ops)
@@ -208,6 +212,7 @@ class MeetingOpPlanner:
                             f"会议编排结构性不可执行（{[op.action for op in ops]}），规则兜底"
                         )
                     ops = self._rule_plan(context, now_iso, mode)
+                    ops = self._sanitize_order_id(ops, context)
                     ops = self._apply_business_rules(ops, context)
                     return MeetingOpPlan(
                         ops=ops,
@@ -227,6 +232,7 @@ class MeetingOpPlanner:
                 )
 
         ops = self._rule_plan(context, now_iso, mode)
+        ops = self._sanitize_order_id(ops, context)
         ops = self._dedup_terminal_booking(ops)
         ops = self._apply_business_rules(ops, context)
         return MeetingOpPlan(
@@ -270,6 +276,26 @@ class MeetingOpPlanner:
             else:
                 kept.append(op)
         return kept
+
+    @classmethod
+    def _sanitize_order_id(cls, ops: list[MeetingOp], context: str) -> list[MeetingOp]:
+        """剥除非 sub_query 原文字面出现的 order_id（契约执行，跨域 Fix A）。
+
+        契约（本文件头注释）：标识符（order_id / room_id / user_id）一律由程序从
+        工具证据解析，模型只允许透传**原文出现**的标识符。LLM 会在 cancel/extend/
+        rebook target 里编造 order_id（zh_0019 编 'SEED-CANCEL-FUZZY-001'）→
+        执行层走直给分支、跳过 gold 要求的 booking.list 定位。context 字面包含该
+        order_id 才保留（mr_0024/0222/0235 的 SEED-* 原文直给不受影响）；否则剥除，
+        执行层改为 booking.list 定位（gold 的 list-before-cancel 语义）。
+        """
+        if not context:
+            return ops
+        for op in ops:
+            t = op.target
+            oid = t.get("order_id")
+            if oid and str(oid) not in context:
+                t.pop("order_id", None)
+        return ops
 
     @classmethod
     def _fill_gaps(

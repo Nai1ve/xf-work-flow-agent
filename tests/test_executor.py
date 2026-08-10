@@ -169,6 +169,41 @@ class TestBookSingleDay:
         assert answer["booking_result"]["office_id"] == "A1"
         assert answer["booking_result"]["status"] == "success"
 
+    def test_book_defaults_to_1400_slot_when_time_missing(self, registry) -> None:
+        """跨域 Fix B（zh_0007/0008/0010）：day 有时、start/end 缺失 → 默认规范槽位
+        14:00-15:00（gold 无时间订会议室一律 14:00-15:00），不再「缺 day/start/end 无法预订」。"""
+        room = _room("A1-3F-349", building="A1", campus="0552", office_id="uuid-a1")
+        env = FakeEnv(rooms_by_address={"0552_A1": [room]})
+        executor = _executor(env, registry)
+
+        c = MeetingConstraints(
+            intent=INTENT_BOOK,
+            day="2026-05-13",
+            addresses=["0552_A1"],
+            title="会议",
+        )
+        answer = executor.execute(INTENT_BOOK, c)
+
+        create_args = env.calls[-1][1]
+        assert create_args["start"] == "14:00"
+        assert create_args["end"] == "15:00"
+        assert answer["booking_result"]["status"] == "success"
+
+    def test_book_refuses_when_day_missing(self, registry) -> None:
+        """day 也缺失（无日期可定位）→ 仍放弃预订（不全量兜底）。"""
+        env = FakeEnv(rooms_by_address={"0552_A1": [_room("A1-3F-349", building="A1", campus="0552")]})
+        executor = _executor(env, registry)
+
+        c = MeetingConstraints(
+            intent=INTENT_BOOK,
+            start="14:00",
+            end="15:00",
+            addresses=["0552_A1"],
+            title="会议",
+        )
+        answer = executor.execute(INTENT_BOOK, c)
+        assert "booking_result" not in answer or not answer.get("booking_result")
+
     def test_break_at_first_available_address(self, registry) -> None:
         """第一个有可用房间的地址即停：A1_1F 全忙、A2_1F 有房 → 只查 A1/A2。"""
         busy = _room("A1-1F-101", building="A1", floor="1F", office_id="uuid-a1", busy_slots=[["09:00", "18:00"]])
@@ -628,6 +663,10 @@ def op_registry(op_store: StaticContextStore) -> ToolContractReconciler:
     return ToolContractReconciler(op_store).reconcile(env.list_tools())
 
 
+class StepLimitExceeded(Exception):
+    """模拟官方 env 的 StepLimitExceeded（类名必须一致，执行层按 __name__ 判定）。"""
+
+
 class OpFakeEnv:
     """execute_ops 专用假 env：booking/cancel/extend/participant/get_info/schedule 可配置。"""
 
@@ -642,6 +681,9 @@ class OpFakeEnv:
         self.cancel_error: str | None = None
         self.extend_error: str | None = None
         self.create_success = True
+        # 步数上限（模拟官方 step_budget）：已执行到该次数后，下一次 call_tool 抛
+        # _StepLimitExceeded（与真实 env 在 step_count>=budget 时于调用入口 raise 一致）。
+        self.step_limit_after: int | None = None
 
     def list_tools(self) -> list[dict]:
         return [
@@ -650,6 +692,8 @@ class OpFakeEnv:
         ]
 
     def call_tool(self, name: str, args: dict) -> dict:
+        if self.step_limit_after is not None and len(self.calls) >= self.step_limit_after:
+            raise StepLimitExceeded(f"Step budget {self.step_limit_after} exceeded.")
         self.calls.append((name, args))
         if name == "meetingroom.room.list":
             return {"rooms": list(self.rooms_by_address.get(args.get("office_address"), []))}
@@ -879,6 +923,22 @@ class TestOpRebook:
         room_list_args = next(args for n, args in env.calls if n == "meetingroom.room.list")
         assert room_list_args["capacity_gte"] >= 9  # 原 8 人 + 1，落在 room.list 过滤
 
+    def test_keeps_seed_title_over_query_phrase(self, op_registry, op_store) -> None:
+        """zh_0020：query 复述「项目复盘会」但种子标题是「季度复盘」→ rebook 沿用种子标题。
+        （train 8 个 rebook case reference 标题 100% = 种子标题。）"""
+        env = OpFakeEnv()
+        env.bookings = [_booking("SEED-REBOOK-LARGER-001", room_id="A1-3F-305", title="季度复盘")]
+        env.rooms_by_address["0552_A1"] = [_room("A1-3F-349", building="A1", capacity=14)]
+        executor = _op_executor(env, op_registry, op_store)
+        result = executor.execute_ops(_plan((
+            "rebook",
+            {"day": "2026-04-21", "keyword": "季度复盘", "start": "14:00", "end": "15:00",
+             "addresses": ["0552_A1"], "capacity": 9, "title": "项目复盘会"},
+        )))
+        assert result["booking_result"]["status"] == "success"
+        create_args = next(args for n, args in env.calls if n == "meetingroom.booking.create")
+        assert create_args["title"] == "季度复盘"  # 种子标题，而非 query 短语
+
 
 class TestOpParticipant:
     def test_add_resolves_user_id(self, op_registry, op_store) -> None:
@@ -1003,6 +1063,131 @@ class TestOpDecide:
         assert names.index("meetingroom.booking.cancel") < names.index("meetingroom.booking.create")
         create_args = next(args for n, args in env.calls if n == "meetingroom.booking.create")
         assert create_args["end"] == "15:30"  # 原结束 + 30 分钟
+
+    def test_rebook_keeps_original_title(self, op_registry, op_store) -> None:
+        """0026：decide 冲突重订沿用原会议标题，不用 query 措辞（「项目复盘」≠「项目复盘会议室」）。"""
+        env = OpFakeEnv()
+        env.bookings = [_booking("SEED-0026-001", start="14:00", end="15:00", title="项目复盘")]
+        env.extend_error = "Time conflict"
+        env.rooms_by_address["0552_A1"] = [_room("0552-001", building="A1", capacity=6)]
+        executor = _op_executor(env, op_registry, op_store)
+        result = executor.execute_ops(_plan((
+            "decide",
+            {"day": "2026-04-21", "start": "14:00", "end": "15:00", "title": "项目复盘会议室",
+             "addresses": ["0552_A1"], "minutes": 30},
+        )))
+        assert result["booking_result"]["status"] == "success"
+        create_args = next(args for n, args in env.calls if n == "meetingroom.booking.create")
+        assert create_args["title"] == "项目复盘"  # seed 原订标题，而非 query 措辞
+
+    def test_probe_conflict_skips_extend_call(self, op_registry, op_store) -> None:
+        """0026：探测命中 seed 预置占用冲突 → 不真调 extend（避免 error 入史拉低 AS），直接取消重订。"""
+        env = OpFakeEnv()
+        env.bookings = [
+            _booking("SEED-0026-001", start="14:00", end="15:00", title="项目复盘", room_id="0552-001"),
+            _booking("SEED-0026-OCC", room_id="0552-001", start="15:00", end="15:30", title="预置占用", organizer="200101"),
+        ]
+        env.rooms_by_address["0552_A1"] = [_room("0552-001", building="A1", capacity=6)]
+        executor = _op_executor(env, op_registry, op_store)
+        result = executor.execute_ops(_plan((
+            "decide",
+            {"day": "2026-04-21", "start": "14:00", "end": "15:00", "title": "项目复盘会议室",
+             "addresses": ["0552_A1"], "minutes": 30},
+        )))
+        names = [n for n, _ in env.calls]
+        assert "meetingroom.booking.extend" not in names  # 探测即冲突，不真调 extend
+        assert result["booking_result"]["status"] == "success"
+        create_args = next(args for n, args in env.calls if n == "meetingroom.booking.create")
+        assert create_args["end"] == "15:30"
+        assert create_args["title"] == "项目复盘"
+
+
+class TestOpEarliest:
+    """earliest op 的周区间缺省处理（mr_0012：LLM 偶发只给语义不产 week_start/week_end）。"""
+
+    def test_earliest_without_week_range_books_day(self, op_registry, op_store) -> None:
+        """缺 week_start/week_end → 退化为单日订 c.day，不崩（修复前 date.fromisoformat("") 崩）。"""
+        env = OpFakeEnv()
+        env.rooms_by_address["0552_A1"] = [_room("A1-3F-305", building="A1", capacity=10)]
+        executor = _op_executor(env, op_registry, op_store)
+        result = executor.execute_ops(_plan((
+            "earliest",
+            {"day": "2026-04-21", "start": "14:00", "end": "15:00", "title": "评审",
+             "addresses": ["0552_A1"]},
+        )))
+        assert result["booking_result"]["status"] == "success"
+        create_args = next(args for n, args in env.calls if n == "meetingroom.booking.create")
+        assert create_args["day"] == "2026-04-21"
+
+    def test_earliest_with_week_range_sequential(self, op_registry, op_store) -> None:
+        """有 week_start/week_end → 逐天 room.list 找最早可订（周四 first → 订周四）。"""
+        env = OpFakeEnv()
+        env.rooms_by_address["0552_A1"] = [_room("A1-3F-305", building="A1", capacity=10)]
+        executor = _op_executor(env, op_registry, op_store)
+        result = executor.execute_ops(_plan((
+            "earliest",
+            {"week_start": "2026-04-20", "week_end": "2026-04-26", "start": "14:00",
+             "end": "15:00", "title": "评审", "addresses": ["0552_A1"]},
+        )))
+        assert result["booking_result"]["status"] == "success"
+        list_days = [args["day"] for n, args in env.calls if n == "meetingroom.room.list"]
+        assert "2026-04-20" in list_days  # 周一起逐天搜
+        create_args = next(args for n, args in env.calls if n == "meetingroom.booking.create")
+        assert create_args["day"] == "2026-04-20"  # 首个可订日
+
+    def test_capacity_str_normalized_to_int(self, op_registry, op_store) -> None:
+        """LLM 把 capacity 输出成字符串（"10"）→ 归一为 int，room.list 校验不再拦截（mr_0216）。"""
+        env = OpFakeEnv()
+        env.rooms_by_address["0552_A1"] = [_room("A1-3F-305", building="A1", capacity=10)]
+        executor = _op_executor(env, op_registry, op_store)
+        executor.execute_ops(_plan((
+            "book",
+            {"day": "2026-04-21", "start": "14:00", "end": "15:00", "title": "评审",
+             "addresses": ["0552_A1"], "capacity": "10"},
+        )))
+        list_args = next(args for n, args in env.calls if n == "meetingroom.room.list")
+        assert list_args["capacity_gte"] == 10
+        assert isinstance(list_args["capacity_gte"], int)
+
+
+class TestOpStepLimit:
+    """zh_0026：decide 重订已成功但剩余 op 触发步数上限 → 保留已完成成果，不整锅丢。"""
+
+    def test_preserves_completed_rebook(self, op_registry, op_store) -> None:
+        env = OpFakeEnv()
+        env.bookings = [_booking("SEED-0027-001", start="14:00", end="15:00")]
+        env.extend_error = "Time conflict"
+        env.rooms_by_address["0552_A1"] = [_room("0552-001", building="A1", capacity=6)]
+        # decide 恰好用满 5 步（list→extend→cancel→room.list→create），剩余 op 的
+        # 探路调用触发上限——decide 的成果必须保留（对应 zh_0026 13 步预算场景）。
+        env.step_limit_after = 5
+        executor = _op_executor(env, op_registry, op_store)
+        result = executor.execute_ops(_plan(
+            ("decide", {"day": "2026-04-21", "start": "14:00", "end": "15:00",
+                        "title": "评审", "addresses": ["0552_A1"], "minutes": 30}),
+            ("extend", {"day": "2026-04-21", "start": "14:00", "end": "15:00",
+                        "minutes": 30, "conditional": True}),
+        ))
+        # decide 的重订成果保留：新订 15:30 成功，原单已取消。
+        assert result["booking_result"]["status"] == "success"
+        assert result["booking_result"]["end"] == "15:30"
+        names = [n for n, _ in env.calls]
+        assert names.index("meetingroom.booking.cancel") < names.index("meetingroom.booking.create")
+        # 上限在 extend op 的探路调用处触发——booking.create 只发生一次（decide 那笔）。
+        assert names.count("meetingroom.booking.create") == 1
+
+    def test_other_exception_still_propagates(self, op_registry, op_store) -> None:
+        """非步数上限异常必须照常抛出（只拦 StepLimitExceeded，不吞真实错误）。"""
+        env = OpFakeEnv()
+
+        def _boom(name: str, args: dict) -> dict:
+            raise RuntimeError("boom")
+        env.call_tool = _boom
+        executor = _op_executor(env, op_registry, op_store)
+        with pytest.raises(RuntimeError):
+            executor.execute_ops(_plan(
+                ("cancel", {"order_id": "SEED-CANCEL-001", "day": "2026-04-21"}),
+            ))
 
 
 class TestMergeFinal:

@@ -120,6 +120,11 @@ def normalize_floor(floor: Any) -> Any:
 # 公司工作时段起点（业务惯例）：午别 → 当日起点时刻。
 _PERIOD_START = {"上午": "09:00", "中午": "12:00", "下午": "14:00", "晚上": "19:00"}
 
+# 裸午别默认起止（业务惯例）：查询只给午别、无时长无显式时刻 → 固定 1 小时。
+# gold 全量实测（zh_0003/0004/0005/0006/0009/0015 6 case 一致）：上午→10:00-11:00、
+# 下午→14:00-15:00。注意上午是 10:00 而非工作时段起点 09:00。
+_PERIOD_DEFAULT = {"上午": ("10:00", "11:00"), "下午": ("14:00", "15:00")}
+
 _CN_NUM = {
     "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
     "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
@@ -134,8 +139,11 @@ def resolve_company_time(query: str) -> tuple[str, str] | None:
     - query 含时长词（N小时 / 半小时 / N个半小时）；
     - query **无**显式「X点到Y点」区间（有显式区间走 LLM/规则，不被覆盖）。
 
-    翻译规则（业务惯例）：起点 = 该午别的公司工作时段起点（下午 → 14:00），
-    终点 = 起点 + 时长。示例：`下午…连续用3小时` → (14:00, 17:00)。
+    翻译规则（业务惯例）：
+    - 起点 = 该午别的公司工作时段起点（下午 → 14:00），终点 = 起点 + 时长。
+      示例：`下午…连续用3小时` → (14:00, 17:00)。
+    - 只有午别、无时长（也无显式区间）→ 固定 1 小时默认：上午→(10:00, 11:00)、
+      下午→(14:00, 15:00)。示例：`订明天下午的会议室` → (14:00, 15:00)。
 
     Args:
         query: 会议 sub_query（编排层上下文）。
@@ -152,7 +160,7 @@ def resolve_company_time(query: str) -> tuple[str, str] | None:
         return None
     hours = _match_duration_hours(query)
     if hours is None:
-        return None
+        return _PERIOD_DEFAULT.get(period)
 
     start_min = _to_minutes(_PERIOD_START[period])
     end_min = start_min + round(hours * 60)

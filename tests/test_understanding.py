@@ -326,3 +326,14 @@ class TestAnalyzeMeetingQuery:
     def test_cancel_intent(self) -> None:
         intent, _ = analyze_meeting_query("帮我取消明天上午的会议预订", NOW)
         assert intent == INTENT_CANCEL
+
+    def test_cancel_keyword_compound_title(self) -> None:
+        """跨域 Fix（zh_0019/mr_0025/zh_0204）：「那个项目复盘会议室」→ 关键词必须是
+        完整会议名「项目复盘」，不能被前瞻里的复合词（复盘会）截断成「项目」。"""
+        _, c = analyze_meeting_query("帮我取消我下周二下午2点到3点那个项目复盘会议室", NOW)
+        assert c.query_keyword == "项目复盘"
+
+    def test_cancel_keyword_compound_title_bare_hui(self) -> None:
+        """「那个项目复盘会」→ 完整标题「项目复盘」（裸「会」前瞻兜住 复盘会 型查询）。"""
+        _, c = analyze_meeting_query("帮我把那个项目复盘会延长半小时", NOW)
+        assert c.query_keyword == "项目复盘"

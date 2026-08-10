@@ -18,5 +18,8 @@
   },
   "leave": {
     "enabled": true
+  },
+  "budget": {
+    "enabled": true
   }
 }

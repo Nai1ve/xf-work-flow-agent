@@ -86,9 +86,15 @@ class TestResolveCompanyTime:
 
     def test_missing_period_or_duration(self) -> None:
         assert resolve_company_time("周三需要连续用3小时") is None  # 无午别
-        assert resolve_company_time("下午的会议室") is None  # 无时长
         assert resolve_company_time("") is None
         assert resolve_company_time(None) is None
+
+    def test_bare_period_default(self) -> None:
+        # 裸午别（无时长、无显式时刻）→ 固定 1 小时默认（gold 6 case 一致）。
+        assert resolve_company_time("订明天下午的会议室") == ("14:00", "15:00")
+        assert resolve_company_time("下午的会议室") == ("14:00", "15:00")
+        assert resolve_company_time("订明天上午会议室") == ("10:00", "11:00")
+        assert resolve_company_time("上午开会") == ("10:00", "11:00")
 
     def test_custom_case_from_query(self) -> None:
         # 0021：下午 + 3小时 + 无显式区间。
