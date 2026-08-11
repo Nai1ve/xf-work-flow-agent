@@ -33,10 +33,13 @@ from utils.logger import ConsoleLogger
 
 def _coerce_int(value: Any) -> Any:
     """把数字型字符串归一为 int（LLM 偶发把 capacity 输出成 "10" 而不是 10，
-    会触发 room.list 校验拦截甚至整 case 崩，mr_0216）。非数字串原样返回，
-    由下游校验报错而非静默吞掉。"""
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
+    会触发 room.list 校验拦截甚至整 case 崩，mr_0216）。容忍中文单位/量词后缀
+    （"20人"/"20+"→20，mr_0041）。完全无数字的串原样返回，由下游校验报错而
+    非静默吞掉。"""
+    if isinstance(value, str):
+        m = re.search(r"\d+", value)
+        if m:
+            return int(m.group())
     return value
 from utils.understanding import (
     INTENT_BOOK,

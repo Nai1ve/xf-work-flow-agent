@@ -7,6 +7,8 @@ __pycache__/
 
 # Local private configuration. Never commit real API keys.
 submission/config.local.json
+submission2/config.json
+submission2/config.local.json
 .env
 .env.*
 

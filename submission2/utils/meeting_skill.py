@@ -44,6 +44,7 @@ from utils.understanding import (
     IntentRecognizer,
     MeetingConstraints,
     TaskGraphIR,
+    TemporalResolver,
     analyze_meeting_query,
 )
 
@@ -202,6 +203,9 @@ class MeetingOpPlanner:
                 # 程序补全确定性字段：LLM 漏算的 day/start/end/地址等用规则抽取填充
                 # （规则只消费 sub_query，同一上下文，跨域不污染）。
                 ops = self._fill_gaps(ops, context, now_iso, mode)
+                # 程序侧日期归一（mr_0041）：LLM 偶发把 day/days/book_only_day
+                # 输出成中文星期（周三/周四）而非 ISO 日期 → 转成相对 now 的日期。
+                ops = self._normalize_day_values(ops, now_iso)
                 # 程序侧业务规则（#41 窄例外）：地址显示名→内部码查表归一、
                 # 公司时间「午别+时长」→规范起止翻译。两者均不给模型处理。
                 ops = self._apply_business_rules(ops, context)
@@ -213,6 +217,7 @@ class MeetingOpPlanner:
                         )
                     ops = self._rule_plan(context, now_iso, mode)
                     ops = self._sanitize_order_id(ops, context)
+                    ops = self._normalize_day_values(ops, now_iso)
                     ops = self._apply_business_rules(ops, context)
                     return MeetingOpPlan(
                         ops=ops,
@@ -234,6 +239,7 @@ class MeetingOpPlanner:
         ops = self._rule_plan(context, now_iso, mode)
         ops = self._sanitize_order_id(ops, context)
         ops = self._dedup_terminal_booking(ops)
+        ops = self._normalize_day_values(ops, now_iso)
         ops = self._apply_business_rules(ops, context)
         return MeetingOpPlan(
             ops=ops,
@@ -381,6 +387,47 @@ class MeetingOpPlanner:
                     for slot in t["slots"]:
                         if isinstance(slot, dict):
                             slot["start"], slot["end"] = ct
+        return ops
+
+    @staticmethod
+    def _normalize_day_value(value: Any, resolver: TemporalResolver) -> Any:
+        """把单个 day 值（中文星期 / 字面日期 / 相对表达）归一为 ISO 日期。
+
+        返回原值的情形：已是 ISO 日期（YYYY-MM-DD）、无法识别的串（交执行层
+        校验报错而非静默吞掉）。
+        """
+        s = str(value).strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            return s
+        # 中文星期：下周三 / 本周三 / 周三 / 周天。
+        m = re.fullmatch(r"(下周|本周|周)?([一二三四五六日天])", s)
+        if m:
+            weeks = 1 if m.group(1) == "下周" else 0
+            return resolver._offset_weekday(m.group(2), weeks).isoformat()
+        # 字面日期（5月11日）/ 今天 / 明天 / 后天：复用规则解析器。
+        resolved = resolver.resolve_day(s)
+        if resolved:
+            return resolved
+        return value
+
+    @classmethod
+    def _normalize_day_values(cls, ops: list[MeetingOp], now_iso: str) -> list[MeetingOp]:
+        """把 LLM op target 里的中文星期名归一为 ISO 日期（mr_0041）。
+
+        LLM 偶发把 multi_day 的 ``days`` 输出成「周三/周四」而非日期，或单日
+        ``day`` / ``book_only_day`` 输出成「周X」→ 执行层原样透传给 room.list，
+        schema 拒绝 / 订错日。规则抽取（TemporalResolver）早已转成日期，此步
+        只兜 LLM 路径；对纯日期是 no-op。``_fill_gaps`` 用 setdefault 不覆盖
+        LLM 已给值，故归一必须在补全之后。
+        """
+        resolver = TemporalResolver(now_iso)
+        for op in ops:
+            t = op.target
+            if isinstance(t.get("days"), list):
+                t["days"] = [cls._normalize_day_value(d, resolver) for d in t["days"]]
+            for key in ("day", "book_only_day"):
+                if t.get(key):
+                    t[key] = cls._normalize_day_value(t[key], resolver)
         return ops
 
     @staticmethod
