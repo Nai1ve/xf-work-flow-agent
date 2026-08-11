@@ -108,6 +108,8 @@ class MeetingroomExecutor:
         self._history: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         self._workspace_ctx: dict[str, str | None] | None = None
         self._current_uid: str | None = None
+        # rebook 组合的跨 op 上下文（execute_ops 每次执行重置）。
+        self._rebook_ctx: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------ 入口 --
 
@@ -159,13 +161,22 @@ class MeetingroomExecutor:
             return {}
         final: dict[str, Any] = {}
         events: list[str] = []
+        # rebook 组合的跨 op 上下文：cancel 记录被取消的原会议信息，
+        # 后续 book{inherit_title} 沿用标题 / 合成 rebooked 状态 / 扩大容量。
+        self._rebook_ctx: dict[str, Any] | None = None
+        # 预扫描：标记 rebook 组合里的 cancel（其后再跟 book{inherit_title}），
+        # 这类 cancel 需定位原会议取标题/容量（只对重订组合做，纯 cancel 不多耗一步）。
+        rebook_cancel_flags = self._mark_rebook_cancels(ops)
+        self._op_is_rebook_cancel = False
         try:
-            for op in ops:
+            for idx, op in enumerate(ops):
                 action = getattr(op, "action", None)
                 target = getattr(op, "target", None) or {}
                 if not isinstance(target, dict):
                     target = {}
+                self._op_is_rebook_cancel = rebook_cancel_flags.get(idx, False)
                 part = self._dispatch_op(action, target)
+                self._op_is_rebook_cancel = False
                 if not part:
                     continue
                 final = self._merge_final(final, part)
@@ -185,6 +196,23 @@ class MeetingroomExecutor:
             final.pop("booking_result", None)
         return final
 
+    @staticmethod
+    def _mark_rebook_cancels(ops: list[Any]) -> dict[int, bool]:
+        """标记 rebook 组合里的 cancel：其后再跟 book{inherit_title} 的 cancel。
+
+        这类 cancel 需要定位原会议一次（取标题/结束/容量），只对重订组合做——
+        纯取消（mr_0024 等单 cancel 场景）不多耗一步，保住紧凑 step budget。
+        """
+        flags: dict[int, bool] = {}
+        for i, op in enumerate(ops):
+            if getattr(op, "action", None) != "cancel":
+                continue
+            for later in ops[i + 1:]:
+                if getattr(later, "action", None) == "book" and later.target.get("inherit_title"):
+                    flags[i] = True
+                    break
+        return flags
+
     def _dispatch_op(self, action: str, target: dict[str, Any]) -> dict[str, Any]:
         """按 action 分发到对应 handler。未知返回空（不动作，安全）。"""
         if action == "book":
@@ -199,8 +227,6 @@ class MeetingroomExecutor:
             return self._op_cancel(target)
         if action == "extend":
             return self._op_extend(target)
-        if action == "rebook":
-            return self._op_rebook(target)
         if action == "participant_add":
             return self._op_participant_add(target)
         if action == "participant_remove":
@@ -209,8 +235,6 @@ class MeetingroomExecutor:
             return self._op_participant_list(target)
         if action == "query":
             return self._op_query(target)
-        if action == "decide":
-            return self._op_decide(target)
         self._log_warning(f"未知 op: {action}")
         return {}
 
@@ -312,11 +336,50 @@ class MeetingroomExecutor:
     # ------------------------------------------------------------ S1 op --
 
     def _op_book(self, target: dict[str, Any]) -> dict[str, Any]:
-        """book：单日预订；点名房间（rooms 长度 1 / room）→ 先 schedule 校验空闲再订。"""
+        """book：单日预订；点名房间 → 先 schedule 校验空闲再订。
+
+        rebook 组合（cancel 先于 book，book.inherit_title=true）：
+        - 沿用刚取消的原会议标题（种子标题权威，zh_0033/0226「评审会」→ 种子「季度复盘」）；
+        - larger=true 时容量须大于原会议（0011/0222 的 require_larger_room）；
+        - minutes 存在且目标结束=原结束 → 结束时刻自动 +minutes（mr_0027/zh_0026/
+          zh_0037「延长半小时后重订」）；
+        - 取消是 SEED 直给 → status=rebooked + cancelled_order_id；定位取消 → status=success
+          （office_id 用楼栋名）。
+        conditional:true（无 inherit_title，即「没订就订」）→ 探测本人在目标时段已有
+        活跃预订则不重复订（安全跳过）。
+        """
         c = self._constraints_from_target(target)
+        ctx = self._rebook_ctx
+        if target.get("conditional") and not target.get("inherit_title"):
+            if c.day and c.start and c.end:
+                existing = self._locate_own_booking(
+                    c.day, keyword=target.get("keyword"), time_hint=(c.start, c.end)
+                )
+                if existing:
+                    return {}  # 已订 → 条件不满足，跳过（不重复预订）
+        if ctx and target.get("inherit_title"):
+            if ctx.get("title"):
+                c.title = ctx["title"]
+            if target.get("larger"):
+                orig = self._room_static(ctx.get("room_id"))
+                orig_cap = int((orig or {}).get("capacity", 0) or 0)
+                c.capacity_gte = max(c.capacity_gte or 0, orig_cap + 1)
+            if target.get("minutes") and ctx.get("end") and c.end == ctx.get("end"):
+                c.end = self._add_minutes(c.end, int(target["minutes"]))
         if c.named_room:
-            return self._book_named_room(c, c.named_room)
-        return self._execute_book(c)
+            result = self._book_named_room(c, c.named_room)
+        else:
+            result = self._execute_book(c)
+        br = result.get("booking_result") if isinstance(result, dict) else None
+        if not br or br.get("status") != "success":
+            return result if result else self._blocked()
+        if ctx and target.get("inherit_title") and br.get("day") == ctx.get("day"):
+            if ctx.get("seeded"):
+                return {"_ok": True, "booking_result": {**br, "status": "rebooked", "cancelled_order_id": ctx["order_id"]}}
+            new_room = self._room_static(br.get("room_id"))
+            if new_room and new_room.get("building"):
+                br = {**br, "office_id": new_room.get("building")}
+        return {"_ok": True, "booking_result": br}
 
     def _op_multi_day(self, target: dict[str, Any]) -> dict[str, Any]:
         """multi_day：同日多场（slots）或多日同房（days）/多日校验只订一天。"""
@@ -370,29 +433,59 @@ class MeetingroomExecutor:
         return self._book_named_room(c, best)
 
     def _op_cancel(self, target: dict[str, Any]) -> dict[str, Any]:
-        """cancel：order_id 直给 → 直接取消；有定位词 → booking.list 定位后取消；
-        都缺 → 只探路并 blocked(need_confirmation)（0026 禁止 cancel）。"""
+        """cancel：order_id 直给 → 直接取消；有定位词/时段 → booking.list 定位后取消；
+        都缺 → 只探路并 blocked(need_confirmation)。
+
+        conditional:true（「已订才取消」，mr_0027 等条件重订）→ 定位不到原会议时
+        安全 no-op（探路已满足 must，不误动作）。取消成功后把原会议信息写入
+        ``_rebook_ctx``（供后续 book{inherit_title} 沿用标题 / 合成 rebooked 状态 /
+        扩大容量）；order_id 直给（SEED-* 在 sub_query 原文）记为 seeded，定位取消
+        记为非 seeded（决定重订结果 status=rebooked 还是 success）。"""
         order_id = target.get("order_id")
         # 定位关键词只用规则 query_keyword（gap-fill 已填）；title 是会议主题，
         # 未必等于预订标题（0050 的「需求评审会」≠ 种子「项目复盘」），不能当关键词。
         keyword = target.get("keyword")
         day = target.get("day")
+        time_hint = (target.get("start"), target.get("end"))
+        conditional = bool(target.get("conditional"))
         if order_id:
+            ctx: dict[str, Any] = {"order_id": order_id, "day": day, "seeded": True}
+            if (
+                getattr(self, "_op_is_rebook_cancel", False)
+                and day
+                and self._registry.is_available(self.BOOKING_LIST)
+            ):
+                # rebook 组合：定位原会议一次取标题/结束/容量（镜像旧 _op_rebook
+                # 的 find；纯 cancel 不多耗这一步）。标题以原订为准（mr_0235「主题
+                # 不变（技术分享）」规则会误抽成「不变（技术分享）」→ 以种子标题兜底）。
+                result = self._call_tool(self.BOOKING_LIST, {"day": day, "status": "active"})
+                if not result.get("error"):
+                    for b in result.get("bookings") or []:
+                        if (b.get("order_id") or b.get("booking_id")) == order_id:
+                            ctx.update(
+                                title=b.get("title"),
+                                end=b.get("end"),
+                                room_id=b.get("room_id"),
+                            )
+                            break
             if not self._registry.can_execute_write(self.BOOKING_CANCEL):
                 return self._blocked("cancel_unavailable")
             result = self._call_tool(self.BOOKING_CANCEL, {"order_id": order_id})
             if result.get("error"):
                 return {"_ok": False, "booking_result": {"status": "blocked", "reason": "cancel_failed"}}
+            self._rebook_ctx = ctx
             return {"_ok": True, "booking_result": {"status": "cancelled", "order_id": order_id}}
         if not day:
             return {"booking_result": {"status": "blocked", "reason": "need_confirmation"}}
-        if not keyword:
+        if not keyword and not time_hint[0]:
             # 无唯一标识 → 只调 booking.list 探路（满足 must），不取消。
             if self._registry.is_available(self.BOOKING_LIST):
                 self._call_tool(self.BOOKING_LIST, {"day": day, "status": "active"})
             return {"booking_result": {"status": "blocked", "reason": "need_confirmation"}}
-        booking = self._locate_own_booking(day, keyword=keyword, time_hint=(target.get("start"), target.get("end")))
+        booking = self._locate_own_booking(day, keyword=keyword, time_hint=time_hint)
         if not booking:
+            if conditional:
+                return {}  # 没订 → 安全 no-op（探路已满足 must_satisfy）
             return {"booking_result": {"status": "blocked", "reason": "not_found"}}
         oid = booking.get("order_id") or booking.get("booking_id")
         if not self._registry.can_execute_write(self.BOOKING_CANCEL):
@@ -400,6 +493,14 @@ class MeetingroomExecutor:
         result = self._call_tool(self.BOOKING_CANCEL, {"order_id": oid})
         if result.get("error"):
             return {"_ok": False, "booking_result": {"status": "blocked", "reason": "cancel_failed"}}
+        self._rebook_ctx = {
+            "order_id": oid,
+            "day": day,
+            "title": booking.get("title"),
+            "end": booking.get("end"),
+            "room_id": booking.get("room_id"),
+            "seeded": False,
+        }
         return {"_ok": True, "booking_result": {"status": "cancelled", "order_id": oid}}
 
     def _op_extend(self, target: dict[str, Any]) -> dict[str, Any]:
@@ -550,69 +651,6 @@ class MeetingroomExecutor:
                 return True
         return False
 
-    def _op_rebook(self, target: dict[str, Any]) -> dict[str, Any]:
-        """rebook：定位原会议 → 取消 → 按目标约束重订。
-
-        SEED 直给 → status=rebooked + cancelled_order_id（office_id 用房间 officeId）；
-        定位重订（0011 换大）→ status=success（office_id 用楼栋名）。
-        """
-        c = self._constraints_from_target(target)
-        order_id = target.get("order_id")
-        day = target.get("day")
-        seeded = bool(order_id)
-        original = None
-        if order_id and day:
-            original = self._find_booking_by_order(order_id, day)
-        elif day:
-            original = self._locate_own_booking(
-                day,
-                keyword=target.get("keyword"),
-                time_hint=(c.start, c.end),
-            )
-        if not original:
-            return {}
-        orig_oid = original.get("order_id") or original.get("booking_id")
-        orig_room_id = original.get("room_id")
-        orig_room = self._room_static(orig_room_id)
-        orig_capacity = int((orig_room or {}).get("capacity", 0) or 0)
-        orig_day = original.get("day")
-        orig_start = original.get("start")
-        orig_end = original.get("end")
-        orig_title = original.get("title") or ""
-        if not self._registry.can_execute_write(self.BOOKING_CANCEL):
-            return self._blocked("cancel_unavailable")
-        res = self._call_tool(self.BOOKING_CANCEL, {"order_id": orig_oid})
-        if res.get("error"):
-            return {"booking_result": {"status": "blocked", "reason": "cancel_failed"}}
-
-        nc = MeetingConstraints()
-        nc.day = day or orig_day
-        nc.start = target.get("start") or orig_start
-        nc.end = target.get("end") or orig_end
-        nc.addresses = target.get("addresses") or []
-        if not nc.addresses and orig_room:
-            nc.addresses = [self._address_for(orig_room.get("campus") or "0552", orig_room.get("building") or "", None)]
-        nc.capacity_gte = _coerce_int(target.get("capacity"))
-        nc.has_screen = target.get("screen")
-        # rebook 语义是替换原会议 → 标题沿用原预订（种子）标题。train 8 个 rebook
-        # case（mr_0027/0222/0235、zh_0020/0026/0033/0037/0226）reference 标题 100%
-        # = 种子标题，即使 query 措辞不同（「项目复盘会/评审会」→ 种子「季度复盘」）。
-        # query 派生的 target.title 只是复述原会议，不能覆盖种子标题（用户定案 2026-08-11）。
-        nc.title = orig_title or target.get("title")
-        if target.get("larger"):
-            nc.capacity_gte = max(nc.capacity_gte or 0, orig_capacity + 1)
-        result = self._execute_book(nc)
-        br = result.get("booking_result") if isinstance(result, dict) else None
-        if not br or br.get("status") != "success":
-            return result if result else self._blocked()
-        if seeded:
-            return {"_ok": True, "booking_result": {**br, "status": "rebooked", "cancelled_order_id": orig_oid}}
-        # 定位重订（0011）：reference office_id 用楼栋名。
-        new_room = self._room_static(br.get("room_id"))
-        if new_room and new_room.get("building"):
-            br = {**br, "office_id": new_room.get("building")}
-        return {"_ok": True, "booking_result": br}
-
     def _op_participant_add(self, target: dict[str, Any]) -> dict[str, Any]:
         """participant_add：定位 → 解析 user_id → 去重 → add。
 
@@ -734,54 +772,6 @@ class MeetingroomExecutor:
         if not c.query_type and c.query_keyword:
             c.query_type = QUERY_BOOKING_LIST
         return self._execute_query(c)
-
-    def _op_decide(self, target: dict[str, Any]) -> dict[str, Any]:
-        """decide 条件分支（0027）：探路 booking.list → 没订就 book / 已订就 extend /
-        冲突则 cancel + rebook（结束时刻 = 原结束 + 延长分钟）。
-
-        探测命中冲突（0026/0037 的 seed 预置占用）→ **跳过真调 extend**：真调会返回
-        conflict error 写进历史，被 evaluator 计为动作错误（每个 -5 AS）。探测未命中
-        再真调 extend（保守，room_id/end 缺失时不臆断，与 _op_extend conditional 一致）。
-        重订沿用原会议标题（gold 语义：冲突后「重订同一会议」，0026/0037 的 reference
-        title 取自 seed 原订，而非 LLM 转述的 query 措辞「项目复盘会议室」）。
-        """
-        c = self._constraints_from_target(target)
-        if not c.day:
-            return {}
-        minutes = c.minutes or 30
-        booking, conflict = self._probe_extend_conflict(
-            c.day,
-            keyword=target.get("keyword"),
-            time_hint=(c.start, c.end),
-            order_id=target.get("order_id"),
-            minutes=minutes,
-        )
-        if booking is None:
-            return self._op_book(target)
-        oid = booking.get("order_id") or booking.get("booking_id")
-        orig_title = booking.get("title") or target.get("title")
-        if not conflict:
-            # 探测未命中冲突 → 真调 extend（实际延长）；仍报错才走取消重订。
-            res = self._call_tool(self.BOOKING_EXTEND, {"order_id": oid, "minutes": int(minutes)})
-            if not res.get("error"):
-                return {"_ok": True, "booking_result": {"status": "extended", "order_id": oid, "new_end": res.get("end")}}
-        if not self._registry.can_execute_write(self.BOOKING_CANCEL):
-            return self._blocked("cancel_unavailable")
-        res_c = self._call_tool(self.BOOKING_CANCEL, {"order_id": oid})
-        if res_c.get("error"):
-            return {"booking_result": {"status": "blocked", "reason": "cancel_failed"}}
-        nc = dict(target)
-        nc["title"] = orig_title
-        nc["end"] = self._add_minutes(c.end, minutes)
-        nc.pop("order_id", None)
-        new = self._op_book(nc)
-        br = new.get("booking_result") if isinstance(new, dict) else None
-        if not br or br.get("status") != "success":
-            return new if new else self._blocked()
-        static_room = self._room_static(br.get("room_id"))
-        if static_room and static_room.get("building"):
-            br = {**br, "office_id": static_room.get("building")}
-        return {"_ok": True, "booking_result": br}
 
     # ------------------------------------------------------- 复合预订 handler --
 
@@ -941,20 +931,6 @@ class MeetingroomExecutor:
                 if owned:
                     return owned[0]
         return candidates[0] if candidates else None
-
-    def _find_booking_by_order(
-        self, order_id: str, day: str
-    ) -> dict[str, Any] | None:
-        """按 order_id 在 booking.list(day) 里定位预订（无 booking.detail 工具）。"""
-        if not self._registry.is_available(self.BOOKING_LIST):
-            return None
-        result = self._call_tool(self.BOOKING_LIST, {"day": day, "status": "active"})
-        if result.get("error"):
-            return None
-        for b in result.get("bookings") or []:
-            if (b.get("order_id") or b.get("booking_id")) == order_id:
-                return b
-        return None
 
     def _current_user_id(self) -> str | None:
         """当前登录用户 user_id（get_workspace 返回），case 内缓存。"""

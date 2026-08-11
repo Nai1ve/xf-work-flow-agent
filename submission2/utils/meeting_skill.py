@@ -49,19 +49,21 @@ from utils.understanding import (
 )
 
 # 会议 op 词表（模型可输出的动作全集；执行层把每个 op 映射到运行时工具）。
+# 原子化守则（用户定案 2026-08-11）：只保留原子动作，**不给模型复合 op**。
+# 条件分支用原子 op + 条件 flag 表达（conditional:true = 前提满足才动作，
+# 执行层运行时探路判定）；「重新预订同一会议」= cancel + book 两个原子 op
+# （book 带 inherit_title:true 沿用原会议标题）。
 MEETING_ACTIONS: tuple[str, ...] = (
-    "book",              # 单日/单时预订（含工位最近、时间柔性、备选楼栋）
+    "book",              # 单日/单时预订（conditional:true=没订才订；inherit_title/larger/minutes=重订语义）
     "multi_day",         # 多日同房间（含同日多时段 0043 / 多日校验只订一天 0223）
     "earliest",          # 逐天最早可订
     "compare_book",      # 日程对比（room.schedule）选更空闲后预订
-    "cancel",            # 取消预订
-    "extend",            # 延长（冲突则不动原会议）
-    "rebook",            # 取消后重订（换楼 / 容量升级 / 参会人增加换大房）
+    "cancel",            # 取消预订（conditional:true=已订才取消，未订则跳过）
+    "extend",            # 延长（conditional:true=冲突则不动原会议）
     "participant_add",   # 加参会人
     "participant_remove",  # 移除参会人
     "participant_list",  # 查参会人
     "query",             # 纯查询（booking.list / room.schedule / unbookable / workspace）
-    "decide",            # 条件分支（book-if-not / extend-if-booked / conflict→rebook）
 )
 
 # 会议 plan 单次网络调用超时（秒），还会被 case 级 LLM 预算二次收窄。
@@ -95,18 +97,22 @@ _MEETING_PLAN_SCHEMA: dict[str, Any] = {
 
 _MEETING_PLAN_CARD = """你是企业流程 Agent 的「会议编排器」。只依据输入的 sub_query 提取会议字段并编排操作序列，输出 JSON。
 
-动作与判定：
-book 订新的 | rebook 换房/换楼/换时（sub_query 提到「之前订的/原会议/SEED-*」并重订） | cancel 取消 | extend 延长已有会议 | participant_add/remove/list 参会人 | query 纯查询（查工位/会议/日程） | decide 条件分支（「没订就…订了就…冲突就…」） | multi_day 多日同房或同日多场（多个时间段/天） | earliest 最早能订上 | compare_book 几间里选更空闲
+动作（全部原子动作，可叠加；一个 plan 只允许一个订房动作）：
+book 订新的（conditional:true=没订才订，已订则跳过） | cancel 取消（conditional:true=已订才取消，未订则跳过） | extend 延长已有会议（conditional:true=冲突就不动原会议） | participant_add/remove/list 参会人 | query 纯查询 | multi_day 多日同房或同日多场 | earliest 最早能订上 | compare_book 几间里选更空闲
+重新预订同一会议 = 先 cancel 原会议，再 book 新会议（book 带 inherit_title:true 沿用原会议标题；minutes 表示在原时段上延长多少分钟后重订）。
+「没订就订 / 已订就延长 / 冲突则重订」的多条件式 = 同一个 cancel{conditional:true} + book{inherit_title:true}（没订分支由 cancel 的 conditional 跳过天然覆盖）。**绝不**把三个分支拆成 book+extend+cancel 三条并行动作。
 earliest / multi_day / compare_book 是终态订房动作（自身就完成预订），不要再追加 book。
 
 字段（放 target）：
-day/start/end（YYYY-MM-DD/HH:MM）slots=[{"day","start","end","title"}] 同日多场 days=[...] 多日 week_start/week_end book_only_day addresses=["0552_A1_3F"] capacity 人数 screen title attendees time_flexible workspace_near persons=[{"name","employee_no"}] minutes 延长分钟 rooms 点名房间 keyword query_type(booking_list/schedule/unbookable/workspace) larger 是否换更大
+day/start/end（YYYY-MM-DD/HH:MM）slots=[{"day","start","end","title"}] 同日多场 days=[...] 多日 week_start/week_end book_only_day addresses=["0552_A1_3F"] capacity 人数 screen title attendees time_flexible workspace_near（仅用户明确要「离工位最近」时设；「在X园区/楼栋」只是地址约束，不设） persons=[{"name","employee_no"}] minutes 延长分钟 rooms 点名房间 keyword query_type(booking_list/schedule/unbookable/workspace) larger 是否换更大 conditional/inherit_title 布尔 flag
 
 规则：只从 sub_query 提取原文字段；order_id 仅 sub_query 含 SEED-* 时透传；复合按序多条（终态订房后只接非 book 动作，如加参会人/查询）。
-示例：1)「之前订的X太小，重新订20人以上」→ rebook{day,start,end,addresses,capacity,larger:true}
+示例：1)「之前订的X太小，重新订20人以上」→ cancel{day,start,end} + book{day,start,end,addresses,capacity:20,larger:true,inherit_title:true}
 2)「能多开半小时就延长，冲突就别动」→ extend{day,start,end,minutes:30,conditional:true}
 3)「上午9-11开A、下午2-4开B，同一房间」→ multi_day{slots}
 4)「把李明加到评审会」→ participant_add{day,persons:[{"name":"李明"}]}
+5)「如果没订就帮我订，已订就延长半小时，冲突则取消重订」→ cancel{day,start,end,conditional:true} + book{day,start,end,minutes:30,inherit_title:true}
+6)「如果没订就帮我订」→ book{day,start,end,conditional:true}
 输出：{"ops":[{"action":"book","target":{"day":"2026-08-10","start":"14:00","end":"15:00"}}],"confidence":0.9}
 只输出一个 JSON 对象。"""
 
@@ -197,9 +203,9 @@ class MeetingOpPlanner:
                 # 出现的标识符。LLM 编造 order_id（zh_0019 编 SEED-CANCEL-FUZZY-001）
                 # 会让执行层走直给分支、跳过 gold 要求的 booking.list 定位。
                 ops = self._sanitize_order_id(ops, context)
-                # 程序侧归一：同一会议不二订（0040 曾输出 ['earliest','book'] → 冗余
-                # book 重复搜索耗尽步数）。终态订房 op 之后的 book 确定性丢弃。
-                ops = self._dedup_terminal_booking(ops)
+                # 程序侧归一：一个 meeting 单元只保留首个订房 op（earliest 后冗余
+                # book / 重订后再 book 导致双活跃预订等重复订房，确定性丢弃）。
+                ops = self._dedup_booking_ops(ops)
                 # 程序补全确定性字段：LLM 漏算的 day/start/end/地址等用规则抽取填充
                 # （规则只消费 sub_query，同一上下文，跨域不污染）。
                 ops = self._fill_gaps(ops, context, now_iso, mode)
@@ -238,7 +244,7 @@ class MeetingOpPlanner:
 
         ops = self._rule_plan(context, now_iso, mode)
         ops = self._sanitize_order_id(ops, context)
-        ops = self._dedup_terminal_booking(ops)
+        ops = self._dedup_booking_ops(ops)
         ops = self._normalize_day_values(ops, now_iso)
         ops = self._apply_business_rules(ops, context)
         return MeetingOpPlan(
@@ -259,28 +265,29 @@ class MeetingOpPlanner:
         "named_room", "order_id",
     )
 
-    @classmethod
-    def _dedup_terminal_booking(cls, ops: list[MeetingOp]) -> list[MeetingOp]:
-        """同一会议不二订：终态订房 op 之后的 book 是重复预订，确定性丢弃。
+    # 一个 meeting 单元只允许一个订房动作（book/multi_day/earliest/compare_book）。
+    _BOOK_FAMILY = frozenset({"book", "multi_day", "earliest", "compare_book"})
 
-        0040：LLM#2 不知道 earliest 自身会订房，输出 ['earliest','book'] —— 冗余
-        book 重新搜索会耗尽步数（StepLimitExceeded → 顶层兜底丢结果）。earliest /
-        multi_day / compare_book 都是终态订房动作（handler 内部完成预订），plan 内
-        再跟一个 book 只能是对同一会议的重复预订（多会议已拆成多 meeting 单元，各
-        自独立 plan）。保留终态 op、丢弃其后 book；终态 op 后仍可接非 book 动作
-        （participant_add / query 等）。
+    @classmethod
+    def _dedup_booking_ops(cls, ops: list[MeetingOp]) -> list[MeetingOp]:
+        """同一会议不二订：只保留首个订房 op，其后的订房 op 确定性丢弃。
+
+        - 0040：LLM#2 不知道 earliest 自身会订房，输出 ['earliest','book'] —— 冗余
+          book 重新搜索会耗尽步数（StepLimitExceeded → 顶层兜底丢结果）；
+        - mr_0027 旧败因：decide 重订成功后再跟一个 book → 2 条活跃预订触发
+          「存在额外新增活跃会议预订」forbidden。atomic 词表下订房 op 只许一个，
+          首个订房后的 book/multi_day/earliest/compare_book 一律丢弃。
+        - 取消+重订 = cancel + book（一个订房动作），不受影响；订房后仍可接非
+          订房动作（participant_add / query / extend 等）。
         """
-        terminal = {"earliest", "multi_day", "compare_book"}
-        seen_terminal = False
+        seen_booking = False
         kept: list[MeetingOp] = []
         for op in ops:
-            if op.action in terminal:
-                seen_terminal = True
-                kept.append(op)
-            elif op.action == "book" and seen_terminal:
-                continue  # 终态订房后重复 book → 丢弃
-            else:
-                kept.append(op)
+            if op.action in cls._BOOK_FAMILY:
+                if seen_booking:
+                    continue  # 已有订房动作，重复订房 → 丢弃
+                seen_booking = True
+            kept.append(op)
         return kept
 
     @classmethod
@@ -333,8 +340,21 @@ class MeetingOpPlanner:
                     op.target.setdefault("dedup", True)
         if any(h in (user_query or "") for h in ("太小", "更大", "换大", "大一点")):
             for op in ops:
-                if op.action == "rebook":
+                if op.action == "book":
                     op.target.setdefault("larger", True)
+        # 重新预订同一会议（cancel 先于 book）→ book 沿用原会议标题（种子标题权威，
+        # zh_0033/0226「评审会」→ 种子「季度复盘」）。执行层以刚取消的会议信息解析。
+        seen_cancel = False
+        for op in ops:
+            if op.action == "cancel":
+                seen_cancel = True
+            elif op.action == "book" and seen_cancel:
+                op.target.setdefault("inherit_title", True)
+        # 条件预订（「没订就订」）：已订则跳过，避免重复预订。
+        if any(h in (user_query or "") for h in ("没订", "如果没有订", "如果没有预订")):
+            for op in ops:
+                if op.action == "book":
+                    op.target.setdefault("conditional", True)
 
         for op in ops:
             t = op.target
@@ -346,7 +366,7 @@ class MeetingOpPlanner:
         return ops
 
     # 公司时间计算器作用的 op 家族（带起止时刻的预订类动作）。
-    _TIME_BEARING_ACTIONS = ("book", "multi_day", "earliest", "compare_book", "rebook", "decide")
+    _TIME_BEARING_ACTIONS = ("book", "multi_day", "earliest", "compare_book")
 
     @classmethod
     def _apply_business_rules(
@@ -431,6 +451,13 @@ class MeetingOpPlanner:
         return ops
 
     @staticmethod
+    def _add_minutes_str(time_str: str, minutes: int) -> str:
+        """HH:MM 加 N 分钟（重订到延长后时刻，规则兜底用）。"""
+        h, m = (int(p) for p in str(time_str).split(":"))
+        total = h * 60 + m + int(minutes)
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    @staticmethod
     def _parse_ops(raw_ops: Any) -> list[MeetingOp]:
         """把 LLM 原始 ops 归一为 MeetingOp 列表（非法项丢弃）。
 
@@ -480,9 +507,6 @@ class MeetingOpPlanner:
             elif action == "extend":
                 if t.get("day") or t.get("order_id"):
                     return True
-            elif action == "rebook":
-                if t.get("day") and (t.get("order_id") or t.get("keyword") or t.get("start")):
-                    return True
             elif action in ("participant_add", "participant_remove"):
                 if t.get("persons") and (t.get("day") or t.get("order_id")):
                     return True
@@ -491,9 +515,6 @@ class MeetingOpPlanner:
                     return True
             elif action == "query":
                 if t.get("day") or t.get("query_type") or t.get("keyword"):
-                    return True
-            elif action == "decide":
-                if t.get("day"):
                     return True
         return False
 
@@ -511,9 +532,17 @@ class MeetingOpPlanner:
             return [MeetingOp("query", target)]
         if intent == INTENT_CANCEL:
             return [MeetingOp("cancel", target)]
-        # decide 条件分支（0027「没订就订 / 已订就延长 / 冲突则取消重订」）。
+        # 条件重订分支（mr_0027/zh_0026/zh_0037「没订就订 / 已订就延长 / 冲突则取消
+        # 重订」）：gold 在种子预置下恒走冲突分支 → cancel{conditional} + book
+        # （重订到「原时段 + 延长分钟」的结束时刻）。
         if "没订" in query and "延长" in query and "冲突" in query:
-            return [MeetingOp("decide", target)]
+            book_t = {**target, "inherit_title": True}
+            if c.minutes and c.end:
+                book_t["end"] = self._add_minutes_str(c.end, c.minutes)
+            return [
+                MeetingOp("cancel", {**target, "conditional": True}),
+                MeetingOp("book", book_t),
+            ]
         if intent == INTENT_EXTEND:
             # 条件性延长（0050/0015「能多开就延长，后面冲突就别动原会议」）：
             # 冲突时执行层不提交，产出 blocked(conflict_after_requested_extension)。
@@ -521,10 +550,12 @@ class MeetingOpPlanner:
                 target = {**target, "conditional": True}
             return [MeetingOp("extend", target)]
         if intent == INTENT_REBOOK:
-            # 「换大/更大/太小」→ 重订须容量 > 原会议（0011/0222 的 require_larger_room 检查）。
+            # 重订 = cancel + book 两个原子 op；新会议沿用原会议标题（种子标题权威）。
+            # 「换大/更大/太小/大一点」→ 容量须大于原会议（larger:true）。
+            book_t = {**target, "inherit_title": True}
             if any(h in query for h in ("太小", "更大", "换大", "大一点")):
-                target = {**target, "larger": True}
-            return [MeetingOp("rebook", target)]
+                book_t["larger"] = True
+            return [MeetingOp("cancel", target), MeetingOp("book", book_t)]
         if intent == INTENT_PARTICIPANT:
             if "移除" in query or "移出" in query:
                 return [MeetingOp("participant_remove", target)]
