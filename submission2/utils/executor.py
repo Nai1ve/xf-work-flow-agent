@@ -316,11 +316,14 @@ class MeetingroomExecutor:
         c.time_flexible = bool(target.get("time_flexible"))
         # target 键来自 _constraints_to_target / LLM：rooms 或 compare_rooms 都认。
         rooms = target.get("rooms") or target.get("compare_rooms") or []
+        rooms = [self._canonicalize_room_id(r) for r in rooms if r]
         c.named_room = (
             target.get("room")
             or target.get("named_room")
             or (rooms[0] if len(rooms) == 1 else None)
         )
+        if c.named_room:
+            c.named_room = self._canonicalize_room_id(c.named_room)
         c.compare_rooms = list(rooms)
         c.minutes = target.get("minutes")
         c.persons = target.get("persons") or []
@@ -328,7 +331,13 @@ class MeetingroomExecutor:
         c.slots = target.get("slots") or []
         c.query_type = target.get("query_type")
         c.query_keyword = target.get("keyword")
-        c.schedule_room_id = target.get("schedule_room_id") or target.get("room_id")
+        c.schedule_room_id = (
+            target.get("schedule_room_id")
+            or target.get("room_id")
+            or (rooms[0] if len(rooms) == 1 else None)
+        )
+        if c.schedule_room_id:
+            c.schedule_room_id = self._canonicalize_room_id(c.schedule_room_id)
         c.schedule_start_date = target.get("start_date")
         c.schedule_end_date = target.get("end_date")
         return c
@@ -973,6 +982,31 @@ class MeetingroomExecutor:
         if not room_id or self._static is None:
             return None
         return self._static.room(room_id)
+
+    def _canonicalize_room_id(self, room_str: str | None) -> str | None:
+        """点名/对比/日程的短房间名 → 规范 room_id（系统侧规范，房间数据全量本地持有）。
+
+        识别用户口头短名形态（缺楼层，如 "A1-349" / "A1北区-349" / "A3-312"）：
+        解析出 (楼栋, 房间号)，静态索引里该楼栋内房间号唯一时补全 → "A1-3F-349"。
+
+        以下情况原样返回（不猜，交 simulator 报错）：
+        - 已是规范 room_id（"A1-3F-349" / "0552-011"，在索引里）；
+        - 楼栋内房间号不唯一（如 A1-001/A1-002 多楼层重复）；
+        - 楼栋或房间号解析不到。
+        """
+        s = (room_str or "").strip()
+        if not s or self._static is None or self._static.room(s):
+            return room_str
+        m = re.match(r"^([A-Za-z]\d+)(?:北区|南区|园区)?[-_ ]?(\d+)$", s)
+        if not m:
+            return room_str
+        building, number = m.group(1), m.group(2)
+        hits = [
+            rid
+            for rid in self._static.rooms_by_building(building)
+            if rid.startswith(building + "-") and rid.split("-")[-1] == number
+        ]
+        return hits[0] if len(hits) == 1 else room_str
 
     @staticmethod
     def _week_range(day: str) -> tuple[str, str]:

@@ -104,7 +104,7 @@ book 订新的（conditional:true=没订才订，已订则跳过） | cancel 取
 earliest / multi_day / compare_book 是终态订房动作（自身就完成预订），不要再追加 book。
 
 字段（放 target）：
-day/start/end（YYYY-MM-DD/HH:MM）slots=[{"day","start","end","title"}] 同日多场 days=[...] 多日 week_start/week_end book_only_day addresses=["0552_A1_3F"] capacity 人数 screen title attendees time_flexible workspace_near（仅用户明确要「离工位最近」时设；「在X园区/楼栋」只是地址约束，不设） persons=[{"name","employee_no"}] minutes 延长分钟 rooms 点名房间 keyword query_type(booking_list/schedule/unbookable/workspace) larger 是否换更大 conditional/inherit_title 布尔 flag
+day/start/end（YYYY-MM-DD/HH:MM）slots=[{"day","start","end","title"}] 同日多场 days=[...] 多日 week_start/week_end book_only_day addresses=["0552_A1_3F"] capacity 人数 screen title attendees time_flexible workspace_near（仅用户明确要「离工位最近」时设；「在X园区/楼栋」只是地址约束，不设） persons=[{"name","employee_no"}] minutes 延长分钟 rooms 点名房间（短名如 "A1-349" 也行，系统会规范成 "A1-3F-349"） keyword query_type(booking_list/schedule/unbookable/workspace) larger 是否换更大 conditional/inherit_title 布尔 flag
 
 规则：只从 sub_query 提取原文字段；order_id 仅 sub_query 含 SEED-* 时透传；复合按序多条（终态订房后只接非 book 动作，如加参会人/查询）。
 示例：1)「之前订的X太小，重新订20人以上」→ cancel{day,start,end} + book{day,start,end,addresses,capacity:20,larger:true,inherit_title:true}
@@ -113,6 +113,8 @@ day/start/end（YYYY-MM-DD/HH:MM）slots=[{"day","start","end","title"}] 同日�
 4)「把李明加到评审会」→ participant_add{day,persons:[{"name":"李明"}]}
 5)「如果没订就帮我订，已订就延长半小时，冲突则取消重订」→ cancel{day,start,end,conditional:true} + book{day,start,end,minutes:30,inherit_title:true}
 6)「如果没订就帮我订」→ book{day,start,end,conditional:true}
+7)「先看看A1-349会议室周四下午3-5点空不空，空就订」→ book{day,start,end,rooms:["A1-349"]}（点名订房动作内部会先查该房间日程，空才订；**不要**拆成 query+book 两步）
+8)「帮我查A1-3F-349本周（5月11日到5月15日）的预订情况」→ query{query_type:"schedule",room_id:"A1-3F-349",start_date:"2026-05-11",end_date:"2026-05-15"}
 输出：{"ops":[{"action":"book","target":{"day":"2026-08-10","start":"14:00","end":"15:00"}}],"confidence":0.9}
 只输出一个 JSON 对象。"""
 
