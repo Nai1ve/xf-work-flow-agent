@@ -741,69 +741,80 @@ class LeaveExecutor:
         env.reply 返回 ``resolved_slot``：命中对应槽位才采纳答复；未命中（如
         槽位其实不缺）时该步返回 fallback，本方法保留默认解析路径。
 
+        2026-08-12 重构：改用共享澄清器（utils/clarifier）。缺槽判定 / 提问语 /
+        答复解析与旧实现逐槽一致，仅循环骨架收敛到共享 ``clarify_slots``。
+
         Returns:
             {"start_hm", "end_hm", "type_word", "reason_word", "approver_name"}
             未问/未解析成功的键缺省。
         """
-        if not (hasattr(self._env, "reply") and callable(getattr(self._env, "reply"))):
-            return {}
-        text = sub_query or ""
-        out: dict[str, Any] = {}
+        from utils.clarifier import ClarifySlot, clarify_slots
 
-        # 1) 起止时刻（无午别/显式区间/全天 → 缺）。
-        if (
+        text = sub_query or ""
+        # 起止缺失条件（start/end 共用，旧实现同源）：无午别/显式区间/全天/整天。
+        missing_start_end = (
             not re.search(r"上午|下午|晚上|中午", text)
             and not _parse_range(text)
             and "全天" not in text
             and "整天" not in text
-        ):
-            r = self._env.reply(_CLARIFY_QUESTIONS["start_time"])
-            if r.get("resolved_slot") == "start_time":
-                hm, period = _parse_reply_time(r.get("user_message") or "", None)
-                if hm is not None:
-                    out["start_hm"] = f"{hm:02d}:00"
-                    out["start_period"] = period
-            r = self._env.reply(_CLARIFY_QUESTIONS["end_time"])
-            if r.get("resolved_slot") == "end_time":
-                hm, _ = _parse_reply_time(
-                    r.get("user_message") or "", out.get("start_period")
-                )
-                if hm is not None:
-                    out["end_hm"] = f"{hm:02d}:00"
-
-        # 2) 请假类型（query 无类型词 → 缺）。
-        if not _regex_leave_type(text):
-            r = self._env.reply(_CLARIFY_QUESTIONS["leave_type"])
-            if r.get("resolved_slot") == "leave_type":
-                reply = r.get("user_message") or ""
-                out["type_word"] = _regex_leave_type(reply) or reply.strip()
-
-        # 3) 原因：query 无原因关键词，且类型默认原因非「10」才问。
-        type_word = (
-            out.get("type_word")
-            or _regex_leave_type(text)
-            or draft.leave_type_hint
         )
-        type_code = _match_type_code(
-            type_word, schema.get("leave_type_options") or []
-        )
-        if (
-            not _match_reason_code(text)
-            and _DEFAULT_REASON.get(type_code or "", "10") != "10"
-        ):
-            r = self._env.reply(_CLARIFY_QUESTIONS["reason"])
-            if r.get("resolved_slot") == "reason":
-                out["reason_word"] = (r.get("user_message") or "").strip()
 
-        # 4) 审批人（query 无姓名/职位 → 缺）。
-        if not (_clean_approver_hint(draft.approver_hint) or _regex_approver(text)):
-            r = self._env.reply(_CLARIFY_QUESTIONS["approver"])
-            if r.get("resolved_slot") == "approver":
-                out["approver_name"] = _clean_reply_name(
-                    r.get("user_message") or ""
-                )
+        def _parse_start(msg: str, o: dict[str, Any]) -> dict[str, Any]:
+            hm, period = _parse_reply_time(msg or "", None)
+            if hm is None:
+                return {}
+            return {"start_hm": f"{hm:02d}:00", "start_period": period}
 
-        return out
+        def _parse_end(msg: str, o: dict[str, Any]) -> dict[str, Any]:
+            hm, _ = _parse_reply_time(msg or "", o.get("start_period"))
+            if hm is None:
+                return {}
+            return {"end_hm": f"{hm:02d}:00"}
+
+        def _missing_reason(t: str, o: dict[str, Any]) -> bool:
+            type_word = o.get("type_word") or _regex_leave_type(t) or draft.leave_type_hint
+            type_code = _match_type_code(
+                type_word, schema.get("leave_type_options") or []
+            )
+            return not _match_reason_code(t) and _DEFAULT_REASON.get(type_code or "", "10") != "10"
+
+        specs = [
+            ClarifySlot(
+                key="start_time",
+                question=_CLARIFY_QUESTIONS["start_time"],
+                missing=lambda t, o, m=missing_start_end: m,
+                parse=_parse_start,
+            ),
+            ClarifySlot(
+                key="end_time",
+                question=_CLARIFY_QUESTIONS["end_time"],
+                missing=lambda t, o, m=missing_start_end: m,
+                parse=_parse_end,
+            ),
+            ClarifySlot(
+                key="leave_type",
+                question=_CLARIFY_QUESTIONS["leave_type"],
+                missing=lambda t, o: not _regex_leave_type(t),
+                parse=lambda msg, o: {
+                    "type_word": _regex_leave_type(msg) or msg.strip()
+                },
+            ),
+            ClarifySlot(
+                key="reason",
+                question=_CLARIFY_QUESTIONS["reason"],
+                missing=_missing_reason,
+                parse=lambda msg, o: {"reason_word": (msg or "").strip()},
+            ),
+            ClarifySlot(
+                key="approver",
+                question=_CLARIFY_QUESTIONS["approver"],
+                missing=lambda t, o: not (
+                    _clean_approver_hint(draft.approver_hint) or _regex_approver(t)
+                ),
+                parse=lambda msg, o: {"approver_name": _clean_reply_name(msg or "")},
+            ),
+        ]
+        return clarify_slots(self._env, text, specs)
 
     def _delete_old_leave(self, workflow_id: int, text: str) -> None:
         """删旧草稿：按旧件形态定位（草稿→oa.todo.list；已提交→oa.done.list）→ delete。

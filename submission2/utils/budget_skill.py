@@ -968,47 +968,55 @@ class BudgetExecutor:
           但 reply 不被校验，仅 ES 微损）；
         - 总预算：query 无金额 → 缺。
 
+        2026-08-12 重构：改用共享澄清器（utils/clarifier）。缺槽判定 / 提问语 /
+        答复解析与旧实现逐槽一致，仅循环骨架收敛到共享 ``clarify_slots``。
+
         Returns:
             {"project_phrase"|"project_code", "category_word", "subclass_word",
              "amount"}；未问/未解析成功的键缺省。
         """
-        if not (hasattr(self._env, "reply") and callable(getattr(self._env, "reply"))):
-            return {}
+        from utils.clarifier import ClarifySlot, clarify_slots
+
         text = context or ""
-        out: dict[str, Any] = {}
 
-        # 1) 项目。
-        if not _regex_project_code(text) and not _regex_project_phrase(text):
-            r = self._env.reply(_CLARIFY_QUESTIONS["project"])
-            if r.get("resolved_slot") in ("project_name", "project_code"):
-                reply = r.get("user_message") or ""
-                code = _regex_project_code(reply)
-                if code:
-                    out["project_code"] = code
-                else:
-                    phrase = _regex_project_phrase(reply)
-                    if phrase:
-                        out["project_phrase"] = phrase
+        def _parse_project(msg: str, o: dict[str, Any]) -> dict[str, Any]:
+            code = _regex_project_code(msg)
+            if code:
+                return {"project_code": code}
+            phrase = _regex_project_phrase(msg)
+            if phrase:
+                return {"project_phrase": phrase}
+            return {}
 
-        # 2) 大类（query 无大类词 → 缺）。
-        if not _regex_category_hint(text):
-            r = self._env.reply(_CLARIFY_QUESTIONS["material_category"])
-            if r.get("resolved_slot") == "material_category":
-                out["category_word"] = _clean_reply_label(r.get("user_message") or "")
-
-        # 3) 小类（query 无小类词 → 缺；mt_0015 无此槽时多问一局白耗 1 步）。
-        if not re.search(r"小类|子类", text):
-            r = self._env.reply(_CLARIFY_QUESTIONS["material_subclass"])
-            if r.get("resolved_slot") == "material_subclass":
-                out["subclass_word"] = _clean_reply_label(r.get("user_message") or "")
-
-        # 4) 总预算（query 无金额 → 缺）。
-        if not re.search(r"预算|元|万|块|金额", text):
-            r = self._env.reply(_CLARIFY_QUESTIONS["total_amount"])
-            if r.get("resolved_slot") == "total_amount":
-                out["amount"] = (r.get("user_message") or "").strip()
-
-        return out
+        specs = [
+            ClarifySlot(
+                key="project",
+                question=_CLARIFY_QUESTIONS["project"],
+                missing=lambda t, o: not _regex_project_code(t)
+                and not _regex_project_phrase(t),
+                parse=_parse_project,
+                keys=("project_name", "project_code"),
+            ),
+            ClarifySlot(
+                key="material_category",
+                question=_CLARIFY_QUESTIONS["material_category"],
+                missing=lambda t, o: not _regex_category_hint(t),
+                parse=lambda msg, o: {"category_word": _clean_reply_label(msg)},
+            ),
+            ClarifySlot(
+                key="material_subclass",
+                question=_CLARIFY_QUESTIONS["material_subclass"],
+                missing=lambda t, o: not re.search(r"小类|子类", t),
+                parse=lambda msg, o: {"subclass_word": _clean_reply_label(msg)},
+            ),
+            ClarifySlot(
+                key="total_amount",
+                question=_CLARIFY_QUESTIONS["total_amount"],
+                missing=lambda t, o: not re.search(r"预算|元|万|块|金额", t),
+                parse=lambda msg, o: {"amount": msg.strip()},
+            ),
+        ]
+        return clarify_slots(self._env, text, specs)
 
     # -------------------------------------------------- 项目解析 --
     def _resolve_project(

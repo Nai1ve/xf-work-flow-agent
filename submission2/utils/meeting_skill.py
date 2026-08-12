@@ -40,6 +40,7 @@ from utils.understanding import (
     INTENT_PARTICIPANT,
     INTENT_QUERY,
     INTENT_REBOOK,
+    MODE_MULTI_TURN,
     UNIT_MEETING,
     IntentRecognizer,
     MeetingConstraints,
@@ -47,6 +48,13 @@ from utils.understanding import (
     TemporalResolver,
     analyze_meeting_query,
 )
+from utils.meeting_clarify import (
+    CONFIRM_REPLY,
+    apply_clarified,
+    build_meeting_specs,
+    build_order_id_spec,
+)
+from utils.clarifier import clarify_slots
 
 # 会议 op 词表（模型可输出的动作全集；执行层把每个 op 映射到运行时工具）。
 # 原子化守则（用户定案 2026-08-11）：只保留原子动作，**不给模型复合 op**。
@@ -548,7 +556,8 @@ class MeetingOpPlanner:
         if intent == INTENT_EXTEND:
             # 条件性延长（0050/0015「能多开就延长，后面冲突就别动原会议」）：
             # 冲突时执行层不提交，产出 blocked(conflict_after_requested_extension)。
-            if any(h in query for h in ("就别动", "别动原会议", "冲突就别", "先告诉我", "不动原会议")):
+            # 「先别动」覆盖 mt_0011/0205「冲突就先别动」措辞（就/先 混用）。
+            if any(h in query for h in ("就别动", "先别动", "别动原会议", "冲突就别", "先告诉我", "不动原会议")):
                 target = {**target, "conditional": True}
             return [MeetingOp("extend", target)]
         if intent == INTENT_REBOOK:
@@ -650,6 +659,7 @@ class MeetingSkill:
         now_iso: str,
         mode: str | None,
         gateway: Any,
+        env: Any = None,
     ) -> tuple[TaskGraphIR, MeetingOpPlan]:
         """顺序执行识别 → 编排，返回 (意图分解, 会议编排)。
 
@@ -659,6 +669,7 @@ class MeetingSkill:
             mode: env.reset 返回的 mode（多轮标记透传）。
             gateway: LLMGateway 实例（LLM#1 用）；编排层另建独立 gateway
                 （分段计时 + 预算隔离）。
+            env: 受控环境（多轮 case 需 env.reply 走澄清/确认；其余传 None）。
 
         Returns:
             (TaskGraphIR, MeetingOpPlan)。
@@ -683,6 +694,22 @@ class MeetingSkill:
             }
             return ir, MeetingOpPlan(ops=[], source="fallback", confidence=0.0)
 
+        # —— 多轮澄清路径（mode=multi_turn 且有 env.reply）：确定性，不调 LLM#2 ——
+        # route() 在 multi_turn 下无条件返回 INTENT_MULTI_TURN，会遮掉取消/延长等
+        # 真实意图；故用 mode=None 的 analyze_meeting_query 判真实意图后分派：
+        # - 预订：缺槽澄清 + 确认解锁 + 确定性 book（mt_0001/0201/0202/0003/0009）；
+        # - 取消/延长等：无缺槽，走既有确定性 _rule_plan（mt_0004/0011/0204/0205）。
+        if mode == MODE_MULTI_TURN and hasattr(env, "reply") and callable(getattr(env, "reply")):
+            meeting_plan = self._multi_turn_plan(user_query, now_iso, env)
+            self.last_planner_gateway = None
+            self.last_timings = {
+                "recognize_s": round(ir.elapsed_s, 3),
+                "orchestrate_s": round(meeting_plan.elapsed_s, 3),
+                "exec_s": 0.0,
+                "skill_total_s": round(time.monotonic() - start, 3),
+            }
+            return ir, meeting_plan
+
         # —— 编排层：LLM#2 接收 sub_query 上下文（独立 gateway 分段计时）——
         # 识别 gateway 不可用时整个流水线走规则兜底：编排层同样不调模型。
         planner_gateway = None
@@ -703,3 +730,57 @@ class MeetingSkill:
             "skill_total_s": round(time.monotonic() - start, 3),
         }
         return ir, meeting_plan
+
+    def _multi_turn_plan(
+        self, user_query: str, now_iso: str, env: Any
+    ) -> MeetingOpPlan:
+        """多轮澄清路径：真实意图判定 → 预订澄清+确认 / 取消延长走确定性规则。
+
+        mode=multi_turn 的 route() 短路到 INTENT_MULTI_TURN，这里用 mode=None
+        重新路由拿到真实意图（book/cancel/extend…）：
+        - 预订（INTENT_BOOK）：按约束提取器的缺槽声明澄清（build_meeting_specs）
+          → 发确认语解锁 booking.create → 确定性 book op（gold 步数与轨迹对齐：
+          clarify×N + confirm + room.list + create）；
+        - 其余（cancel/extend/query/participant/rebook）：query 已带全部所需槽位，
+          无缺槽可问 → 复用 _rule_plan（mode=None 避免短路）。
+
+        Returns:
+            MeetingOpPlan（source="rule_clarify" 标记多轮澄清路径）。
+        """
+        start = time.monotonic()
+        intent, c = analyze_meeting_query(user_query, now_iso, None)
+        if intent != INTENT_BOOK:
+            # 取消/延长/查询/参会人等非预订意图：query 可能缺订单号（多轮 case 的
+            # missing_slots=['order_id']）→ 先澄清订单号，再走确定性规则（gateway
+            # =None → planner 内部 _rule_plan + 全部后处理），把澄清出的订单号注入
+            # 各 op target（取消/延长直给分支免 booking.list 定位）。
+            clarified = clarify_slots(env, user_query or "", [build_order_id_spec(c)])
+            plan = self.planner.plan(
+                user_query, now_iso, None, None, sub_query=user_query
+            )
+            order_id = clarified.get("order_id") or c.order_id_hint
+            if order_id and plan.ops:
+                for op in plan.ops:
+                    # clarified 标记：order_id 经对话澄清而非 query 直给 → 执行层
+                    # extend 需先定位/探测（mt_0011/0205），非条件延长才做富化定位
+                    # （mt_0204）；单轮直给订单号则直延省一次 list。
+                    op.target = {
+                        **op.target,
+                        "order_id": order_id,
+                        "clarified": True,
+                    }
+            return plan
+
+        # 预订：缺槽澄清（缺槽判定对齐 gold missing_slots，见 build_meeting_specs）。
+        clarified = clarify_slots(env, user_query or "", build_meeting_specs(now_iso, c))
+        apply_clarified(c, clarified)
+        # 确认门：gold 要求 booking.create 前发确认语（CONFIRM_PATTERNS 解锁）。
+        env.reply(CONFIRM_REPLY)
+        target = MeetingOpPlanner._constraints_to_target(c)
+        plan = MeetingOpPlan(
+            ops=[MeetingOp("book", target)],
+            source="rule_clarify",
+            confidence=0.9,
+        )
+        plan.elapsed_s = round(time.monotonic() - start, 3)
+        return plan

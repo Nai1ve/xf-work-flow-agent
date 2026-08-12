@@ -144,7 +144,7 @@ class MyAgent:
             # gateway 在 run 内构建：预算按 case 隔离，实例复用也不串预算。
             gateway = LLMGateway(logger=understand_log.child("LLM#1"))
             meeting_skill = MeetingSkill(logger=understand_log)
-            ir, meeting_plan = meeting_skill.run(user_query, now_iso, mode, gateway)
+            ir, meeting_plan = meeting_skill.run(user_query, now_iso, mode, gateway, self.env)
             units_desc = [
                 {
                     "unit_type": u.unit_type,

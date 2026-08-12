@@ -515,23 +515,36 @@ class MeetingroomExecutor:
     def _op_extend(self, target: dict[str, Any]) -> dict[str, Any]:
         """extend：定位 → 延长。条件性延长先探测冲突，命中则不真调 extend。
 
-        0050「能多开半小时就延长，后面冲突就别动原会议」：gold 只调 booking.list
-        就判定 blocked——延长窗口与他人预订冲突时**不调用 extend**（否则 extend
-        返回 conflict 会触发 forbidden「会议预订时间与房间占用冲突」→ AS=0）。
-        先探测再决定：冲突 → blocked(conflict_after_requested_extension)；
-        无冲突 → 真调 extend。直给延长冲突 → extend_failed(time_conflict)。"""
+        0050/0015「能多开半小时就延长，后面冲突就别动原会议」：gold 只调
+        booking.list 就判定 blocked——延长窗口与他人预订冲突时**不调用 extend**
+        （否则 extend 返回 conflict 会触发 forbidden → AS=0）。探测 list 取当日
+        **全量**活跃预订（不带 keyword：同房其它标题的冲突预订如「预置占用」若被
+        keyword 过滤掉会漏判 → 误调 extend）。day 不在 query 时（mt_0011/0205
+        「那个项目复盘会」无日期）先用无 day 的 booking.list 定位目标预订发现其
+        day，再全量探测。非条件延长定位后富化 booking_result 的
+        day/office_id/start/end/title（mt_0204 reference 要求）。
+        直给延长冲突 → extend_failed(time_conflict)。条件探测/富化定位仅对
+        clarified（多轮澄清注入）或缺失 order_id 的目标执行；单轮 query 直给订单号
+        直延，避免 LLM 过度标记 conditional 时多打 list 扣 ES。"""
         order_id = target.get("order_id")
         minutes = target.get("minutes") or 30
         conditional = bool(target.get("conditional"))
+        # clarified：order_id 由多轮澄清注入（mt_0011/0205/0204），非 query 直给——
+        # 需先定位/探测；单轮直给订单号（mr_0240/0249/0218，LLM 可能过度标
+        # conditional）直延即可，避免无用 list 消耗 ES。
+        clarified = bool(target.get("clarified"))
         day = target.get("day")
+        keyword = target.get("keyword")
+        time_hint = (target.get("start"), target.get("end"))
 
-        if conditional and day:
+        if conditional and (not order_id or clarified):
+            # 条件延长：day 未知 → 先定位目标预订发现其 day（mt_0011/0205）。
+            if not day:
+                day = self._discover_extend_day(keyword, time_hint, order_id)
+                if not day:
+                    return {}
             booking, conflict = self._probe_extend_conflict(
-                day,
-                keyword=target.get("keyword"),
-                time_hint=(target.get("start"), target.get("end")),
-                order_id=order_id,
-                minutes=minutes,
+                day, time_hint, order_id, minutes
             )
             if booking is None:
                 return {}
@@ -547,18 +560,102 @@ class MeetingroomExecutor:
                 }
             return self._do_extend(oid, minutes, conditional)
 
-        if not order_id:
-            if not day:
-                return {}
-            booking = self._locate_own_booking(
-                day,
-                keyword=target.get("keyword"),
-                time_hint=(target.get("start"), target.get("end")),
+        # 非条件延长。
+        if order_id and day:
+            # 直给 order_id+day：无需定位（保持既有一步行为），无富化字段。
+            return self._do_extend(order_id, minutes, False)
+        if clarified or not order_id:
+            # 澄清来的订单号 → 定位富化（mt_0204）；无订单号 → 按 day/keyword 定位。
+            day, booking = self._resolve_extend_booking(
+                day, keyword, time_hint, order_id
             )
-            if not booking:
+            if booking is None:
                 return {}
             order_id = booking.get("order_id") or booking.get("booking_id")
-        return self._do_extend(order_id, minutes, conditional)
+            result = self._do_extend(order_id, minutes, False)
+            if booking.get("day"):
+                # 富化 final：day/office_id/start/title 来自定位到的目标预订（种子权威），
+                # end 取延长后的新结束时刻（result.end）。
+                result["booking_result"] = {
+                    **result.get("booking_result", {}),
+                    "day": booking["day"],
+                    "office_id": booking.get("office_id"),
+                    "start": booking.get("start"),
+                    "title": booking.get("title"),
+                    "end": result.get("booking_result", {}).get("new_end")
+                    or booking.get("end"),
+                }
+            return result
+        # 单轮直给订单号、day 未知：直延（LLM 过度标 conditional 或漏 day 都不追加定位）。
+        return self._do_extend(order_id, minutes, False)
+
+    def _discover_extend_day(
+        self,
+        keyword: str | None,
+        time_hint: tuple[str | None, str | None] | None,
+        order_id: str | None,
+    ) -> str | None:
+        """条件延长且 day 未知：无 day 的 booking.list 定位目标预订 → 返回其 day。
+
+        query 无日期（mt_0011/0205「那个项目复盘会」）→ 种子预订的 day 只能经
+        booking.list 发现：定位目标后取该预订的 day 字段（工具证据，非臆断）。
+        """
+        if not self._registry.is_available(self.BOOKING_LIST):
+            return None
+        args: dict[str, Any] = {"status": "active"}
+        if keyword:
+            args["keyword"] = keyword
+        result = self._call_tool(self.BOOKING_LIST, args)
+        if result.get("error"):
+            return None
+        booking = self._pick_extend_target(
+            result.get("bookings") or [], order_id, time_hint
+        )
+        return booking.get("day") if booking else None
+
+    def _resolve_extend_booking(
+        self,
+        day: str | None,
+        keyword: str | None,
+        time_hint: tuple[str | None, str | None] | None,
+        order_id: str | None,
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """定位延长目标预订；day 未知时顺带发现其 day。
+
+        Returns:
+            (day, booking)；定位不到返回 (原 day, None)。
+        """
+        if not self._registry.is_available(self.BOOKING_LIST):
+            return day, None
+        args: dict[str, Any] = {"day": day, "status": "active"} if day else {"status": "active"}
+        if not day and keyword:
+            args["keyword"] = keyword
+        result = self._call_tool(self.BOOKING_LIST, args)
+        if result.get("error"):
+            return day, None
+        booking = self._pick_extend_target(
+            result.get("bookings") or [], order_id, time_hint
+        )
+        if booking is None:
+            return day, None
+        return booking.get("day") or day, booking
+
+    def _pick_extend_target(
+        self,
+        bookings: list[dict[str, Any]],
+        order_id: str | None,
+        time_hint: tuple[str | None, str | None] | None,
+    ) -> dict[str, Any] | None:
+        """按 order_id（已知优先）或 本人+时段 从 booking.list 结果里挑延长目标。"""
+        if order_id:
+            return next(
+                (
+                    b for b in bookings
+                    if (b.get("order_id") or b.get("booking_id")) == order_id
+                ),
+                None,
+            )
+        return self._filter_own_candidates(bookings, time_hint=time_hint)
 
     def _do_extend(
         self, order_id: str, minutes: int, conditional: bool
@@ -590,7 +687,6 @@ class MeetingroomExecutor:
     def _probe_extend_conflict(
         self,
         day: str,
-        keyword: str | None,
         time_hint: tuple[str | None, str | None] | None,
         order_id: str | None,
         minutes: int,
@@ -599,33 +695,25 @@ class MeetingroomExecutor:
 
         Args:
             day: 目标日期。
-            keyword: booking.list keyword（定位用）。
             time_hint: (start, end) 时段过滤（定位用）。
             order_id: 已知 order_id 时直接按 id 定位。
             minutes: 延长分钟数。
 
         Returns:
             (booking, conflict)；booking 定位不到返回 (None, False)。
+
+        注意：探测 list **不带 keyword**——取当日全量活跃预订，同房其它标题的
+        冲突预订（0050/0015「预置占用」/ mt_0011「预置占用」）才可见，否则被
+        keyword 过滤 → 漏判 → 误调 extend 触发 forbidden。
         """
         if not day or not self._registry.is_available(self.BOOKING_LIST):
             return None, False
         args: dict[str, Any] = {"day": day, "status": "active"}
-        if keyword:
-            args["keyword"] = keyword
         result = self._call_tool(self.BOOKING_LIST, args)
         if result.get("error"):
             return None, False
         bookings = result.get("bookings") or []
-        if order_id:
-            booking = next(
-                (
-                    b for b in bookings
-                    if (b.get("order_id") or b.get("booking_id")) == order_id
-                ),
-                None,
-            )
-        else:
-            booking = self._filter_own_candidates(bookings, time_hint=time_hint)
+        booking = self._pick_extend_target(bookings, order_id, time_hint)
         if booking is None:
             return None, False
         conflict = self._extend_would_conflict(bookings, booking, minutes)
