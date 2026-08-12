@@ -632,6 +632,17 @@ def _has_budget_amount(text: str) -> bool:
     return bool(m) and any(u in text for u in ("预算", "万", "元", "块", "金额"))
 
 
+# 点名购买动词（zh_0008「要买电脑配件」）。无预算 + 空明细时，点名要买某物 =
+# 具体物料意图 → 不落「取 29028 首个选项」占位保存兜底（避免把歧义类别词
+# 静默 save 成首个子类），交由 _resolve_subclasses 空行 block。
+_PURCHASE_VERBS = ("买", "采购", "购置", "购买")
+
+
+def _has_purchase_verb(text: str) -> bool:
+    """query 文本是否点名要买某物（买/采购/购置/购买 动词）。"""
+    return any(v in (text or "") for v in _PURCHASE_VERBS)
+
+
 def _clean_reply_label(value: str) -> str:
     """多轮澄清答复 → 选项 label：剥掉「小类选/大类选/物资小类选…」前缀与尾部标点。
 
@@ -840,7 +851,11 @@ class BudgetExecutor:
                 draft.rows = [syn_row]
             elif subclass_word:
                 draft.rows = [BudgetRow(material_name=subclass_word)]
-            elif not budget_known:
+            elif not budget_known and not _has_purchase_verb(text):
+                # 无预算占位保存仅限「query 只给大类未点名物料」（zh_0007/0010/0223/
+                # 0227 品牌广告费用）。点名要买某物（zh_0008「要买电脑配件」）→ 具体
+                # 物料意图，取首个子类会静默 save 成显示器（歧义应 block）→ 不兜底，
+                # 空行下放 _resolve_subclasses 返回 None → blocked(ambiguous_material_subclass)。
                 default_rows = self._default_subclass_row(project, material_category)
                 if default_rows:
                     draft.rows = [BudgetRow(material_name=default_rows[0])]
