@@ -24,8 +24,10 @@ S1 基础预订（含 S1w 工位关联、S1d 逐天最早 / 多日同会议室�
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
 
 from utils.logger import ConsoleLogger
@@ -110,6 +112,22 @@ class MeetingroomExecutor:
         self._current_uid: str | None = None
         # rebook 组合的跨 op 上下文（execute_ops 每次执行重置）。
         self._rebook_ctx: dict[str, Any] | None = None
+        # 楼栋降级门控开关（meeting.no_floorless_exact_capacity）：精确容量
+        # （6人/10人，无 以上/以下）时跳过楼栋级降级。默认关；开启用于 A/B 测试
+        # 对 ES 步数的影响（用户定案：仅作配置开关，不默认启用）。
+        self._no_floorless_exact_capacity = self._read_no_floorless_switch()
+
+    @staticmethod
+    def _read_no_floorless_switch() -> bool:
+        """读取 config.json meeting.no_floorless_exact_capacity（默认 False）。"""
+        config_path = Path(__file__).resolve().parent.parent / "config.json"
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            return bool(
+                config.get("meeting", {}).get("no_floorless_exact_capacity", False)
+            )
+        except (OSError, ValueError):
+            return False
 
     # ------------------------------------------------------------------ 入口 --
 
@@ -305,10 +323,12 @@ class MeetingroomExecutor:
         c.end = target.get("end")
         c.building = target.get("building")
         c.campus = target.get("campus")
+        c.campus_explicit = bool(target.get("campus_explicit"))
         c.floor = target.get("floor")
         c.addresses = target.get("addresses") or []
         c.fallback_building = target.get("fallback_building")
         c.capacity_gte = _coerce_int(target.get("capacity"))
+        c.capacity_exact = bool(target.get("capacity_exact"))
         c.has_screen = target.get("screen")
         c.title = target.get("title")
         c.attendees = _coerce_int(target.get("attendees"))
@@ -1279,8 +1299,13 @@ class MeetingroomExecutor:
 
         # 楼栋级回退（0229：A1 3F 全被占，但 1F 有房）：楼层是软约束，同楼栋
         # 其他楼层可订时降级到楼栋级再搜；排在反园区之前——楼栋优先于园区。
+        # 门控（配置开关 no_floorless_exact_capacity）：精确容量（6人/10人，无
+        # 以上/以下）= 点名具体房间，订不到就订不到，不做楼栋级替代（mr_0021/
+        # 0022 + zh_* 小镇A1四楼族，ES 少打一步）。0229（10人以上）不受影响。
         floorless = self._floorless_addresses(c)
-        if floorless:
+        if floorless and not (
+            self._no_floorless_exact_capacity and c.capacity_exact
+        ):
             combos.append((floorless, c.start, c.end))
             if c.time_flexible:
                 for start, end in shifts:

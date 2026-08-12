@@ -101,6 +101,8 @@ class MeetingConstraints:
         addresses: 候选 office_address（有序），执行层按序调用 room.list。
         fallback_building: 「A1 优先，A2 备选」里的备选楼栋名。
         capacity_gte: 最小容量（人数 → capacity_gte）。
+        capacity_exact: 容量是否「精确」（6人/10人，无 以上/以下）。精确=用户点名
+            具体容量房间，执行层楼栋降级可据此门控（用户定案，见 executor 开关）。
         has_screen: True=需要屏幕；False=明确不需要（不传筛选参数）。
         bookable: True=只看可预订；False=只看不可预订（S2 查询用）。
         title: 会议主题。
@@ -131,6 +133,7 @@ class MeetingConstraints:
     addresses: list[str] = field(default_factory=list)
     fallback_building: str | None = None
     capacity_gte: int | None = None
+    capacity_exact: bool = False
     has_screen: bool | None = None
     bookable: bool | None = None
     title: str | None = None
@@ -887,6 +890,8 @@ class MeetingConstraintExtractor:
         if cap_m:
             c.capacity_gte = int(cap_m.group(1))
             c.attendees = int(cap_m.group(1))
+            # 精确容量（无 以上/以下）＝点名具体容量房间；楼栋降级门控依据。
+            c.capacity_exact = "以上" not in cap_m.group(0) and "以下" not in cap_m.group(0)
 
         if any(h in query for h in ("不需要屏幕", "没有屏幕", "不带屏幕", "无需屏幕")):
             c.has_screen = False

@@ -272,7 +272,7 @@ class MeetingOpPlanner:
         "fallback_building", "capacity", "screen", "title", "attendees",
         "minutes", "persons", "keyword", "query_type", "week_start",
         "week_end", "book_only_day", "days", "slots", "compare_rooms",
-        "named_room", "order_id",
+        "named_room", "order_id", "campus_explicit", "capacity_exact",
     )
 
     # 一个 meeting 单元只允许一个订房动作（book/multi_day/earliest/compare_book）。
@@ -600,7 +600,9 @@ class MeetingOpPlanner:
             "end": c.end,
             "building": c.building,
             "campus": c.campus,
+            "campus_explicit": c.campus_explicit,
             "floor": c.floor,
+            "capacity_exact": c.capacity_exact,
             "addresses": c.addresses,
             "fallback_building": c.fallback_building,
             "capacity": c.capacity_gte,
