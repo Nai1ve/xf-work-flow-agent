@@ -390,6 +390,19 @@ def _clean_reply_name(reply: str) -> str:
     return m.group(1) if m else ""
 
 
+_TIME_SIGNAL_RE = re.compile(r"上午|下午|晚上|中午|点|全天|整天|小时")
+
+
+def _has_time_signal(text: str) -> bool:
+    """文本是否含时间惯例信号词（时段/时刻/全天/小时），用于时段解析文本选择。
+
+    多域 case 里 leave 子句与完整 user_query 拼接（``text``）后，会带上其他域
+    （meeting 的「下午两点到三点」）的时间词，污染请假时段解析（zh_0014）。时段
+    解析优先用 leave 子句自身；仅当子句无任何时间信号时才回退到拼接文本。
+    """
+    return bool(text and _TIME_SIGNAL_RE.search(text))
+
+
 class LeaveExecutor:
     """请假执行器：确定性流程 SOP（程序业务规则组件），产出 workflow_draft_result。
 
@@ -625,7 +638,9 @@ class LeaveExecutor:
         wf_0202 赵丽）；未指名（默认，用户定稿 #49 方案一）→ 按职位 title="经理"，
         其次 title="总监"——职位搜索（docs「Search by title 经理」）：zh_0014→
         刘经理(研发经理)，mt_0012→张三(技术总监)。恰 1 人取 user_id；0 →
-        approver_not_found；>1 → ambiguous_approver（不 save）。
+        approver_not_found；>1 → 歧义：若 query 含「提交」且未指名，按职位兜底选
+        产品经理（zh_0035/0206/0220/0224/0215 gold 5/5 选产品经理王芳），否则
+        ambiguous_approver（不 save，zh_0210/0228 两个王芳 → 预期阻塞）。
         """
         if forced_keyword:
             people = self._search_person_approver(
@@ -660,8 +675,21 @@ class LeaveExecutor:
                 title=title, workflow_id=workflow_id
             )
             verdict = _approver_verdict(people)
-            if verdict is not None:
+            if verdict is None:
+                continue
+            if "error_reason" in verdict:
+                # 未指名 + 明确要求提交 → 按职位兜底（优先产品经理，否则第一位）。
+                # 用户定稿：没有指明上级、不能追问/追问无效、明确要求提交时按职位选。
+                # zh_0035/0206/0220/0224/0215：title=经理 歧义 [研发经理, 产品经理]，
+                # gold 5/5 选产品经理王芳/120004。命名了审批人（hint 非空）不兜底——
+                # zh_0210/0228 两个王芳 → 预期阻塞（不 save）。
+                if not hint and re.search(r"提交", sub_query or ""):
+                    for p in people:
+                        if "产品经理" in (p.get("title") or ""):
+                            return {"user_id": p.get("user_id")}
+                    return {"user_id": people[0].get("user_id")}
                 return verdict
+            return verdict
         return {"error_reason": "approver_not_found"}
 
     def _search_person_approver(
@@ -905,14 +933,14 @@ class LeaveExecutor:
           18:00（mt_0012/0206）；
         - 「那天/当天」→ 从完整 user_query 首个日期表达兜底解析（mr_wf_0006）。
 
-        已知问题（用户定案 #49 Q2：只记录，后续单独分析，暂不修）：``text``
-        是 sub_query + 完整 user_query 的拼接（为跨域指代「那天」兜底）。多域
-        case（zh_0014：订会议室 + 请假）里 meeting 的「下午两点到三点」会被
-        ``_parse_range`` 命中，把请假时段污染成 14:00-15:00（reference 是
-        09:00-11:00）。修法候选：优先在 sub_query 内解析，user_query 仅作
-        「那天/当天」指代兜底；但需先核对所有跨域 case 再动。
+        2026-08-12 已修（原 #49 Q2 记录项）：时段解析优先 leave 子句自身，
+        子句无时间信号才回退拼接 text（``_has_time_signal`` 门控）。多域 case
+        （zh_0014）meeting 的「下午两点到三点」不再污染请假时段（reference
+        09:00-11:00）。day 解析仍保留 sub_query → 「那天/当天」user_query →
+        text 的三级兜底。
         """
-        text = f"{sub_query or ''} {user_query or ''}".strip()
+        sub = (sub_query or "").strip()
+        text = f"{sub} {user_query or ''}".strip()
         resolver = TemporalResolver(now_iso)
 
         # 每周X + 两周 → 两次（本周五 + 下周五）。
@@ -950,7 +978,11 @@ class LeaveExecutor:
             return [
                 (f"{day} {clarified['start_hm']}", f"{day} {clarified['end_hm']}")
             ]
-        start_t, end_t = self._time_of_day(text, resolver)
+        # 时段解析优先 leave 子句自身（zh_0014：子句「后天上午」→ 09:00-11:00），
+        # 避免拼接 text 带上 meeting 的「下午两点到三点」污染成 14:00-15:00。
+        # 子句无时间信号（如纯「那天」指代）才回退拼接文本。
+        time_text = sub if _has_time_signal(sub) else text
+        start_t, end_t = self._time_of_day(time_text, resolver)
         return [(f"{day} {start_t}", f"{day} {end_t}")]
 
     def _time_of_day(self, text: str, resolver: TemporalResolver) -> tuple[str, str]:

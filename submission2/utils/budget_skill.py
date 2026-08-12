@@ -157,6 +157,15 @@ sub_query=算力平台资源运营项目里有一笔对象存储与带宽费用�
 15.
 sub_query=帮我提一个办公设备采购申请。
 → {"project":{"search_term":"","code_hint":""}}
+16.
+sub_query=渠道布展升级印刷项目需要一批招商折页，预算9000，直接提交。
+→ {"project":{"search_term":"布展升级印刷","code_hint":""}}
+17.
+sub_query=智能客服知识库改造项目要走一笔品牌宣传费用，预算4万。
+→ {"project":{"search_term":"知识库改造","code_hint":""}}
+18.
+sub_query=渠道布展升级项目要做一批宣传物料，总预算1.5万，直接帮我走流程。
+→ {"project":{"search_term":"渠道布展升级","code_hint":""}}
 
 规则：只从 sub_query 提取原文，不解释、不补全、不编造；不输出任何数字 id（除 code_hint 的项目编码）。
 输出：{"project":{"search_term":"品牌升级","code_hint":""},"confidence":0.9}
