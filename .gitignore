@@ -32,5 +32,8 @@ submission/submission/
 # IDE.
 .idea/
 
+# LLM 中转代理独立成仓库（/Users/liupeize/code/llm-proxy），主仓库不再跟踪。
+llm-proxy/
+
 # Local review/analysis artifacts.
 outputs/
