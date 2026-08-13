@@ -7,8 +7,8 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 
-import httpx
 import pytest
 
 from utils.llm_gateway import (
@@ -141,13 +141,11 @@ class TestJsonObjectAdaptation:
             def chat(self, messages, **kwargs):
                 self.calls.append(bool(kwargs.get("require_json_object")))
                 if kwargs.get("require_json_object"):
-                    request = httpx.Request("POST", CFG["base_url"])
-                    response = httpx.Response(
-                        400,
-                        request=request,
-                        text='{"error":{"message":"must contain json to use json_object"}}',
+                    exc = urllib.error.HTTPError(
+                        CFG["base_url"], 400, "Bad Request", {}, None
                     )
-                    raise httpx.HTTPStatusError("400", request=request, response=response)
+                    exc.response_text = '{"error":{"message":"must contain json to use json_object"}}'
+                    raise exc
                 return json.dumps({"task_units": [{"unit_type": "budget"}]})
 
         backend = RejectThenOk()
@@ -160,8 +158,7 @@ class TestJsonObjectAdaptation:
         assert LLMGateway(config=CFG, backend=FakeBackend([]))._prefer_json_object is False
 
     def test_rejects_detector(self) -> None:
-        request = httpx.Request("POST", CFG["base_url"])
-        response = httpx.Response(400, request=request, text='{"error":"json_object"}')
-        exc = httpx.HTTPStatusError("400", request=request, response=response)
+        exc = urllib.error.HTTPError(CFG["base_url"], 400, "Bad Request", {}, None)
+        exc.response_text = '{"error":"json_object"}'
         assert _rejects_json_object(exc) is True
         assert _rejects_json_object(ConnectionError()) is False

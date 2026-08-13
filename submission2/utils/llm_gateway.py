@@ -9,7 +9,7 @@
   （gitignored，本地线上 key / base_url / model，只读）← 环境变量
   `OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL`；
 - 无 api_key / base_url / model → `available=False`，调用方直接走规则兜底；
-- **可注入 backend**（测试用 FakeBackend，不触网）；生产走 httpx openai-compatible
+- **可注入 backend**（测试用 FakeBackend，不触网）；生产走标准库 urllib 的 OpenAI-compatible
   `/chat/completions`（与官方 `submission_example.py` 同源）。
 
 安全（AGENT.md）：api_key 只在内存使用，绝不打印、绝不写日志、绝不进 final_answer。
@@ -22,15 +22,10 @@ import json
 import os
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
-
-import httpx
-
-try:  # 本地校验优先用 jsonschema（contest 已锁定版本）；缺失时降级为最小结构检查。
-    from jsonschema import Draft202012Validator
-except ImportError:  # pragma: no cover —— 仅当依赖缺失时走最小校验
-    Draft202012Validator = None  # type: ignore[assignment]
 
 
 def _load_config() -> dict[str, Any]:
@@ -70,18 +65,14 @@ def _load_config() -> dict[str, Any]:
 
 
 class HttpBackend:
-    """openai-compatible `/chat/completions` 后端（官方 submission_example 同源）。"""
+    """纯标准库 OpenAI-compatible ``/chat/completions`` 后端。
+
+    不依赖 httpx/openai SDK，避免评测容器缺少第三方包时在模块导入阶段直接失败。
+    """
 
     def __init__(self, *, base_url: str, api_key: str) -> None:
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.Client(
-            base_url=self.base_url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=httpx.Timeout(120.0),
-        )
+        self.api_key = api_key
 
     def chat(
         self,
@@ -108,13 +99,27 @@ class HttpBackend:
         }
         if require_json_object:
             body["response_format"] = {"type": "json_object"}
-        response = self._client.post(
-            "/chat/completions",
-            json=body,
-            timeout=timeout_s,
+        request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json; charset=utf-8",
+                "Accept": "application/json",
+            },
+            method="POST",
         )
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            with urllib.request.urlopen(request, timeout=max(float(timeout_s), 0.1)) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # 读取响应体后仍保留 HTTPError；上层据 status/text 判断是否应去掉
+            # response_format 重试。禁止记录 Authorization header。
+            try:
+                exc.response_text = exc.read().decode("utf-8", errors="replace")  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 - 错误体不可读不影响原异常传播
+                exc.response_text = ""  # type: ignore[attr-defined]
+            raise
         return payload["choices"][0]["message"]["content"]
 
 
@@ -151,14 +156,51 @@ def _parse_json(content: str) -> dict[str, Any] | None:
 
 
 def _schema_errors(data: dict[str, Any], schema: dict[str, Any]) -> list[str]:
-    """jsonschema 校验；缺依赖时退化为「必填键 + 顶层类型」最小检查。"""
-    if schema and Draft202012Validator is not None:
-        validator = Draft202012Validator(schema)
-        return [str(e.message) for e in sorted(validator.iter_errors(data), key=lambda e: list(e.path))]
+    """校验模型输出使用到的 JSON Schema 子集，全程仅依赖标准库。
+
+    覆盖 object/array/string/number/integer、required、properties、items、enum、
+    minimum/maximum 和 additionalProperties；这些已覆盖当前四类模型契约。
+    """
     errors: list[str] = []
-    for required in schema.get("required", []):
-        if required not in data:
-            errors.append(f"缺少必填键: {required}")
+
+    def check(value: Any, rule: dict[str, Any], path: str) -> None:
+        expected = rule.get("type")
+        type_ok = {
+            "object": isinstance(value, dict),
+            "array": isinstance(value, list),
+            "string": isinstance(value, str),
+            "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+            "integer": isinstance(value, int) and not isinstance(value, bool),
+            "boolean": isinstance(value, bool),
+        }.get(expected, True)
+        if not type_ok:
+            errors.append(f"{path} 类型应为 {expected}")
+            return
+        if "enum" in rule and value not in rule["enum"]:
+            errors.append(f"{path} 不在允许枚举中")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if "minimum" in rule and value < rule["minimum"]:
+                errors.append(f"{path} 小于最小值")
+            if "maximum" in rule and value > rule["maximum"]:
+                errors.append(f"{path} 大于最大值")
+        if isinstance(value, dict):
+            for required in rule.get("required", []):
+                if required not in value:
+                    errors.append(f"{path} 缺少必填键: {required}")
+            properties = rule.get("properties") or {}
+            if rule.get("additionalProperties") is False:
+                for key in value:
+                    if key not in properties:
+                        errors.append(f"{path}.{key} 是未允许字段")
+            for key, child_rule in properties.items():
+                if key in value and isinstance(child_rule, dict):
+                    check(value[key], child_rule, f"{path}.{key}")
+        if isinstance(value, list) and isinstance(rule.get("items"), dict):
+            for index, item in enumerate(value):
+                check(item, rule["items"], f"{path}[{index}]")
+
+    if schema:
+        check(data, schema, "$")
     return errors
 
 
@@ -168,11 +210,15 @@ def _rejects_json_object(exc: BaseException) -> bool:
     典型回复（OpenAI 系）："Response input messages must contain the word 'json'
     ... to use '***.format' of type 'json_object'."。命中后重试应去掉该参数。
     """
-    return (
-        isinstance(exc, httpx.HTTPStatusError)
-        and exc.response.status_code == 400
-        and "json_object" in exc.response.text
-    )
+    if isinstance(exc, urllib.error.HTTPError):
+        status = exc.code
+        text = str(getattr(exc, "response_text", ""))
+    else:
+        # 保持对可注入测试后端和其它 HTTP SDK 异常的兼容，不导入对应 SDK。
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        text = str(getattr(response, "text", ""))
+    return status == 400 and "json_object" in text
 
 
 # 供应商级记忆：同进程内一旦检测到某 base_url 拒绝 response_format=json_object，
