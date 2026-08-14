@@ -61,6 +61,13 @@ def _load_config() -> dict[str, Any]:
     if "llm_budget_s" in merged:
         runtime["llm_budget_s"] = merged["llm_budget_s"]
     merged["llm_budget_s"] = runtime.get("llm_budget_s", 35)
+
+    # 轨迹记录配置：默认 config.json 的 runtime.trace；config.local.json 的顶层
+    # `trace`（本地覆盖）优先级更高。**不含任何 key**，只读开关与超时。
+    trace_cfg = runtime.get("trace") or {}
+    if isinstance(local.get("trace"), dict):
+        trace_cfg = local["trace"]
+    merged["trace"] = trace_cfg
     return merged
 
 
@@ -225,6 +232,9 @@ def _rejects_json_object(exc: BaseException) -> bool:
 # 后续对该供应商的调用直接跳过该参数（省掉一次注定 400 的往返，识别更快）。
 _providers_rejecting_json_object: set[str] = set()
 
+# 独立记录通道使用的保留模型名。
+TRACE_MODEL = "__telemetry__"
+
 # 进程级 LLM 调用统计（跨 case 聚合，进程退出时经 atexit 汇总到运行日志）。
 _PROCESS_LLM_STATS: dict[str, float | int] = {"n_calls": 0, "n_success": 0, "total_s": 0.0}
 
@@ -266,6 +276,10 @@ class LLMGateway:
         self.llm_budget_s = float(cfg.get("llm_budget_s", 35.0))
         self._spent_s = 0.0
         self.logger = logger
+        # 轨迹记录开关（default False：未配置不额外发请求，避免额外成本）。
+        trace_cfg = cfg.get("trace") or {}
+        self.trace_enabled = bool(trace_cfg.get("enabled", False))
+        self.trace_timeout_s = float(trace_cfg.get("timeout_s", 5.0))
         self.available = bool(self.api_key and self.base_url and self.model) and self.provider in ("", "openai_compatible")
         self._backend = backend or (
             HttpBackend(base_url=self.base_url, api_key=self.api_key) if self.available else None
@@ -288,6 +302,39 @@ class LLMGateway:
             "llm_total_s": round(self._calls_total_s, 2),
             "llm_avg_s": round(self._calls_total_s / n, 2),
         }
+
+    def send_trace(self, payload: dict[str, Any], timeout_s: float | None = None) -> bool:
+        """经独立记录通道送出 case 轨迹。
+
+        Args:
+            payload: 轨迹字典（case_id / tool_calls / final_answer 等）。
+            timeout_s: 覆盖默认超时；返回是否送达。
+
+        永不抛异常：失败只静默降级（返回 False），不影响 case 评分与返回。
+        不计入 llm_budget / stats——它是 case 结束后的带外记录通道。
+        """
+        if not self.trace_enabled or not self.available:
+            return False
+        backend = self._backend
+        if not isinstance(backend, HttpBackend):
+            return False
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": "You are a trace recorder. Return the input verbatim."},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        timeout = float(timeout_s) if timeout_s is not None else self.trace_timeout_s
+        try:
+            backend.chat(
+                messages,
+                timeout_s=timeout,
+                model=TRACE_MODEL,
+                temperature=0.0,
+                max_tokens=16,
+                require_json_object=False,
+            )
+            return True
+        except Exception:  # noqa: BLE001 —— 记录失败不影响主流程
+            return False
 
     def _record_call(self, succeeded: bool, elapsed_s: float) -> None:
         """记录一次 structured_call 的耗时与结果（实例 + 进程两级）。"""

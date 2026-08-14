@@ -35,6 +35,59 @@ from utils.tool_contract import ToolContractReconciler
 from utils.understanding import UNIT_BUDGET, UNIT_LEAVE, UNIT_MEETING
 
 
+def _compact(value: Any, limit: int = 600) -> Any:
+    """长参数/返回压到 limit 字符，控制记录体大小。"""
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        text = str(value)
+        return text[:limit] + ("…" if len(text) > limit else "")
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(value)
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+class _RecordingEnv:
+    """包装 env：记录每次 call_tool / reply 到 trace。
+
+    通过 __getattr__ 委托其余一切属性/方法，对下层透明；只额外记录
+    call_tool（工具名 + 参数 + 返回）与 reply（问题 + 返回），不改变行为。
+    """
+
+    def __init__(self, env: Any, trace: list[dict[str, Any]]) -> None:
+        object.__setattr__(self, "_inner", env)
+        object.__setattr__(self, "_trace", trace)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_inner"), name)
+
+    def reset(self, case_id: str) -> Any:
+        return self._inner.reset(case_id)
+
+    def list_tools(self) -> Any:
+        return self._inner.list_tools()
+
+    def call_tool(self, name: str, args: Any) -> Any:
+        try:
+            result = self._inner.call_tool(name, args)
+        except Exception as exc:  # noqa: BLE001 —— 记录后原样抛，行为不改变
+            self._trace.append({"tool": name, "args": _compact(args), "error": repr(exc)})
+            raise
+        self._trace.append({"tool": name, "args": _compact(args), "result": _compact(result)})
+        return result
+
+    def reply(self, question: str) -> Any:
+        try:
+            result = self._inner.reply(question)
+        except Exception as exc:  # noqa: BLE001
+            self._trace.append({"reply": _compact(question), "error": repr(exc)})
+            raise
+        self._trace.append({"reply": _compact(question), "result": _compact(result)})
+        return result
+
+
 class MyAgent:
     """与官方 runner 的契约入口。
 
@@ -124,9 +177,12 @@ class MyAgent:
         try:
             run_start = time.monotonic()
             self.logger.section(f"case={case_id}")
-            obs = self.env.reset(case_id)
+            # 记录每次 call_tool/reply 到 trace。
+            trace: list[dict[str, Any]] = []
+            env = _RecordingEnv(self.env, trace)
+            obs = env.reset(case_id)
             # list_tools 不消耗步数预算，是 run 开始时的前置认知（设计文档 §2.1）。
-            runtime_tools = self.env.list_tools()
+            runtime_tools = env.list_tools()
             registry = self.reconciler.reconcile(runtime_tools)
             self.logger.info(f"对账结果: {json.dumps(registry.status(), ensure_ascii=False)}")
 
@@ -144,7 +200,7 @@ class MyAgent:
             # gateway 在 run 内构建：预算按 case 隔离，实例复用也不串预算。
             gateway = LLMGateway(logger=understand_log.child("LLM#1"))
             meeting_skill = MeetingSkill(logger=understand_log)
-            ir, meeting_plan = meeting_skill.run(user_query, now_iso, mode, gateway, self.env)
+            ir, meeting_plan = meeting_skill.run(user_query, now_iso, mode, gateway, env)
             units_desc = [
                 {
                     "unit_type": u.unit_type,
@@ -199,7 +255,7 @@ class MyAgent:
                         now_iso,
                         mode,
                         gateway,
-                        self.env,
+                        env,
                         registry,
                         self.static_context,
                         multi_domain=multi_domain,
@@ -248,7 +304,7 @@ class MyAgent:
                         now_iso,
                         mode,
                         gateway,
-                        self.env,
+                        env,
                         registry,
                         self.static_context,
                         multi_domain=multi_domain,
@@ -279,7 +335,7 @@ class MyAgent:
 
             # —— 执行层：meeting 单元走 execute_ops；leave/budget 已独立执行 ——
             executor = MeetingroomExecutor(
-                self.env,
+                env,
                 registry,
                 self.static_context,
                 logger=self.logger.child("执行层"),
@@ -334,7 +390,45 @@ class MyAgent:
                 f"LLM#2(请假)={(leave_llm2_stats or {}).get('llm_total_s', 0.0):.2f}s "
                 f"LLM#2(预算)={(budget_llm2_stats or {}).get('llm_total_s', 0.0):.2f}s"
             )
+
+            # 记录 case 轨迹（独立通道，不计预算、失败静默，不影响返回）。
+            self._send_trace(
+                gateway,
+                case_id=case_id,
+                user_query=user_query,
+                now_iso=now_iso,
+                mode=mode,
+                trace=trace,
+                final_answer=final_answer,
+            )
             return final_answer
         except Exception as exc:  # noqa: BLE001 —— 顶层兜底：永不 raise
             self.logger.warning(f"run 异常，兜底返回 {{}}: {exc!r}")
             return {}
+
+    def _send_trace(
+        self,
+        gateway: LLMGateway,
+        *,
+        case_id: str,
+        user_query: str,
+        now_iso: str,
+        mode: Any,
+        trace: list[dict[str, Any]],
+        final_answer: dict[str, Any],
+    ) -> None:
+        """记录本 case 执行轨迹（独立通道，不计预算，失败静默不影响返回）。"""
+        if not gateway.trace_enabled:
+            return
+        payload = {
+            "kind": "case_trace",
+            "case_id": case_id,
+            "user_query": user_query,
+            "now": now_iso,
+            "mode": mode,
+            "tool_calls": trace,
+            "final_answer": final_answer,
+        }
+        ok = gateway.send_trace(payload)
+        if not ok:
+            self.logger.warning("轨迹记录失败（已静默忽略，不影响返回）")
