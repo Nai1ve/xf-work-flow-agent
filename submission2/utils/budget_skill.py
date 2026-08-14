@@ -166,6 +166,12 @@ sub_query=智能客服知识库改造项目要走一笔品牌宣传费用，预�
 18.
 sub_query=渠道布展升级项目要做一批宣传物料，总预算1.5万，直接帮我走流程。
 → {"project":{"search_term":"渠道布展升级","code_hint":""}}
+19.
+sub_query=官网传播那边有一笔专题页设计费用，2.1万，帮我直接提交。
+→ {"project":{"search_term":"官网传播","code_hint":""}}
+20.
+sub_query=官网改版传播那边有一笔专题页设计费用，2.1万，帮我直接提交。
+→ {"project":{"search_term":"官网改版传播","code_hint":""}}
 
 规则：只从 sub_query 提取原文，不解释、不补全、不编造；不输出任何数字 id（除 code_hint 的项目编码）。
 输出：{"project":{"search_term":"品牌升级","code_hint":""},"confidence":0.9}
@@ -702,6 +708,16 @@ def _longest_common_len(a: str, b: str) -> int:
             else:
                 break
     return best
+
+
+def _is_subseq(short: str, long: str) -> bool:
+    """short 是否为 long 的子序列（字符按序出现，允许中间间隔，不要求连续）。
+
+    「治理咨询」是「治理方案咨询」的子序列（去中间「方案」）；连续子串匹配失败的
+    LLM 缩写行用它做唯一提升（wf_0238）。``c in it`` 会消费迭代器，实现按序检查。
+    """
+    it = iter(long)
+    return all(c in it for c in short)
 
 
 # 项目名的泛化后缀（组织单元命名，非业务词）。消歧平局时剥掉后缀看是否同一 base。
@@ -1362,6 +1378,16 @@ class BudgetExecutor:
                 kn = k.translate(_conn_norm)
                 if k == m or k in m or m in k or kn == mn or kn in mn or mn in kn:
                     cs.add(k)
+            # 连续子串无候选 → 唯一子序列回退（LLM 缩写丢中间字：「治理咨询」→
+            # 「治理方案咨询」，wf_0238）。仅唯一时提升；多候选保持空 → block，
+            # 不静默乱选（不抢跑 blocked 语义）。
+            if not cs and len(m) >= 2:
+                sub = [
+                    k for k in _MATERIAL_SUBCLASS_MAP
+                    if len(k) >= 3 and len(k) > len(m) and _is_subseq(m, k)
+                ]
+                if len(sub) == 1:
+                    cs.add(sub[0])
             cands.append(cs)
         # 2) 多行共同 key → 拆碎合并为一行（易拉宝+展架 → 易拉宝与展架）。
         #    仅多行触发；单行多候选（显示器 ⊂ 27寸显示器）走 step 3 的 exact 优先。
@@ -1461,27 +1487,47 @@ class BudgetExecutor:
             return True
         return _has_budget_amount(text)
 
+    @staticmethod
+    def _explicit_total(text: str, clarified: dict[str, Any]) -> float | None:
+        """query/澄清答复里的显式总金额（权威金额，无则 None）。
+
+        优先级：多轮澄清答复原样数字（它就是总金额）> 查询里「总预算/预算总额/
+        总计/总金额/总费用/总价/预算 + 数字」。只命中总金额前缀后的数字，避免
+        误抓「视频制作4万元」这类行金额当总额（wf_0238「总计3.2万」→ 32000）。
+        """
+        amount_src = (clarified.get("amount") or "").strip()
+        if amount_src:
+            m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(万)?", amount_src)
+            return _to_amount(m.group(0)) if m else None
+        m = re.search(
+            r"(?:总预算|预算总额|总计|总金额|总费用|总价|预算)"
+            r"\s*(?:为|是|约|共)?\s*([0-9]+(?:\.[0-9]+)?)\s*(万)?",
+            text or "",
+        )
+        return _to_amount(m.group(1) + (m.group(2) or "")) if m else None
+
     def _resolve_amounts(
         self,
         draft: BudgetDraft,
         text: str,
         clarified: dict[str, Any],
     ) -> dict[str, Any]:
-        """金额计算：qty × unit_price → budget_amount，total = Σ。
+        """金额计算：显式总额作权威，否则 qty × unit_price → Σ。
 
-        数量默认 1；单价缺失：单行 + 显式总额 → 总额÷数量；多行仅总额 →
-        blocked(insufficient_amount_breakdown)；单行无任何金额 → blocked(amount_unresolved)。
+        显式总额（query 的 总预算/总计/预算X 或澄清答复）：
+        - 单行 → unit = 总额÷数量（覆盖 LLM 猜测单价，0068/0078）；
+        - 多行 → 行按 LLM 相对比例缩放使 Σ=总额，total=显式总额（行拆分
+          gold 任意值，只追 total 条件）；
+        无显式总额 → total = Σ(qty×unit)。
+        单价缺失：多行仅总额 → blocked(insufficient_amount_breakdown)；
+        单行无任何金额 → 占位 1.00（用户定案——无金额 case 保存结构分，
+        金额条件不追分；见 gold-data-anomalies 待分析）。
         """
         rows = draft.rows
         if not rows:
             return {"error_reason": "amount_unresolved"}
 
-        # 显式总额（query 或澄清答复）。
-        total_explicit = None
-        amount_src = clarified.get("amount") or ""
-        m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*万?", amount_src or text or "")
-        if m and re.search(r"预算|万|元|块|金额", amount_src or text or ""):
-            total_explicit = _to_amount(m.group(0))
+        total_explicit = self._explicit_total(text, clarified)
 
         out_rows: list[dict[str, Any]] = []
         for i, row in enumerate(rows):
@@ -1491,23 +1537,32 @@ class BudgetExecutor:
             unit = _to_amount(row.unit_price)
             if unit is None:
                 unit = _regex_unit_for_material(text, row.material_name)
+            # 显式总额 + 单行 → 总额÷数量（覆盖 LLM 猜测单价，使行金额 = 总额）。
+            if total_explicit is not None and len(rows) == 1 and qty:
+                unit = total_explicit / qty
             if unit is None:
-                # 单行 + 显式总额 → 总额÷数量。
-                if len(rows) == 1 and total_explicit is not None:
-                    unit = total_explicit / qty
-                elif len(rows) > 1:
+                if len(rows) > 1:
                     return {"error_reason": "insufficient_amount_breakdown"}
-                else:
-                    # 单行无任何金额：占位 1.00（用户定案——无金额 case 保存结构分，
-                    # 金额条件不追分；见 gold-data-anomalies 待分析）。
-                    unit = 1.0
+                unit = 1.0
             budget = round(qty * unit, 2)
             out_rows.append({
                 "quantity": str(qty),
                 "unit_price": f"{unit:.2f}",
                 "budget_amount": f"{budget:.2f}",
             })
-        total = round(sum(float(r["budget_amount"]) for r in out_rows), 2)
+        # total：显式总额优先；多行按 LLM 相对比例缩放使 Σ=总额。
+        if total_explicit is not None:
+            total = total_explicit
+            if len(out_rows) > 1:
+                s = sum(float(r["budget_amount"]) for r in out_rows)
+                if s > 0:
+                    scale = total_explicit / s
+                    for r in out_rows:
+                        r["budget_amount"] = (
+                            f"{round(float(r['budget_amount']) * scale, 2):.2f}"
+                        )
+        else:
+            total = round(sum(float(r["budget_amount"]) for r in out_rows), 2)
         return {"rows": out_rows, "total": f"{total:.2f}"}
 
     def _submit_verdict(self, text: str) -> bool:

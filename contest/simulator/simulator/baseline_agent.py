@@ -19,6 +19,8 @@ class BaselineAgent:
         obs = self.env.reset(case_id)
         tools = self.env.list_tools()
         self._case_now = datetime.fromisoformat(obs["now"]) if obs.get("now") else None
+        print(f"[Env] case={case_id} now={obs.get('now')} mode={obs.get('mode')} "
+              f"now_weekday={self._case_now.strftime('%A') if self._case_now else None}")
 
         query = obs["user_query"]
         print(f"[Query] {query}")
@@ -543,20 +545,21 @@ class BaselineAgent:
     def _infer_day(self, query: str) -> str:
         base = self._case_now or datetime(2026, 4, 18, 10, 0, 0)
 
+        day = None
         explicit = re.search(r"(\d{4})-(\d{2})-(\d{2})", query)
         if explicit:
-            return f"{explicit.group(1)}-{explicit.group(2)}-{explicit.group(3)}"
+            day = f"{explicit.group(1)}-{explicit.group(2)}-{explicit.group(3)}"
 
         month_day = re.search(r"(\d{1,2})月(\d{1,2})[号日]", query)
-        if month_day:
-            return f"{base.year:04d}-{int(month_day.group(1)):02d}-{int(month_day.group(2)):02d}"
+        if day is None and month_day:
+            day = f"{base.year:04d}-{int(month_day.group(1)):02d}-{int(month_day.group(2)):02d}"
 
-        if "今天" in query:
-            return base.date().isoformat()
-        if "明天" in query:
-            return (base.date() + timedelta(days=1)).isoformat()
-        if "后天" in query:
-            return (base.date() + timedelta(days=2)).isoformat()
+        if day is None and "今天" in query:
+            day = base.date().isoformat()
+        if day is None and "明天" in query:
+            day = (base.date() + timedelta(days=1)).isoformat()
+        if day is None and "后天" in query:
+            day = (base.date() + timedelta(days=2)).isoformat()
 
         weekday_map = {
             "一": 0,
@@ -569,21 +572,24 @@ class BaselineAgent:
             "天": 6,
         }
         next_week_match = re.search(r"下周([一二三四五六日天])", query)
-        if next_week_match:
+        if day is None and next_week_match:
             target_weekday = weekday_map[next_week_match.group(1)]
             days_until_next_monday = 7 - base.weekday()
             target_date = base.date() + timedelta(days=days_until_next_monday + target_weekday)
-            return target_date.isoformat()
+            day = target_date.isoformat()
 
         this_week_match = re.search(r"(本周|这周)([一二三四五六日天])", query)
-        if this_week_match:
+        if day is None and this_week_match:
             target_weekday = weekday_map[this_week_match.group(2)]
             delta = target_weekday - base.weekday()
             if delta < 0:
                 delta += 7
-            return (base.date() + timedelta(days=delta)).isoformat()
+            day = (base.date() + timedelta(days=delta)).isoformat()
 
-        return base.date().isoformat()
+        if day is None:
+            day = base.date().isoformat()
+        print(f"[DayInfer] now={base.isoformat()} query={query[:40]!r} => {day}")
+        return day
 
     def _infer_title(self, query: str) -> str:
         title_match = re.search(r"主题(?:是|写)?([^\n，。,.]+)", query)

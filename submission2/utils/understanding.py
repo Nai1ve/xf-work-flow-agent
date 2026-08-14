@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from .business_rules import _FLOORLESS_BUILDINGS
+
 # --------------------------------------------------------------------------
 # 意图常量（会议室 SOP 分类，technical_design.md §5 / 计划文件 §二）
 # --------------------------------------------------------------------------
@@ -259,7 +261,8 @@ class IntentRouter:
 
         # S4b 换大会议室（无显式取消词，如 0011「参会人加了4个，帮我换一个大一点的会议室」）。
         # 必须在参会人 hint（"参会人"）之前判定，否则 0011 会误判为 participant。
-        if any(h in query for h in ("换一个大", "换大一点", "换间更大", "换一间更大", "换个大", "更大的会议室")):
+        # 「换大房」「换大」是 zh_0219/0226 的措辞变体——换大语义本身即重订。
+        if any(h in query for h in ("换一个大", "换大一点", "换间更大", "换一间更大", "换个大", "更大的会议室", "换大房", "换大")):
             return INTENT_REBOOK
 
         # S5 延长（含「冲突则保持原会不变」的查询型延长）。
@@ -357,13 +360,14 @@ _INTENT_PROMPT_CARD = """你是企业流程 Agent 的「意图识别器」：把
 硬约束：
 - 绝不抽取参数：不输出地点/时间/人数/主题/金额等任何槽位键。
 - 预订/取消/延长/参会人/查询等细粒度一律归入 meeting，不在识别层区分。
-- 每个 task_unit 必须带 sub_query：该单元负责的**原文字句**（从 user_query 里原样照抄、可删去其它单元的无关部分，但不改写、不新增、不抽取槽位）。单域整句 → sub_query=整句。
+- 每个 task_unit 必须带 sub_query：该单元负责的**原文字句**（从 user_query 里原样照抄、可删去其它单元的无关部分、不抽取槽位；**但允许跨引用解析**：sub_query 含指代（同项目/该项目/那个项目/也/同样/上面的/X那边）时，用 user_query 中指代的实际项目名替换指代词，如「同项目的短片费用」→「数字员工项目的短片费用」，使 sub_query 自包含；解析不出 → 保持原样。**会议主题不算项目名**：项目周会/项目复盘/项目评审/项目培训等不可作指代目标，指代目标必须是「X项目/项目是X/X产品发布会」形式）。单域整句 → sub_query=整句。
 - task_unit 内只允许 unit_type / sub_query / depends_on / confidence 四键。
 - confidence 0~1，≥0.55 视为可靠；可放顶层或每个单元。
 示例：
 - 「订个会议室，然后请三天假」→ [meeting{sub_query:"订个会议室"}, leave{sub_query:"然后请三天假"}]
 - 「取消原来的，换个更大的会议室重新订」→ [meeting{sub_query:"取消原来的，换个更大的会议室重新订"}]
 - 「延长30分钟，然后把张伟加入参会人」→ [meeting{sub_query:"延长30分钟，然后把张伟加入参会人"}]
+- 「订数字员工项目复盘会，顺便把同项目的视频制作费用存个草稿」→ [meeting{sub_query:"订数字员工项目复盘会"}, budget{sub_query:"数字员工项目的视频制作费用存个草稿"}]
 输出：{"task_units":[{"unit_type":"meeting","sub_query":"订个会议室","depends_on":[]}],"confidence":0.95}
 只输出一个符合 schema 的 json 对象。"""
 
@@ -555,10 +559,23 @@ class TemporalResolver:
         Returns:
             ISO 日期字符串；无法解析返回 None。
         """
-        # 字面日期：5月11日。
-        m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", query)
+        # 字面日期：5月11日 / 5月11号。
+        m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]", query)
         if m:
             return date(self._today.year, int(m.group(1)), int(m.group(2))).isoformat()
+
+        # 下个月X日 / 下月X号（跨年自动顺延）。
+        m = re.search(r"下(?:个)?月\s*(\d{1,2})\s*[日号]", query)
+        if m:
+            d = int(m.group(1))
+            if self._today.month == 12:
+                base = date(self._today.year + 1, 1, d)
+            else:
+                base = date(self._today.year, self._today.month + 1, d)
+            try:
+                return base.isoformat()
+            except ValueError:
+                return None
 
         # 今天 / 明天 / 后天。
         if "后天" in query:
@@ -830,7 +847,7 @@ class MeetingConstraintExtractor:
             addresses.append(MeetingConstraintExtractor._address_for(campus, c.building, c.floor))
         elif c.floor:
             # 无楼栋指定楼层：枚举常见楼栋（与 0038「小镇一楼」一致）。
-            for building in ("A1", "A2", "A3", "A4", "A5"):
+            for building in _FLOORLESS_BUILDINGS:
                 addresses.append(MeetingConstraintExtractor._address_for(campus, building, c.floor))
         else:
             addresses.append(campus)

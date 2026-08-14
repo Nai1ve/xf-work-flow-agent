@@ -27,6 +27,11 @@ _FLOOR_CN = {
     "六": "6", "七": "7", "八": "8", "九": "9", "零": "0",
 }
 
+# 「无楼栋有楼层」地址展开时的楼栋枚举（与 understanding._build_addresses 同源）：
+# 地址只给园区+楼层（如 小镇一楼 → 0552_1F）时，room.list 无法直接匹配，需展开为
+# 园区下各楼栋的同楼层（0552_A1_1F … 0552_A5_1F）。**唯一权威定义**，两处共用。
+_FLOORLESS_BUILDINGS = ("A1", "A2", "A3", "A4", "A5")
+
 
 def normalize_office_address(address: str) -> str:
     """把单个地址归一为工具契约内部码（``园区码[_楼栋[_楼层]]``）。
@@ -75,15 +80,36 @@ def _extract_floor(text: str) -> str | None:
 
 
 def normalize_addresses(addresses: Any) -> list[str]:
-    """对候选地址列表整体归一（保持顺序、去空、去重）。"""
+    """对候选地址列表整体归一（保持顺序、去空、去重）。
+
+    无楼栋有楼层（如「小镇一楼」→ ``0552_1F``）时，把该地址展开为园区下各楼栋的
+    同楼层（``0552_A1_1F`` … ``0552_A5_1F``）：room.list 的 office_address 契约
+    是 ``园区[_楼栋[_楼层]]``，无楼栋的 ``0552_1F`` 会被执行层当成「楼栋=1F」
+    而匹配不到任何房间（mr_0038 归零根因）。展开后执行层按楼栋逐个搜索，
+    与理解层 `_build_addresses` 的「无楼栋有楼层 → 各楼栋该楼层」规则一致。
+    """
     if not isinstance(addresses, list):
         return []
     out: list[str] = []
     for a in addresses:
         code = normalize_office_address(str(a))
-        if code and code not in out:
-            out.append(code)
+        for expanded in _expand_floorless_address(code):
+            if expanded and expanded not in out:
+                out.append(expanded)
     return out
+
+
+def _expand_floorless_address(code: str) -> list[str]:
+    """把无楼栋有楼层的内部码（``0552_1F``）展开为各楼栋同楼层；否则原样返回。
+
+    判定：两段式（``园区_楼层``，第二段是楼层码如 ``1F``）。已含楼栋（``0552_A1_1F``）
+    或仅园区（``0552``）均不展开——前者契约完整，后者是合法宽搜范围。
+    """
+    parts = code.split("_")
+    if len(parts) == 2 and re.fullmatch(r"\d+F", parts[1]):
+        campus, floor = parts
+        return [f"{campus}_{building}_{floor}" for building in _FLOORLESS_BUILDINGS]
+    return [code]
 
 
 def normalize_building(building: Any) -> Any:

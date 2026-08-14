@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 import time
+from datetime import timedelta
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -112,9 +113,10 @@ book 订新的（conditional:true=没订才订，已订则跳过） | cancel 取
 earliest / multi_day / compare_book 是终态订房动作（自身就完成预订），不要再追加 book。
 
 字段（放 target）：
-day/start/end（YYYY-MM-DD/HH:MM）slots=[{"day","start","end","title"}] 同日多场 days=[...] 多日 week_start/week_end book_only_day addresses=["0552_A1_3F"] capacity 人数 screen title attendees time_flexible workspace_near（仅用户明确要「离工位最近」时设；「在X园区/楼栋」只是地址约束，不设） persons=[{"name","employee_no"}] minutes 延长分钟 rooms 点名房间（短名如 "A1-349" 也行，系统会规范成 "A1-3F-349"） keyword query_type(booking_list/schedule/unbookable/workspace) larger 是否换更大 conditional/inherit_title 布尔 flag
+day/days/book_only_day 输出 sub_query 原文日期短语（下周二/明天/本周三/5月11日/周三），系统按 now 自动换算成具体日期，**不要**自己算成 YYYY-MM-DD（算错会订错日）；**本周/下周 这类整周词不能当 day**（不是具体一天）；start/end（HH:MM）slots=[{"day","start","end","title"}] 同日多场（slot 的 day 同样用原文短语）days=[...] 多日（每项都是原文短语）week_start/week_end/start_date/end_date 保持 YYYY-MM-DD（区间/查询范围，给不出就省略让系统按 now 算）book_only_day 与 day 同规则（原文短语）addresses=["0552_A1_3F"] capacity 人数 screen title attendees time_flexible workspace_near（仅用户明确要「离工位最近」时设 true；与 addresses 是**独立约束**，可并存） persons=[{"name","employee_no"}] minutes 延长分钟 rooms 点名房间（短名如 "A1-349" 也行，系统会规范成 "A1-3F-349"） keyword query_type(booking_list/schedule/unbookable/workspace) larger 是否换更大 conditional/inherit_title 布尔 flag
 
 规则：只从 sub_query 提取原文字段；order_id 仅 sub_query 含 SEED-* 时透传；复合按序多条（终态订房后只接非 book 动作，如加参会人/查询）。
+**地址约束规则**：addresses 是**地址约束数组**——子句提到「在X园区/楼/栋/楼层」就**必须**填入 addresses；「离工位最近」→ workspace_near:true。两者**不互斥**，同时出现时**都必须提取**。
 示例：1)「之前订的X太小，重新订20人以上」→ cancel{day,start,end} + book{day,start,end,addresses,capacity:20,larger:true,inherit_title:true}
 2)「能多开半小时就延长，冲突就别动」→ extend{day,start,end,minutes:30,conditional:true}
 3)「上午9-11开A、下午2-4开B，同一房间」→ multi_day{slots}
@@ -123,7 +125,8 @@ day/start/end（YYYY-MM-DD/HH:MM）slots=[{"day","start","end","title"}] 同日�
 6)「如果没订就帮我订」→ book{day,start,end,conditional:true}
 7)「先看看A1-349会议室周四下午3-5点空不空，空就订」→ book{day,start,end,rooms:["A1-349"]}（点名订房动作内部会先查该房间日程，空才订；**不要**拆成 query+book 两步）
 8)「帮我查A1-3F-349本周（5月11日到5月15日）的预订情况」→ query{query_type:"schedule",room_id:"A1-3F-349",start_date:"2026-05-11",end_date:"2026-05-15"}
-输出：{"ops":[{"action":"book","target":{"day":"2026-08-10","start":"14:00","end":"15:00"}}],"confidence":0.9}
+9)「合肥A4楼10人带屏幕会议室，离我工位近一点」→ book{day,start,end,addresses:["合肥A4楼"],capacity:10,screen:true,workspace_near:true}
+输出：{"ops":[{"action":"book","target":{"day":"下周二","start":"14:00","end":"15:00"}}],"confidence":0.9}
 只输出一个 JSON 对象。"""
 
 @dataclass
@@ -221,10 +224,26 @@ class MeetingOpPlanner:
                 ops = self._fill_gaps(ops, context, now_iso, mode)
                 # 程序侧日期归一（mr_0041）：LLM 偶发把 day/days/book_only_day
                 # 输出成中文星期（周三/周四）而非 ISO 日期 → 转成相对 now 的日期。
-                ops = self._normalize_day_values(ops, now_iso)
+                ops = self._normalize_day_values(ops, now_iso, context)
                 # 程序侧业务规则（#41 窄例外）：地址显示名→内部码查表归一、
                 # 公司时间「午别+时长」→规范起止翻译。两者均不给模型处理。
                 ops = self._apply_business_rules(ops, context)
+                # 统一流程（换大房，防御性）：query 含换大语义且计划带 participant_add
+                # 但无 cancel（LLM 常把「加人+换大」误判成 participant_add+book，产生
+                # 额外预订触发 forbidden）→ 按规则重编 rebook（cancel + book{inherit_title,
+                # larger}）。正确日期 case（mr_0011/0222）LLM 已 emit cancel → 不受影响；
+                # 规则判定不出 rebook（意图 unknown）→ 保持 LLM 计划不动。
+                if self._is_rebook_larger_miss(context, ops):
+                    rule_ops = self._rule_plan(context, now_iso, mode)
+                    rule_ops = self._sanitize_order_id(rule_ops, context)
+                    rule_ops = self._normalize_day_values(rule_ops, now_iso, context)
+                    rule_ops = self._apply_business_rules(rule_ops, context)
+                    if rule_ops:
+                        ops = rule_ops
+                        if self.logger is not None:
+                            self.logger.warning(
+                                f"会议「换大房」缺 cancel（{[op.action for op in ops]}），规则重编 rebook"
+                            )
                 if not self._structurally_usable(ops):
                     # LLM 编排结构性不可执行（如 0223 compare_book 无 compare_rooms）→ 规则兜底。
                     if self.logger is not None:
@@ -233,7 +252,7 @@ class MeetingOpPlanner:
                         )
                     ops = self._rule_plan(context, now_iso, mode)
                     ops = self._sanitize_order_id(ops, context)
-                    ops = self._normalize_day_values(ops, now_iso)
+                    ops = self._normalize_day_values(ops, now_iso, context)
                     ops = self._apply_business_rules(ops, context)
                     return MeetingOpPlan(
                         ops=ops,
@@ -255,7 +274,7 @@ class MeetingOpPlanner:
         ops = self._rule_plan(context, now_iso, mode)
         ops = self._sanitize_order_id(ops, context)
         ops = self._dedup_booking_ops(ops)
-        ops = self._normalize_day_values(ops, now_iso)
+        ops = self._normalize_day_values(ops, now_iso, context)
         ops = self._apply_business_rules(ops, context)
         return MeetingOpPlan(
             ops=ops,
@@ -277,6 +296,21 @@ class MeetingOpPlanner:
 
     # 一个 meeting 单元只允许一个订房动作（book/multi_day/earliest/compare_book）。
     _BOOK_FAMILY = frozenset({"book", "multi_day", "earliest", "compare_book"})
+
+    @classmethod
+    def _is_rebook_larger_miss(cls, context: str, ops: list[MeetingOp]) -> bool:
+        """换大房被误判为加人：query 含换大语义 + 计划带 participant_add 但无 cancel。
+
+        「加人 + 换大房」的真实语义是取消原会议另订更大的（cancel + book{larger}），
+        而 LLM 常输出 participant_add + book —— 原会议不取消、又新订一间 → 双活跃
+        预订触发「存在额外新增活跃会议预订」forbidden。只有两种信号同时成立才触发：
+        (1) query 有换大/太小/更大/大一点；(2) 计划有 participant_add 且无 cancel。
+        """
+        if "cancel" in [op.action for op in ops]:
+            return False
+        if "participant_add" not in [op.action for op in ops]:
+            return False
+        return any(h in (context or "") for h in ("太小", "更大", "换大", "大一点"))
 
     @classmethod
     def _dedup_booking_ops(cls, ops: list[MeetingOp]) -> list[MeetingOp]:
@@ -336,7 +370,14 @@ class MeetingOpPlanner:
         自身正确抽取）。语义 flag（conditional/dedup/larger）同样仅 setdefault
         （模型没给才填），不覆盖。
         """
-        _, rule_c = analyze_meeting_query(user_query, now_iso, mode)
+        rule_intent, rule_c = analyze_meeting_query(user_query, now_iso, mode)
+        # 方案 A（2026-08-14 用户定案，与 _rule_plan 同源）：单轮预订缺 day →
+        # 默认当日，让 LLM 漏 day 的 book 仍能走完整搜索判定（zh_0223/0224 的
+        # LLM 空壳触发规则兜底在 _rule_plan 覆盖；这里兜 LLM 给了非空但无 day 的
+        # 单轮 booking）。只补 _BOOK_FAMILY 的 day（下方 FILLABLE 通用补全不区分
+        # 动作，cancel/extend 的 day 保持规则值，不在此默认）。
+        if rule_intent == INTENT_BOOK and not rule_c.day:
+            rule_c.day = TemporalResolver(now_iso).today.isoformat()
         rule_t = cls._constraints_to_target(rule_c)
 
         # 规则语义 flag（模型漏给时 setdefault，模型已给则保留）。
@@ -373,6 +414,26 @@ class MeetingOpPlanner:
                     rule_val = rule_t.get(key)
                     if rule_val not in (None, "", [], False):
                         t[key] = rule_val
+
+        # 统一订房候选队列（用户定案「执行层补全」，统一流程）：query 声明备选楼栋
+        # （先A1不行就A2 / 优先A1 / A1没有合适的就A2）时，候选地址按规则权威顺序
+        # （主楼栋[+楼层] + 备选楼栋）在前、LLM 给出的地址去重追加在后。LLM 常把
+        # addresses 给成「备选楼栋+楼层」的过度具体地址（mr_0023 56 分：只搜
+        # 0552_A2_1F，缺 0552_A1_4F 与 0552_A2 两次楼栋级 room.list）→ 主楼栋搜索
+        # 被跳过、gold 的两栋探测落空。搜索顺序是**流程**（程序权威，#41 窄例外：
+        # 只补候选序列，不覆盖 LLM 的容量/标题/时间等语义值）。
+        if rule_c.fallback_building:
+            rule_addresses = rule_t.get("addresses") or []
+            if rule_addresses:
+                for op in ops:
+                    if op.action in cls._BOOK_FAMILY:
+                        cur = [a for a in (op.target.get("addresses") or []) if a]
+                        merged = list(rule_addresses)
+                        for a in cur:
+                            if a not in merged:
+                                merged.append(a)
+                        op.target["addresses"] = merged
+                        op.target.setdefault("fallback_building", rule_c.fallback_building)
         return ops
 
     # 公司时间计算器作用的 op 家族（带起止时刻的预订类动作）。
@@ -421,7 +482,12 @@ class MeetingOpPlanner:
 
     @staticmethod
     def _normalize_day_value(value: Any, resolver: TemporalResolver) -> Any:
-        """把单个 day 值（中文星期 / 字面日期 / 相对表达）归一为 ISO 日期。
+        """把单个 day 值（原文日期短语）归一为 ISO 日期（方案1，确定性）。
+
+        与 leave 对齐：LLM 只输出 sub_query 的原文日期短语（下周二/明天/本周三/
+        5月11日/周三），日期换算完全交给程序（TemporalResolver）——消除「下周二」
+        被 LLM 预解析成 04-21 或 04-28 的方差。**搜索式**解析，容忍短语前后缀
+        （「下周二下午」「周三的」），与解析器覆盖的旧形式保持兼容。
 
         返回原值的情形：已是 ISO 日期（YYYY-MM-DD）、无法识别的串（交执行层
         校验报错而非静默吞掉）。
@@ -429,36 +495,137 @@ class MeetingOpPlanner:
         s = str(value).strip()
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
             return s
-        # 中文星期：下周三 / 本周三 / 周三 / 周天。
-        m = re.fullmatch(r"(下周|本周|周)?([一二三四五六日天])", s)
+        # 大后天必须先于「后天」判断（resolve_day 的「后天」子串会误判为 +2 天）。
+        if "大后天" in s:
+            return (resolver._today + timedelta(days=3)).isoformat()
+        # 下周X / 下个星期三 / 下星期二 / 下星期X。
+        m = re.search(r"下(?:周|个星期|星期)([一二三四五六日天])", s)
         if m:
-            weeks = 1 if m.group(1) == "下周" else 0
-            return resolver._offset_weekday(m.group(2), weeks).isoformat()
-        # 字面日期（5月11日）/ 今天 / 明天 / 后天：复用规则解析器。
+            return resolver._offset_weekday(m.group(1), weeks=1).isoformat()
+        # 本周X / 这周X / 星期X / 周X。
+        m = re.search(r"(?:本周|这周|星期|周)([一二三四五六日天])", s)
+        if m:
+            return resolver._offset_weekday(m.group(1), weeks=0).isoformat()
+        # 字面日期（5月11日）/ 下个月X日 / 今天 / 明天 / 后天：复用规则解析器。
         resolved = resolver.resolve_day(s)
         if resolved:
             return resolved
         return value
 
     @classmethod
-    def _normalize_day_values(cls, ops: list[MeetingOp], now_iso: str) -> list[MeetingOp]:
-        """把 LLM op target 里的中文星期名归一为 ISO 日期（mr_0041）。
+    def _normalize_day_values(
+        cls,
+        ops: list[MeetingOp],
+        now_iso: str,
+        context: str | None = None,
+    ) -> list[MeetingOp]:
+        """把 LLM op target 里的原文日期短语归一为 ISO 日期（方案1）。
 
-        LLM 偶发把 multi_day 的 ``days`` 输出成「周三/周四」而非日期，或单日
-        ``day`` / ``book_only_day`` 输出成「周X」→ 执行层原样透传给 room.list，
-        schema 拒绝 / 订错日。规则抽取（TemporalResolver）早已转成日期，此步
-        只兜 LLM 路径；对纯日期是 no-op。``_fill_gaps`` 用 setdefault 不覆盖
-        LLM 已给值，故归一必须在补全之后。
+        LLM#2 的卡片契约：``day/days/book_only_day`` 只输出 sub_query 原文日期
+        短语，日期换算完全由本步确定性完成（消除「下周二」→ 04-21/04-28 的
+        LLM 方差）。对已经是 ISO 的值是 no-op；``week_start/week_end`` 若是
+        「本周/下周」这类整周词，展开成周一~周五区间（最早能订上语义）。
+
+        **安全网**（方案1 的强制兜底）：LLM 违反卡片指令仍把 ``day`` 预解析成
+        ISO（下周二 → 04-28 订错日）时，只要 sub_query 里**只有一个**可解析的
+        日期短语，就以规则抽取的确定性日期覆盖。多日期上下文（取消周三/周四再
+        订、周三和周四多日、下周X 比较订房）不触发，避免误覆盖其它日期的 op；
+        只作用于 ``book`` 动作（方差实测全部落在普通订房上）。
         """
         resolver = TemporalResolver(now_iso)
+        # 规则抽取的确定性 booking 日（安全网权威值；仅单日期上下文才启用）。
+        rule_day: Any = None
+        if context:
+            try:
+                _, rule_c = analyze_meeting_query(context, now_iso, None)
+                rule_day = cls._constraints_to_target(rule_c).get("day")
+            except Exception:
+                rule_day = None
+            if rule_day is not None and cls._count_day_refs(context) != 1:
+                rule_day = None
         for op in ops:
             t = op.target
             if isinstance(t.get("days"), list):
                 t["days"] = [cls._normalize_day_value(d, resolver) for d in t["days"]]
+            if isinstance(t.get("slots"), list):
+                for slot in t["slots"]:
+                    if isinstance(slot, dict) and slot.get("day"):
+                        slot["day"] = cls._normalize_day_value(slot["day"], resolver)
             for key in ("day", "book_only_day"):
-                if t.get(key):
-                    t[key] = cls._normalize_day_value(t[key], resolver)
+                if not t.get(key):
+                    continue
+                raw = str(t[key]).strip()
+                t[key] = cls._normalize_day_value(t[key], resolver)
+                # 整周词（本周/下周/这周）不是具体一天：用规则抽取的 booking 日兜底
+                # （mr_0236 LLM 把比较区间「下周」误当成 day → 执行层 isoformat 崩溃）。
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(t[key]).strip()) and re.fullmatch(
+                    r"(本周|这周|下周)", raw
+                ):
+                    if rule_day:
+                        t[key] = rule_day
+                    else:
+                        span = cls._expand_week_word(raw, resolver)
+                        if span:
+                            t[key] = span[0]
+                if (
+                    key == "day"
+                    and op.action == "book"
+                    and rule_day
+                    and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw)
+                    and str(t[key]).strip() != rule_day
+                ):
+                    t[key] = rule_day
+            for key in ("week_start", "week_end"):
+                v = t.get(key)
+                if not v:
+                    continue
+                sv = str(v).strip()
+                if re.fullmatch(r"(本周|这周|下周)", sv):
+                    span = cls._expand_week_word(sv, resolver)
+                    if span:
+                        t[key] = span[0] if key == "week_start" else span[1]
+                else:
+                    t[key] = cls._normalize_day_value(v, resolver)
         return ops
+
+    @staticmethod
+    def _count_day_refs(context: str) -> int:
+        """统计上下文里可解析的**单日**日期短语数量（安全网门控）。
+
+        只统计能换算成一个具体日期的表达（大后天/后天/明天/今天/下周X/本周X/
+        星期X/周X/X月X日）。整周搜索词（本周/下周不带星期）、多日连接（周三和
+        周四）、比较订房（下周哪个更空闲里的「周X」）都会如实计入，从而关闭
+        安全网。``大后天`` 先计、``后天`` 减去大后天，避免子串重复计数。
+        """
+        n = 0
+        n += context.count("大后天")
+        n += context.count("后天") - context.count("大后天")
+        n += context.count("明天")
+        n += context.count("今天")
+        n += len(re.findall(r"下(?:周|个星期|星期)[一二三四五六日天]", context))
+        n += len(re.findall(r"(?:本周|这周|星期)[一二三四五六日天]", context))
+        n += len(re.findall(r"(?<![下本这])周[一二三四五六日天]", context))
+        n += len(re.findall(r"\d{1,2}\s*月\s*\d{1,2}\s*[日号]", context))
+        return n
+
+    @staticmethod
+    def _expand_week_word(value: str, resolver: TemporalResolver) -> tuple[str, str] | None:
+        """「本周/下周」→ (周一, 周五) ISO 区间（最早能订上语义）。
+
+        与 ``resolve_week_span`` 一致：本周起始不早于今天，周六/周日已无本周
+        工作日则顺延到下周。LLM 若给 ``week_start``/``week_end`` 整周词（而非
+        具体日期短语）时才走这里。
+        """
+        s = str(value).strip()
+        weeks = 1 if "下" in s else 0
+        this_monday = resolver._today - timedelta(days=resolver._today.weekday())
+        start = this_monday + timedelta(days=7 * weeks)
+        if weeks == 0:
+            start = max(start, resolver._today)
+            if start.weekday() >= 5:
+                start = this_monday + timedelta(days=7)
+        end = start + timedelta(days=4)
+        return start.isoformat(), end.isoformat()
 
     @staticmethod
     def _add_minutes_str(time_str: str, minutes: int) -> str:
@@ -535,6 +702,15 @@ class MeetingOpPlanner:
         只覆盖规则能可靠判定的意图；判定不出 → 空 op（执行层不动作，安全）。
         """
         intent, c = analyze_meeting_query(user_query, now_iso, mode)
+        # 方案 A（2026-08-14 用户定案）：单轮预订缺 day → 默认当日。缺日期不再
+        # 「提前短路」（executor 曾对空 day 直接放弃，zh_0223/0224「订不到就算了/
+        # 不行就别乱订」连 room.list 都不发）；默认当日走完整搜索判定——A1_4F
+        # 无 bookable 房 → blocked/no_bookable_room 对齐 gold。**只在本路径默认**：
+        # 多轮澄清（_multi_turn_plan 预订分支）不经这里，day 靠澄清拿到正确值；
+        # cancel/extend/rebook 也不默认（已有会议定位不靠它）。LLM 已给 day 时
+        # c.day 非空不覆盖。
+        if intent == INTENT_BOOK and not c.day:
+            c.day = TemporalResolver(now_iso).today.isoformat()
         target = self._constraints_to_target(c)
         query = user_query or ""
 

@@ -47,11 +47,26 @@ _LEAVE_PLAN_TIMEOUT_S = 15.0
 
 _LEAVE_DRAFT_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "required": ["leave_type_hint", "reason_hint", "approver_hint"],
+    "required": ["leave_type_hint", "reason_hint", "approver_hint", "schedule"],
     "properties": {
         "leave_type_hint": {"type": "string"},
         "reason_hint": {"type": "string"},
         "approver_hint": {"type": "string"},
+        "approver_dept": {"type": "string"},
+        "schedule": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["day_phrase"],
+                "properties": {
+                    "day_phrase": {"type": "string"},
+                    "end_day_phrase": {"type": "string"},
+                    "start_hm": {"type": "string"},
+                    "end_hm": {"type": "string"},
+                    "full_day": {"type": "boolean"},
+                },
+            },
+        },
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     },
     "additionalProperties": False,
@@ -62,11 +77,29 @@ _LEAVE_DRAFT_CARD = """你是企业流程 Agent 的「请假提取器」。只�
 字段：
 leave_type_hint 请假类型（原文词，如 事假/年假/病假/婚假/陪产假/育儿假/丧假；没有就空字符串）
 reason_hint 请假原因（原文短语，如 有点私事/住院治疗/照顾孩子；没有就空字符串）
-approver_hint 审批人（原文名字或职位，如 刘经理/王芳/张三/经理；没有就空字符串）
+approver_hint 审批人名字/称呼（**只要人名本身**，如 刘工/王芳/张三/刘经理；「测试部门的刘工」→刘工；没有就空字符串）
+approver_dept 审批人所属部门词（「测试部门的刘工」→测试部门，「产品部门的王芳经理」→产品部门；没有就空字符串）
+schedule 请假时间段数组（必填，≥1 项）。每项：
+  day_phrase 起始日（自包含表达：今天/明天/后天/下周X/本周X/X月X日/下个月X日，如 明天、下周二、5月12日、下个月6日）
+  end_day_phrase 结束日（跨天/多日区间填，必须自包含；单日留空字符串，如 后天、下周三、5月13日、下个月11日）
+  start_hm 起始时刻（24小时制 "HH:MM"）
+  end_hm 结束时刻（24小时制 "HH:MM"）
+  full_day 整天/整天区间（如 5月14日到5月16日 → true；此时 start_hm/end_hm 可留空）
 
-规则：只从 sub_query 提取原文，不解释、不补全、不编造；时间是程序计算，不要输出；不输出任何数字 id。
-示例：sub_query="我明天下午请年假，审批人刘经理" → {"leave_type_hint":"年假","reason_hint":"","approver_hint":"刘经理"}
-输出：{"leave_type_hint":"事假","reason_hint":"有点私事","approver_hint":"王芳","confidence":0.9}
+【公司内部记忆：口语时刻翻译与惯例】
+- 口语翻译：下午X点→X+12（下午3点→15:00）；上午X点→X（上午9点→09:00）；中午12点→12:00；晚上X点→X+12（晚上8点→20:00）；X点半→X:30；X点45→X:45
+- 午别半天（只说了上午/下午）：上午→09:00-11:00；下午→14:00-18:00
+- 全天/整天→09:00-18:00
+- 裸时长 N 小时→当日 18:00 往前推 N 小时（请2小时→16:00-18:00）
+- 结束未带午别继承起始午别（下午2点到5点→14:00-17:00；10点到下午3点→10:00-15:00）
+- 跨天区间：明天下午3点到后天中午12点 → day_phrase=明天,end_day_phrase=后天,start_hm=15:00,end_hm=12:00
+- 跨天区间（起止不同天）的结束端若为裸午别：『上午』→12:00、『下午』→18:00（今天下午到明天上午 → start_hm=14:00,end_hm=12:00；不要用半日 11:00/18:00 的起始端规则）
+- 多日区间（X日到Y日/下周X到Y）：全整天 → full_day=true，如 下个月6号到11号 → day_phrase=下个月6日,end_day_phrase=下个月11日,full_day=true
+- 「排除假期/周末」等是说明性文字，不改变起止区间
+
+规则：只从 sub_query 提取，不编造；不输出任何数字 id、请假类型码、日期绝对格式（YYYY-MM-DD）。
+示例：sub_query="我明天下午请年假，审批人刘经理" → {"leave_type_hint":"年假","reason_hint":"","approver_hint":"刘经理","schedule":[{"day_phrase":"明天","end_day_phrase":"","start_hm":"14:00","end_hm":"18:00","full_day":false}]}
+输出：{"leave_type_hint":"事假","reason_hint":"有点私事","approver_hint":"王芳","schedule":[{"day_phrase":"下周二","end_day_phrase":"","start_hm":"16:00","end_hm":"18:00","full_day":false}],"confidence":0.9}
 只输出一个 JSON 对象。"""
 
 
@@ -77,7 +110,8 @@ class LeaveDraft:
     Attributes:
         leave_type_hint: 请假类型原文词（如 事假 / 年假 / 病假）。
         reason_hint: 请假原因原文短语。
-        approver_hint: 审批人原文名字/职位。
+        approver_hint: 审批人原文名字/称呼（模型抽取，不含部门前缀）。
+        approver_dept: 审批人所属部门词（模型抽取，如 测试部门；无则空）。
         source: "llm" | "fallback"。
         confidence: 模型置信度（规则兜底为 0）。
         elapsed_s: 编排耗时（秒）。
@@ -86,9 +120,16 @@ class LeaveDraft:
     leave_type_hint: str = ""
     reason_hint: str = ""
     approver_hint: str = ""
+    approver_dept: str = ""
+    schedule: list[dict[str, Any]] = None  # type: ignore[assignment]
     source: str = "fallback"
     confidence: float = 0.0
     elapsed_s: float = 0.0
+
+    def __post_init__(self) -> None:
+        """schedule 默认空列表（dataclass 可变默认用 None + 后处理）。"""
+        if self.schedule is None:
+            self.schedule = []
 
 
 class LeavePlanner:
@@ -164,12 +205,16 @@ class LeavePlanner:
         hint_type = str(raw.get("leave_type_hint") or "")
         hint_reason = str(raw.get("reason_hint") or "")
         hint_approver = str(raw.get("approver_hint") or "")
+        hint_dept = str(raw.get("approver_dept") or "")
+        schedule = _clean_schedule(raw.get("schedule"))
         confidence = float(raw.get("confidence") or 0.0)
-        if (hint_type or hint_reason or hint_approver) and confidence >= CONFIDENCE_FLOOR:
+        if (hint_type or hint_reason or hint_approver or schedule) and confidence >= CONFIDENCE_FLOOR:
             return LeaveDraft(
                 leave_type_hint=hint_type,
                 reason_hint=hint_reason,
                 approver_hint=hint_approver,
+                approver_dept=hint_dept,
+                schedule=schedule,
                 source="llm",
                 confidence=round(confidence, 3),
             )
@@ -307,6 +352,28 @@ def _split_surname_title(hint: str) -> tuple[str, str]:
         if hint.endswith(tw) and len(hint) > len(tw):
             return hint[: -len(tw)], tw
     return hint, ""
+
+
+def _dept_keyword(dept: str) -> str:
+    """部门词 → title 过滤关键词（测试部门/测试部 → 测试；去 部门/部/中心/组/处 后缀）。
+
+    世界的人员记录只有 title（测试工程师），部门信息编码在 title 里；「测试部门」
+    需归一为「测试」才能命中 title 子串。
+    """
+    dept = (dept or "").strip()
+    for suf in ("部门", "部", "中心", "组", "处"):
+        if dept.endswith(suf) and len(dept) > len(suf):
+            return dept[: -len(suf)]
+    return dept
+
+
+def _strip_name_honorific(name: str) -> str:
+    """剥离姓名尾部的称呼/职位（刘工→刘、刘工程师→刘、刘经理→刘），便于姓搜索。"""
+    name = (name or "").strip()
+    for suf in ("工程师", "工", "经理", "总监", "主管", "部长", "主任"):
+        if name.endswith(suf) and len(name) > len(suf):
+            return name[: -len(suf)]
+    return name
 
 
 # 文档类型词 → 附件文件名关键词（train 附件形态：gold 只在 wf_0019/0024/0028
@@ -499,6 +566,7 @@ class LeaveExecutor:
             draft.approver_hint,
             workflow_id,
             forced_keyword=clarified.get("approver_name"),
+            approver_dept=draft.approver_dept,
         )
         if isinstance(approver, dict) and "error_reason" in approver:
             return {"workflow_draft_result": {
@@ -506,9 +574,9 @@ class LeaveExecutor:
                 "reason": approver["error_reason"],
             }}
 
-        # 4) 时段解析（公司工作时段惯例，程序业务规则；澄清起止优先）。
+        # 4) 时段解析：LLM#2 schedule（翻译+惯例）→ 系统归一化；失败/为空 → 规则兜底。
         schedules = self._resolve_schedule(
-            sub_query, user_query, now_iso, clarified=clarified
+            sub_query, user_query, now_iso, clarified=clarified, schedule=draft.schedule
         )
         if not schedules:
             return self._blocked("time_unresolved")
@@ -582,6 +650,7 @@ class LeaveExecutor:
             "reason": reason,
             "duration": _span_hours(last_start, last_end),
             "count": count,
+            "approver": approver["user_id"],
         }
         # 附件已随 save data 落盘（data["attachment"]），但 reference_final_answer
         # 的 workflow_draft_result 也要求该键（wf_0019/0024/0026/0028 的 RS 因此
@@ -627,6 +696,7 @@ class LeaveExecutor:
         hint: str,
         workflow_id: int,
         forced_keyword: str | None = None,
+        approver_dept: str = "",
     ) -> dict[str, Any]:
         """审批人消歧：返回 {"user_id"} 或带 error_reason 的 blocked 标记。
 
@@ -652,6 +722,22 @@ class LeaveExecutor:
             return {"error_reason": "approver_not_found"}
         hint = _clean_approver_hint(hint) or _regex_approver(sub_query or "")
         if hint:
+            # 「部门+姓/名」联合（模型抽取 approver_dept）优先：测试部门的刘工 →
+            # dept=测试 + 姓=刘，keyword=刘 搜候选，title 含「测试」过滤 → 刘强
+            # （wf_0022）。一次搜索直达（少一步废搜索）；仅唯一命中时返回，
+            # 未命中落回常规路径（LLM 偶发幻觉部门时不误 block）。
+            if approver_dept:
+                dept_kw = _dept_keyword(approver_dept)
+                name = _strip_name_honorific(hint)
+                if dept_kw and name:
+                    dept_people = self._search_person_approver(
+                        keyword=name, workflow_id=workflow_id
+                    )
+                    matched = [
+                        p for p in dept_people if dept_kw in (p.get("title") or "")
+                    ]
+                    if len(matched) == 1:
+                        return {"user_id": matched[0]["user_id"]}
             people = self._search_person_approver(
                 keyword=hint, workflow_id=workflow_id
             )
@@ -921,29 +1007,28 @@ class LeaveExecutor:
         user_query: str,
         now_iso: str,
         clarified: dict[str, Any] | None = None,
+        schedule: list[dict[str, Any]] | None = None,
     ) -> list[tuple[str, str]]:
         """解析请假起止 → [(start_time, end_time)]（"YYYY-MM-DD HH:MM"）。
 
-        覆盖（逐 case 对 val reference 校准的公司惯例）：
-        - 每周X + 两周 → 本周/下周两个周五（wf_0010 count=2）；
-        - X月X日到Y月Y日 → 首日 09:00 至末日 18:00（wf_0218 跨天）；
-        - 单日 + 时刻：澄清起止（multi_turn __reply__，优先）→ 显式「X点到Y点」
-          （午别就近继承）、「X点后」、全天 → 09:00-18:00、
-          上午 → 09:00-11:00、下午 → 14:00-18:00、裸时长 N小时 → 18:00-Nh 至
-          18:00（mt_0012/0206）；
-        - 「那天/当天」→ 从完整 user_query 首个日期表达兜底解析（mr_wf_0006）。
+        优先级（2026-08-13 起，模型端翻译 + 系统端归一）：
+        1. 每周X + 两周 → 本周/下周两个周五（wf_0010 count=2，规则特殊情形）；
+        2. 多轮澄清起止（multi_turn __reply__，用户答复的精确时刻，最高优先）；
+        3. LLM#2 ``schedule``（模型把用户口语时刻/公司惯例翻译成 24h 时段 +
+           day 短语）→ 系统归一化（day 短语→日期、HH:MM 校验、跨天/多日区间）；
+           任一段归一失败 → 整体走规则兜底（模型格式可能出错，系统兜底）；
+        4. 现有规则兜底：X月X日/号到Y月Y日/号 → 首日 09:00 至末日 18:00；
+           单日 + 时刻（显式「X点到Y点」、全天、上午/下午裸午别、裸时长 N小时）；
+           「那天/当天」→ 从完整 user_query 首个日期表达兜底解析（mr_wf_0006）。
 
-        2026-08-12 已修（原 #49 Q2 记录项）：时段解析优先 leave 子句自身，
-        子句无时间信号才回退拼接 text（``_has_time_signal`` 门控）。多域 case
-        （zh_0014）meeting 的「下午两点到三点」不再污染请假时段（reference
-        09:00-11:00）。day 解析仍保留 sub_query → 「那天/当天」user_query →
-        text 的三级兜底。
+        day 解析仍保留 sub_query → 「那天/当天」user_query → text 的三级兜底
+        （zh_0014 时段优先 leave 子句自身的门控逻辑不变）。
         """
         sub = (sub_query or "").strip()
         text = f"{sub} {user_query or ''}".strip()
         resolver = TemporalResolver(now_iso)
 
-        # 每周X + 两周 → 两次（本周五 + 下周五）。
+        # 1) 每周X + 两周 → 两次（本周五 + 下周五）。
         if re.search(r"每周|每个星期", text) and re.search(r"两周|这周", text):
             m = re.search(r"(?:每周|每个星期)([一二三四五六日天])", text)
             if m:
@@ -954,6 +1039,24 @@ class LeaveExecutor:
                 start_t, end_t = self._time_of_day(text, resolver)
                 return [(f"{d} {start_t}", f"{d} {end_t}") for d in days]
 
+        # 2) 多轮澄清起止优先（需先解析单日 day）。
+        day = resolver.resolve_day(sub_query or "")
+        if not day and re.search(r"那天|当天", sub_query or ""):
+            day = resolver.resolve_day(user_query or "")
+        if not day:
+            day = resolver.resolve_day(text)
+        if clarified and clarified.get("start_hm") and clarified.get("end_hm") and day:
+            return [(f"{day} {clarified['start_hm']}", f"{day} {clarified['end_hm']}")]
+
+        # 3) LLM#2 schedule 优先（跨天/多日/口语时刻靠模型泛化 + 系统归一化）。
+        if schedule:
+            normalized = self._normalize_llm_schedule(schedule, resolver)
+            if normalized:
+                return normalized
+
+        # 4) 规则兜底。
+        if not day:
+            return []
         # 跨天：X月X日/号到Y月Y日/号（首日 09:00 至末日 18:00）。
         m = re.search(
             r"(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]\s*(?:到|至)\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]",
@@ -964,26 +1067,89 @@ class LeaveExecutor:
             start_day = date(year, int(m.group(1)), int(m.group(2))).isoformat()
             end_day = date(year, int(m.group(3)), int(m.group(4))).isoformat()
             return [(f"{start_day} 09:00", f"{end_day} 18:00")]
-
-        # 单日。
-        day = resolver.resolve_day(sub_query or "")
-        if not day and re.search(r"那天|当天", sub_query or ""):
-            day = resolver.resolve_day(user_query or "")
-        if not day:
-            day = resolver.resolve_day(text)
-        if not day:
-            return []
-        if clarified and clarified.get("start_hm") and clarified.get("end_hm"):
-            # 多轮澄清起止（用户答复的精确时刻，不再套时间惯例）。
-            return [
-                (f"{day} {clarified['start_hm']}", f"{day} {clarified['end_hm']}")
-            ]
         # 时段解析优先 leave 子句自身（zh_0014：子句「后天上午」→ 09:00-11:00），
         # 避免拼接 text 带上 meeting 的「下午两点到三点」污染成 14:00-15:00。
-        # 子句无时间信号（如纯「那天」指代）才回退拼接文本。
         time_text = sub if _has_time_signal(sub) else text
         start_t, end_t = self._time_of_day(time_text, resolver)
         return [(f"{day} {start_t}", f"{day} {end_t}")]
+
+    def _normalize_llm_schedule(
+        self,
+        schedule: list[dict[str, Any]],
+        resolver: TemporalResolver,
+    ) -> list[tuple[str, str]] | None:
+        """LLM#2 schedule → [(start_full, end_full)]；任一段归一失败 → None（规则兜底）。
+
+        系统端归一化（模型给的格式可能出错）：
+        - day_phrase / end_day_phrase → 绝对日期（TemporalResolver；裸「X号」
+          继承起始日月份，小于起始日的号 → 下个月）；
+        - start_hm / end_hm 校验 "HH:MM"（0-23 / 0-59），同天必须 start<end；
+        - full_day → 09:00-18:00（整天/整天区间）。
+        """
+        out: list[tuple[str, str]] = []
+        for seg in schedule or []:
+            day = self._resolve_day_phrase(str(seg.get("day_phrase") or ""), resolver)
+            if not day:
+                return None
+            if seg.get("full_day"):
+                start_hm, end_hm = "09:00", "18:00"
+            else:
+                start_hm = _normalize_hm(seg.get("start_hm"))
+                end_hm = _normalize_hm(seg.get("end_hm"))
+                if start_hm is None or end_hm is None:
+                    return None
+            end_day = day
+            if str(seg.get("end_day_phrase") or "").strip():
+                end_day = self._resolve_day_phrase(
+                    seg["end_day_phrase"], resolver, ref=day
+                )
+                if not end_day or end_day < day:
+                    return None
+            if end_day == day and start_hm >= end_hm:
+                return None
+            out.append((f"{day} {start_hm}", f"{end_day} {end_hm}"))
+        return out or None
+
+    @staticmethod
+    def _resolve_day_phrase(
+        phrase: str,
+        resolver: TemporalResolver,
+        ref: date | None = None,
+    ) -> str | None:
+        """LLM day 短语 → ISO 日期。TemporalResolver 优先；裸「X号/X日」继承
+        ``ref``（起始日）月份，号小于起始日时顺延到下个月（0013「11号」→ 下月）。"""
+        p = (phrase or "").strip()
+        if not p:
+            return None
+        if isinstance(ref, str):  # ISO "YYYY-MM-DD"（来自 _normalize_llm_schedule 的起始日）
+            try:
+                ref = date.fromisoformat(ref)
+            except ValueError:
+                ref = None
+        day = resolver.resolve_day(p)
+        if day:
+            return day
+        if ref:
+            m = re.fullmatch(r"(\d{1,2})\s*[日号]", p)
+            if m:
+                d = int(m.group(1))
+                try:
+                    base = date(ref.year, ref.month, d)
+                except ValueError:
+                    return None
+                if base < ref:
+                    if ref.month == 12:
+                        try:
+                            base = date(ref.year + 1, 1, d)
+                        except ValueError:
+                            return None
+                    else:
+                        try:
+                            base = date(ref.year, ref.month + 1, d)
+                        except ValueError:
+                            return None
+                return base.isoformat()
+        return None
 
     def _time_of_day(self, text: str, resolver: TemporalResolver) -> tuple[str, str]:
         """公司工作时段惯例 → (start, end)（HH:MM）。
@@ -1110,6 +1276,39 @@ def _parse_range(text: str) -> tuple[str, str] | None:
     if sh24 * 60 + start_minute >= eh24 * 60 + end_minute:
         return None
     return f"{sh24:02d}:{start_minute:02d}", f"{eh24:02d}:{end_minute:02d}"
+
+
+def _clean_schedule(raw: Any) -> list[dict[str, Any]]:
+    """清洗 LLM#2 schedule 原始输出 → 结构化列表（只留 day_phrase 非空项）。"""
+    out: list[dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return out
+    for s in raw:
+        if not isinstance(s, dict):
+            continue
+        dp = str(s.get("day_phrase") or "").strip()
+        if not dp:
+            continue
+        out.append({
+            "day_phrase": dp,
+            "end_day_phrase": str(s.get("end_day_phrase") or "").strip(),
+            "start_hm": str(s.get("start_hm") or "").strip(),
+            "end_hm": str(s.get("end_hm") or "").strip(),
+            "full_day": bool(s.get("full_day")),
+        })
+    return out
+
+
+def _normalize_hm(value: Any) -> str | None:
+    """校验/归一 "HH:MM"；格式错或越界（h>23 / m>59）返回 None（系统兜底）。"""
+    v = str(value or "").strip()
+    m = re.fullmatch(r"(\d{1,2}):(\d{1,2})", v)
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if h > 23 or mi > 59:
+        return None
+    return f"{h:02d}:{mi:02d}"
 
 
 class LeaveSkill:

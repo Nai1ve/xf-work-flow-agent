@@ -1173,6 +1173,13 @@ class MeetingroomExecutor:
         2. 按约束形态分派到多日交集、逐天最早或单日预订；
         3. 首个可用房间 create（含 fallback：备选楼栋 / 反园区 / ±30 分钟）。
         """
+        if c.workspace_hint:
+            # 「离工位最近」本地实现：搜索范围只带 query 显式约束（园区/楼栋），
+            # 楼层**绝不进 room.list**——离工位最近由 _pick_room 用工位/房间图本地
+            # rank（同楼层同楼栋 > 同楼栋 > 同园区）决定。LLM 编排层常臆造 query
+            # 没有的楼层（0551_A4_4F，mr_0016/zh_0018），剥掉后按 building 级搜索，
+            # 官方 nearest 检查仍唯一命中（A4 楼 4F 唯一空闲最近房）。
+            c.addresses = [self._strip_floor_address(a) for a in c.addresses]
         ws_floor: str | None = None
         if c.workspace_hint and self._registry.can_execute_read(self.GET_WORKSPACE):
             ws_floor = self._apply_workspace(c)
@@ -1895,6 +1902,18 @@ class MeetingroomExecutor:
         building = parts[1] if len(parts) > 1 else None
         floor = parts[2] if len(parts) > 2 else None
         return building, campus, floor
+
+    @staticmethod
+    def _strip_floor_address(address: str) -> str:
+        """剥掉 office_address 的楼层后缀（0551_A4_4F → 0551_A4）；园区级/楼栋级不变。
+
+        「离工位最近」搜索范围只带 query 显式约束，楼层偏好由本地 workspace rank
+        决定，不进入 room.list。
+        """
+        building, campus, _ = MeetingroomExecutor._parse_office_address(address)
+        if campus and building:
+            return f"{campus}_{building}"
+        return address
 
     # ---------------------------------------------------------------- 日志 --
 
