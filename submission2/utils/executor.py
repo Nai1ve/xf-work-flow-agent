@@ -327,6 +327,22 @@ class MeetingroomExecutor:
         c.floor = target.get("floor")
         c.addresses = target.get("addresses") or []
         c.fallback_building = target.get("fallback_building")
+        # M2 备选楼栋展开：LLM 编排常只给 addresses 主楼栋 + fallback_building
+        # 字段（「A1 优先、A2 备选」），备选地址不会自动进 addresses（规则提取器
+        # understanding 会补，LLM 路径不会）→ 这里镜像补齐，主楼栋无可订时能搜备选。
+        # 楼栋级地址不带楼层（备选句通常不指定楼层）；无 campus 时从既有地址反推。
+        if c.fallback_building:
+            fb_campus = c.campus
+            if not fb_campus:
+                for addr in c.addresses:
+                    _, camp, _ = self._parse_office_address(addr)
+                    if camp:
+                        fb_campus = camp
+                        break
+            if fb_campus:
+                fb_addr = self._address_for(fb_campus, c.fallback_building, None)
+                if fb_addr and fb_addr not in c.addresses:
+                    c.addresses.append(fb_addr)
         c.capacity_gte = _coerce_int(target.get("capacity"))
         c.capacity_exact = bool(target.get("capacity_exact"))
         c.has_screen = target.get("screen")
@@ -895,30 +911,46 @@ class MeetingroomExecutor:
     def _book_named_room(self, c: MeetingConstraints, room_id: str) -> dict[str, Any]:
         """点名房间预订（0227）：先 room.schedule 校验目标时段空闲，再 create。
 
+        M3 点名房降级（beta_mr_0019 线上 71.02 命中）：
+        - 房间名不是规范 ID（"武夷厅"/"大会堂"＝名称/偏好，不是 room_id）→
+          降级为楼栋级同条件搜索（_book_single_day），不再直接 blocked；
+        - 合法 ID 但时段占用/查询失败 → 仅当查询带备选语义（c.fallback_building，
+          「A1 优先、A2 备选」）才降级；硬点名（无备选）仍 blocked。
+
         Args:
             c: 会议约束（day/start/end/title 必填）。
-            room_id: 点名房间（如 "A3-3F-312"）。
+            room_id: 点名房间（如 "A3-3F-312"，或名称如 "武夷厅"）。
 
         Returns:
             final_answer dict（booking_result）或 blocked。
         """
         if not c.day or not c.start or not c.end:
             return {}
+        canonical = self._canonicalize_room_id(room_id)
+        valid_id = self._static is None or bool(self._room_static(canonical or room_id))
+        if not valid_id:
+            # 房间名不是合法 room_id（名称/偏好）→ 楼栋级降级。静态索引关闭时
+            # 无法校验，视为合法（保持原 hard 语义，不误降级）。
+            return self._named_room_degrade(c, reason=f"not_valid_room_id:{room_id}")
         if not self._registry.is_available(self.ROOM_SCHEDULE):
             return self._blocked("schedule_unavailable")
         result = self._call_tool(
             self.ROOM_SCHEDULE,
-            {"room_id": room_id, "start_date": c.day, "end_date": c.day},
+            {"room_id": canonical or room_id, "start_date": c.day, "end_date": c.day},
         )
         if result.get("error"):
+            if c.fallback_building:
+                return self._named_room_degrade(c, reason=f"schedule_error:{room_id}")
             return self._blocked()
         for slot in result.get("busy_slots") or []:
             if len(slot) >= 2 and c.start < slot[1] and slot[0] < c.end:
+                if c.fallback_building:
+                    return self._named_room_degrade(c, reason=f"room_busy:{room_id}")
                 return self._blocked("room_busy")
-        office_id = self._static.office_id_for_room(room_id) or room_id
+        office_id = self._static.office_id_for_room(canonical or room_id) or room_id
         args: dict[str, Any] = {
             "day": c.day,
-            "room_id": room_id,
+            "room_id": canonical or room_id,
             "start": c.start,
             "end": c.end,
             "title": c.title or "会议",
@@ -934,12 +966,38 @@ class MeetingroomExecutor:
                 "status": "success",
                 "day": c.day,
                 "office_id": office_id,
-                "room_id": res.get("room_id") or room_id,
+                "room_id": res.get("room_id") or canonical or room_id,
                 "start": c.start,
                 "end": c.end,
                 "title": c.title or "会议",
             }
         }
+
+    def _named_room_degrade(
+        self, c: MeetingConstraints, reason: str
+    ) -> dict[str, Any]:
+        """点名房降级 → 楼栋级同条件搜索（M3）。
+
+        - 清掉 named_room/compare_rooms，避免上层重复触发点名路径；
+        - 无搜索范围（地址）时从 campus+building / campus+fallback_building 构造
+          楼栋级地址（不带楼层，逐楼栋搜所有楼层）；
+        - 仍无范围 → 保持 blocked（不臆造地址，尊重 gold 的 no_bookable_room）。
+        """
+        self._log_info(f"M3 点名房降级: {reason}")
+        c.named_room = None
+        c.compare_rooms = []
+        if not c.addresses:
+            base_addr = None
+            if c.campus and c.building:
+                base_addr = self._address_for(c.campus, c.building, None)
+            elif c.campus and c.fallback_building:
+                base_addr = self._address_for(c.campus, c.fallback_building, None)
+            if base_addr:
+                c.addresses = [base_addr]
+        if not c.addresses:
+            self._log_warning(f"M3 降级无搜索范围，保持 blocked: {reason}")
+            return self._blocked()
+        return self._book_single_day(c, None)
 
     def _book_multi_slots(self, c: MeetingConstraints) -> dict[str, Any]:
         """同日多时段同房（0043）：每个槽位都可订的房间交集 → 逐槽位 create。
