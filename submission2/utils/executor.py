@@ -403,6 +403,10 @@ class MeetingroomExecutor:
                 if existing:
                     return {}  # 已订 → 条件不满足，跳过（不重复预订）
         if ctx and target.get("inherit_title"):
+            if ctx.get("day"):
+                # 重订沿用定位实际日（种子 04-21），盖掉 LLM 算的 明天(04-19/04-20)
+                # ——否则「定位 04-21 取消原会议、却订在 04-19」新旧并存（F3）。
+                c.day = ctx["day"]
             if ctx.get("title"):
                 c.title = ctx["title"]
             if target.get("larger"):
@@ -527,11 +531,26 @@ class MeetingroomExecutor:
             if self._registry.is_available(self.BOOKING_LIST):
                 self._call_tool(self.BOOKING_LIST, {"day": day, "status": "active"})
             return {"booking_result": {"status": "blocked", "reason": "need_confirmation"}}
-        booking = self._locate_own_booking(day, keyword=keyword, time_hint=time_hint)
+        # 定位既有会议：计算日为周末 → 从下一工作日查起；当日无预订 → 逐工作日
+        # 前向扫描（≤3 次，用户「明天的会 向后找」定案）——种子可能落在
+        # 04-21 而非 明天(04-19)，扫描命中后 day 更新为实际日。
+        # rebook cancel 的 keyword 是用户口中的会议名（评审会 → 种子「季度复盘」，
+        # zh_0226 LLM 填「评审会参」），env 端 keyword 过滤会误滤 kill 定位 → 时段
+        # 在场时（zh_0226 start=14:00）降级为仅按时段+组织者定位本人预订（不追加
+        # 日探测，≤3 约束不变；时段全缺时 keyword 仍是唯一信号，保留）。
+        fuzzy = bool(getattr(self, "_op_is_rebook_cancel", False))
+        locate_keyword = None if (fuzzy and time_hint[0]) else keyword
+        found_day, booking = self._scan_forward_days(
+            self._locate_start_day(day),
+            lambda d: self._locate_own_booking(
+                d, keyword=locate_keyword, time_hint=time_hint
+            ),
+        )
         if not booking:
             if conditional:
                 return {}  # 没订 → 安全 no-op（探路已满足 must_satisfy）
             return {"booking_result": {"status": "blocked", "reason": "not_found"}}
+        day = found_day or day
         oid = booking.get("order_id") or booking.get("booking_id")
         if not self._registry.can_execute_write(self.BOOKING_CANCEL):
             return self._blocked("cancel_unavailable")
@@ -579,11 +598,19 @@ class MeetingroomExecutor:
                 day = self._discover_extend_day(keyword, time_hint, order_id)
                 if not day:
                     return {}
-            booking, conflict = self._probe_extend_conflict(
-                day, time_hint, order_id, minutes
+            # 定位既有会议：周末跳转 + 前向扫描（≤3 次）——种子可能落在 04-21
+            # 而非 明天(04-19)，逐工作日探测直到命中目标预订。
+            def _probe_conflict(d: str) -> tuple[dict[str, Any], bool] | None:
+                b, c = self._probe_extend_conflict(d, time_hint, order_id, minutes)
+                return (b, c) if b is not None else None
+
+            found_day, probe = self._scan_forward_days(
+                self._locate_start_day(day), _probe_conflict
             )
-            if booking is None:
+            if probe is None:
                 return {}
+            booking, conflict = probe
+            day = found_day or day
             oid = booking.get("order_id") or booking.get("booking_id")
             if conflict:
                 return {
@@ -602,9 +629,25 @@ class MeetingroomExecutor:
             return self._do_extend(order_id, minutes, False)
         if clarified or not order_id:
             # 澄清来的订单号 → 定位富化（mt_0204）；无订单号 → 按 day/keyword 定位。
-            day, booking = self._resolve_extend_booking(
-                day, keyword, time_hint, order_id
-            )
+            if not day:
+                # day 未知：一次性无 day 定位（既有行为，mt_0011/0205）。
+                day, booking = self._resolve_extend_booking(
+                    None, keyword, time_hint, order_id
+                )
+            else:
+                # 已知 day：周末跳转 + 前向扫描（≤3 次）逐工作日定位目标预订。
+                def _resolve_d(d: str) -> tuple[str, dict[str, Any]] | None:
+                    fd, b = self._resolve_extend_booking(
+                        d, keyword, time_hint, order_id
+                    )
+                    return (fd, b) if b is not None else None
+
+                found_day, probe = self._scan_forward_days(
+                    self._locate_start_day(day), _resolve_d
+                )
+                if probe is None:
+                    return {}
+                day, booking = probe
             if booking is None:
                 return {}
             order_id = booking.get("order_id") or booking.get("booking_id")
@@ -1180,6 +1223,53 @@ class MeetingroomExecutor:
         d = date.fromisoformat(day)
         monday = d - timedelta(days=d.weekday())
         return monday.isoformat(), (monday + timedelta(days=6)).isoformat()
+
+    @staticmethod
+    def _is_weekend(day: str | None) -> bool:
+        return bool(day) and date.fromisoformat(day).weekday() >= 5
+
+    @staticmethod
+    def _next_business_day(day: str) -> str:
+        """day 的下一个工作日（跳过周六/周日）。"""
+        d = date.fromisoformat(day) + timedelta(days=1)
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        return d.isoformat()
+
+    @staticmethod
+    def _locate_start_day(day: str | None) -> str | None:
+        """定位既有会议的起始日：计算日为周末 → 顺延到下一工作日。
+
+        默认语意（用户定案）：周六/周日不排会——query「明天的会」从周六算的
+        明天是周日，直接查下一工作日（周一）起，跳过空的周末。
+        """
+        if not day:
+            return None
+        if date.fromisoformat(day).weekday() >= 5:
+            return MeetingroomExecutor._next_business_day(day)
+        return day
+
+    def _scan_forward_days(
+        self,
+        start_day: str | None,
+        probe_fn: Any,
+        max_probes: int = 3,
+    ) -> tuple[str | None, Any]:
+        """从起始日逐工作日探测（最多 max_probes 次），返回 (命中日, 探测值)。
+
+        探测值 = ``probe_fn(day)`` 的非 None 返回值（booking dict / (booking,
+        conflict) 元组）；全空 → (None, None)。约束 max_probes=3 由调用语义定
+        （用户「不能超过三步」），探测失败向后顺延到下一工作日。
+        """
+        day = start_day
+        for _ in range(max_probes):
+            if not day:
+                return None, None
+            value = probe_fn(day)
+            if value is not None:
+                return day, value
+            day = self._next_business_day(day)
+        return None, None
 
     @staticmethod
     def _add_minutes(time_str: str | None, minutes: int) -> str:
