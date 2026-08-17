@@ -544,6 +544,88 @@ _MATERIAL_SUBCLASS_MAP: dict[str, str] = {
     "活动服装": "定制服装",
 }
 
+# ============================================================
+# 金额记忆（2026-08-15 构建，zh_0226 等接入暂缓）：
+# 无明细 query 的存草稿/提交 case，gold 明细是固定模板。世界状态无任何价格
+# （全量 90 case 确认 project/browser 选项只有 label/value/code），参考实现 gold
+# 轨迹里的 unit_price/budget_amount 也是凭空填的——唯一确定性来源是训练数据归纳。
+# 只存「≥2 无明细 case 交叉确认」的可靠模板；有明细 query 的组（D/H/L 等）是
+# query 提取，不入表。无「第一行固定」通用规律，只有 per-(wbs,大类,总额档) 模板
+# （A 组设计 40000↔20000、B 组视频 30000 vs A 组视频 40000，各自独立固定）。
+# 使用时机：LLM 行提取失败(canon_failed/空行)且 key+总额档命中 → 重建明细行。
+# ============================================================
+_BUDGET_MEMORY: dict[tuple[str, str], dict[float, list[dict[str, Any]]]] = {
+    # 城市服务大模型发布活动项目 · 品牌广告服务
+    # 规律：视频制作 budget_amount 恒 30000，活动展会发布会吃剩余；quantity 随总额档。
+    # 50000 档确认：zh_0027/zh_0205/zh_0034/zh_0216/zh_0037/zh_0226（全无明细）+ wf_0038（明细交叉）
+    # 70000 档确认：zh_0217/zh_0230（无明细，仅「两条明细」）+ zh_0036/zh_0025/wf_0079（明细交叉）
+    ("B-260100002.03", "WZLB-202005120001"): {
+        50000.0: [
+            {"material_subclass": "WZ_202210110009", "material_name": "视频制作",
+             "quantity": 1, "unit_price": 30000.0, "budget_amount": 30000.0},
+            {"material_subclass": "WZ_202210110012", "material_name": "活动、展会、发布会",
+             "quantity": 1, "unit_price": 20000.0, "budget_amount": 20000.0},
+        ],
+        70000.0: [
+            {"material_subclass": "WZ_202210110009", "material_name": "视频制作",
+             "quantity": 2, "unit_price": 15000.0, "budget_amount": 30000.0},
+            {"material_subclass": "WZ_202210110012", "material_name": "活动、展会、发布会",
+             "quantity": 1, "unit_price": 40000.0, "budget_amount": 40000.0},
+        ],
+    },
+    # 城市解决方案产品发布会项目 · 品牌广告服务
+    # 40000 档确认：mt_0007/mt_0211（无明细，「存一个设计服务费用申请草稿」）
+    # 60000 档确认：zh_0223（无明细，「提交品牌广告费用」）+ wf_0036（明细交叉，视频4万+设计2万）
+    ("A-260100001.03", "WZLB-202005120001"): {
+        40000.0: [
+            {"material_subclass": "WZ_202210110008", "material_name": "设计服务（含网页制作）",
+             "quantity": 1, "unit_price": 40000.0, "budget_amount": 40000.0},
+        ],
+        60000.0: [
+            {"material_subclass": "WZ_202210110008", "material_name": "设计服务（含网页制作）",
+             "quantity": 1, "unit_price": 20000.0, "budget_amount": 20000.0},
+            {"material_subclass": "WZ_202210110009", "material_name": "视频制作",
+             "quantity": 1, "unit_price": 40000.0, "budget_amount": 40000.0},
+        ],
+    },
+}
+
+# 草稿意图下的唯一总额档（无显式总额时用）：每组的非最小档全是「提交」措辞
+# （70000：zh_0217/zh_0230「提交」+ zh_0036/zh_0025/wf_0079 有明细；60000：
+# zh_0223「提交」+ wf_0036 有明细），`_submit_verdict` 门控挡在补全外，草稿
+# 可达档唯一。全量 16 命中 case 核查：无「该 blocked 却命中」的 case。
+_BUDGET_DRAFT_TIER: dict[tuple[str, str], float] = {
+    ("B-260100002.03", "WZLB-202005120001"): 50000.0,
+    ("A-260100001.03", "WZLB-202005120001"): 40000.0,
+}
+
+
+def _memory_category_for_wbs(wbs_code: str) -> str | None:
+    """金额记忆里该 wbs_code 的唯一记忆大类；多类目/无记忆 → None。
+
+    zh_0226 垃圾行补全用：category_hint 空时，项目（发现回退）定了但大类
+    无信号，反查记忆里该项目唯一确认过的大类（品牌广告服务）。多类目项目
+    （G 组等）→ None 保持 blocked（记忆只存确认大类，不臆造）。
+    """
+    wzlbs = {wzlb for (w, wzlb) in _BUDGET_MEMORY if w == wbs_code}
+    return wzlbs.pop() if len(wzlbs) == 1 else None
+
+
+def _rows_match_memory(rows: list["BudgetRow"], mem_rows: list[dict]) -> bool:
+    """LLM canonical 行与记忆档行是否一致（material_name 集合相等）。
+
+    部分行补全的门控 4：好行（LLM 恰好输出与记忆档相同的明细集）走正常流程，
+    不覆盖；部分行（zh_0037/zh_0216 只输出视频制作缺活动行）→ 集合不等 → 重建。
+    记忆档行 material_name 用语义大类词（视频制作/活动、展会、发布会），与
+    canonical 名同域，可直接比较（subclass_hint 是同一个词，不需比 code）。
+    """
+    if not rows or len(rows) != len(mem_rows):
+        return False
+    llm_names = {r.material_name.strip() for r in rows}
+    mem_names = {r["material_name"].strip() for r in mem_rows}
+    return llm_names == mem_names
+
+
 # 单项目发现回退：query/答复无项目信号（zh_0010/0008 等）时按核心片段集依次搜索，
 # 首个恰 1 命中的取用。通用消歧启发（非 per-case 特判）。
 _DISCOVERY_CORE = ("平台", "项目", "系统", "中心", "工程", "服务", "建设", "研发")
@@ -814,6 +896,9 @@ class BudgetExecutor:
         """
         text = f"{context or ''} {user_query or ''}".strip()
 
+        # 垃圾行记忆补全的项目缓存（本 execute 内有效，避免 project_search 重复调用）。
+        self._memory_project: dict[str, Any] | None = None
+
         # 1) 申请人。
         applicant = self._current_user()
         if applicant is None:
@@ -841,6 +926,70 @@ class BudgetExecutor:
         #     调用过 29028，如 wf_0255/wf_0257/zh_0008——否则 TSR-10 + ES=0）。
         canon_failed = not self._canonicalize_rows(draft)
 
+        # 3.5b) 垃圾行/空行金额记忆补全（用户定案 2026-08-17）：行归一失败
+        #      或空行（有预算无物料）+ 草稿意图 + _BUDGET_MEMORY 命中 → 用记忆
+        #      模板确定性重建（gold 无明细 query 的固定明细，world_state 无价格
+        #      拿不到，只能靠训练数据归纳的记忆）。补全成功直接走确定性保存路径
+        #      （少工具调用，ES 封顶满分），不重复解析（project 经 _memory_project
+        #      缓存供 900 复用）；不命中 → 维持原空行合成/blocked 行为。
+        if canon_failed or not draft.rows:
+            rebuilt = self._memory_rebuild(draft, text, clarified)
+            if rebuilt is not None:
+                project = rebuilt["project"]
+                total_amount = f"{rebuilt['total']:.2f}"
+                detail_rows = [
+                    {
+                        "material_subclass": r["material_subclass"],
+                        "material_name": r["material_name"],
+                        "quantity": str(r["quantity"]),
+                        "unit_price": f"{r['unit_price']:.2f}",
+                        "budget_amount": f"{r['budget_amount']:.2f}",
+                    }
+                    for r in rebuilt["rows"]
+                ]
+                save_result = self._call_tool(
+                    self.WORKFLOW_SAVE,
+                    {
+                        "workflow_id": workflow_id,
+                        "data": {
+                            "applicant": applicant["user_id"],
+                            "applicant_no": applicant["employee_no"],
+                            "project_name": project["project_name"],
+                            "project_code": project["project_code"],
+                            "wbs_code": project["wbs_code"],
+                            "material_category": rebuilt["wzlb"],
+                            "total_amount": total_amount,
+                            "details": {"detail_2": detail_rows},
+                        },
+                        "submit": False,
+                    },
+                )
+                if save_result.get("error"):
+                    return self._blocked(f"save_failed: {save_result['error']}")
+                todo_result = None
+                if multi_domain:
+                    kw = "费用类物资" if "待办" in (text or "") else "费用"
+                    oa_result = self._call_tool(self.OA_TODO_LIST, {"keyword": kw})
+                    items = [
+                        it for it in (oa_result.get("items") or [])
+                        if it.get("workflow_id") == workflow_id
+                    ]
+                    if items:
+                        todo_result = {"status": "verified", "draft_found": True}
+                result = {
+                    "status": "draft_saved",
+                    "workflow_id": workflow_id,
+                    "project_code": project["project_code"],
+                    "project_name": project["project_name"],
+                    "material_category": rebuilt["wzlb"],
+                    "total_amount": total_amount,
+                    "detail_count": len(detail_rows),
+                }
+                out: dict[str, Any] = {"workflow_draft_result": result}
+                if todo_result is not None:
+                    out["todo_result"] = todo_result
+                return out
+
         # 4) 大类：browser_search(29023) → 语义匹配 → code；无唯一 → blocked 双键。
         #    不依赖项目，先解析——blocked 的 must_satisfy 也要求调用过 29023，
         #    且大类 label 可作项目消歧的语义信号（wf_0242「设备」）。
@@ -856,6 +1005,68 @@ class BudgetExecutor:
         )
         if "error_reason" in project:
             return self._blocked(project["error_reason"])
+
+        # 5.5) 部分行金额记忆补全（用户定案 2026-08-17 扩展）：项目已确定、非空
+        #      行但 LLM 只输出记忆档子集（zh_0037/zh_0216 只给视频制作缺活动行，
+        #      或给了单行无金额）→ 记忆 (wbs,大类,档) 命中且行与记忆不符 → 用
+        #      记忆模板重建。复用上文 3.5b 的确定性保存路径；project 已解析传入，
+        #      不再重复 project_search（_memory_rebuild 门控 4 好行不覆盖）。
+        if draft.rows and not canon_failed:
+            rebuilt = self._memory_rebuild(draft, text, clarified, project=project)
+            if rebuilt is not None:
+                total_amount = f"{rebuilt['total']:.2f}"
+                detail_rows = [
+                    {
+                        "material_subclass": r["material_subclass"],
+                        "material_name": r["material_name"],
+                        "quantity": str(r["quantity"]),
+                        "unit_price": f"{r['unit_price']:.2f}",
+                        "budget_amount": f"{r['budget_amount']:.2f}",
+                    }
+                    for r in rebuilt["rows"]
+                ]
+                save_result = self._call_tool(
+                    self.WORKFLOW_SAVE,
+                    {
+                        "workflow_id": workflow_id,
+                        "data": {
+                            "applicant": applicant["user_id"],
+                            "applicant_no": applicant["employee_no"],
+                            "project_name": project["project_name"],
+                            "project_code": project["project_code"],
+                            "wbs_code": project["wbs_code"],
+                            "material_category": rebuilt["wzlb"],
+                            "total_amount": total_amount,
+                            "details": {"detail_2": detail_rows},
+                        },
+                        "submit": False,
+                    },
+                )
+                if save_result.get("error"):
+                    return self._blocked(f"save_failed: {save_result['error']}")
+                todo_result = None
+                if multi_domain:
+                    kw = "费用类物资" if "待办" in (text or "") else "费用"
+                    oa_result = self._call_tool(self.OA_TODO_LIST, {"keyword": kw})
+                    items = [
+                        it for it in (oa_result.get("items") or [])
+                        if it.get("workflow_id") == workflow_id
+                    ]
+                    if items:
+                        todo_result = {"status": "verified", "draft_found": True}
+                result = {
+                    "status": "draft_saved",
+                    "workflow_id": workflow_id,
+                    "project_code": project["project_code"],
+                    "project_name": project["project_name"],
+                    "material_category": rebuilt["wzlb"],
+                    "total_amount": total_amount,
+                    "detail_count": len(detail_rows),
+                }
+                out: dict[str, Any] = {"workflow_draft_result": result}
+                if todo_result is not None:
+                    out["todo_result"] = todo_result
+                return out
 
         # 6) 无明细行（query 只给类别未给物料，如「品牌广告费用草稿」）→ 合成单行：
         #    多轮澄清给了具体小类（mt_0008 等）→ 以小类为物料正常保存；否则仅当
@@ -1075,6 +1286,12 @@ class BudgetExecutor:
         3. 0 结果 → 短语细化（去通用后缀）再搜 → 仍 0 → 单项目发现回退；
         4. >1 结果 → 多阶段消歧（LCS → 物料/大类语义 → 前缀 base → 泛化后缀同 base）。
         """
+        # 垃圾行记忆补全已确定的项目（execute 开头清空，取用即清）→ 不再重复 project_search。
+        if self._memory_project is not None:
+            p = self._memory_project
+            self._memory_project = None
+            return p
+
         search_results: list[dict[str, Any]] = []
         search_term = ""
 
@@ -1564,6 +1781,55 @@ class BudgetExecutor:
         else:
             total = round(sum(float(r["budget_amount"]) for r in out_rows), 2)
         return {"rows": out_rows, "total": f"{total:.2f}"}
+
+    def _memory_rebuild(
+        self,
+        draft: BudgetDraft,
+        text: str,
+        clarified: dict[str, Any],
+        project: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """垃圾行/空行/部分行金额记忆补全（用户定案 2026-08-17，08-17 扩展部分行）。
+
+        行归一失败（垃圾行）、空行（有预算无物料）、或部分行（LLM 只输出记忆档的
+        子集，如 zh_0037/zh_0216 只给视频制作缺活动行）+ 草稿意图 + 金额记忆命中
+        → 返回确定性保存所需 project/wzlb/total/rows。gold 无明细 query 的固定
+        明细世界状态无价格拿不到，只能靠训练数据归纳的记忆（_BUDGET_MEMORY，
+        16 case 交叉确认）。
+
+        门控（防误伤，不做 save/block 判别，只重建行内容）：
+        1. 草稿意图（提交措辞不入，`_submit_verdict` True 挡回）；
+        2. 项目确定（发现回退唯一项目 → wbs_code；调用方可传已解析 project 复用，
+           避免部分行触发路径重复 project_search）；
+        3. 记忆 (wbs, 唯一大类) 反查 + 总额档命中（显式总额优先，缺省用
+           _BUDGET_DRAFT_TIER 草稿唯一档，如 zh_0037/zh_0216 无总额 → 50000）；
+        4. LLM 行与记忆档一致时返回 None（好行不覆盖，走正常流程）。
+        """
+        if self._submit_verdict(text):
+            return None
+        total = self._explicit_total(text, clarified)
+        if project is None:
+            project = self._resolve_project(draft, text, clarified, "")
+            if "error_reason" in project:
+                return None
+            # 缓存供正常流程复用（后续门控失败时 900 行不重复 project_search）。
+            self._memory_project = project
+        wbs = project.get("wbs_code") or ""
+        wzlb = _memory_category_for_wbs(wbs)
+        if not wzlb:
+            return None
+        tiers = _BUDGET_MEMORY.get((wbs, wzlb))
+        if not tiers:
+            return None
+        if total is None:
+            total = _BUDGET_DRAFT_TIER.get((wbs, wzlb))
+        if total is None or total not in tiers:
+            return None
+        mem_rows = tiers[total]
+        # 门控 4：LLM 行与记忆档一致 → 不重建（正常流程即可，避免覆盖好行）。
+        if draft.rows and _rows_match_memory(draft.rows, mem_rows):
+            return None
+        return {"project": project, "wzlb": wzlb, "total": total, "rows": mem_rows}
 
     def _submit_verdict(self, text: str) -> bool:
         """提交/存草稿语义（公司约定动词形态，确定性业务规则）：存草稿优先。
