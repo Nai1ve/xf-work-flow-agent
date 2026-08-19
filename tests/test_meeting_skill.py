@@ -207,6 +207,39 @@ class TestPlannerLLM:
         plan = MeetingOpPlanner().plan("帮我订下周二会议室", NOW, "single_turn", gateway)
         assert plan.source == "fallback"
 
+    def test_llm_forward_rel_shifted_to_bookable_day(self) -> None:
+        """类A「明天→04-21」：now=04-18 周六时 明天=04-19 周日 → 顺延到 04-21。
+
+        顺延只对前瞻相对词（明天/后天/大后天）生效；04-20 在 _MEETING_NOBOOK_DATES
+        特例内跳过。金标准 04-21 由此可达（room.list A1+A2 本已搜索，缺的是
+        gold 的 capacity_gte=10 trace 参数——那是另一个问题）。
+        """
+        gateway = _gateway(
+            {
+                "ops": [{"action": "book", "target": {"start": "14:00", "end": "15:00"}}],
+                "confidence": 0.9,
+            }
+        )
+        plan = MeetingOpPlanner().plan(
+            "帮我订明天下午2点到3点的会议室，先A1不行就A2，带屏幕，主题复盘",
+            "2026-04-18T10:00:00", "single_turn", gateway,
+        )
+        t = plan.ops[0].target
+        assert t["day"] == "2026-04-21", t
+        assert t["addresses"] == ["0552_A1", "0552_A2"], t
+        assert t["fallback_building"] == "A2", t
+
+    def test_llm_forward_rel_weekday_not_shifted(self) -> None:
+        """明天解析到工作日 → 不顺延（zh_0014 明天=05-13 周三保持原值）。"""
+        gateway = _gateway(
+            {"ops": [{"action": "book", "target": {}}], "confidence": 0.9}
+        )
+        plan = MeetingOpPlanner().plan(
+            "帮我订明天下午2点到3点的会议室",
+            "2026-05-12T10:00:00", "single_turn", gateway,
+        )
+        assert plan.ops[0].target["day"] == "2026-05-13"
+
     def test_llm_missing_fields_gap_filled(self) -> None:
         """LLM 漏 day/start/end → _fill_gaps 用规则抽取补全（日期换算）。"""
         gateway = _gateway(

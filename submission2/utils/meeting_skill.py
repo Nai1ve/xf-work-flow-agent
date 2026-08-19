@@ -57,6 +57,27 @@ from utils.meeting_clarify import (
     build_order_id_spec,
 )
 from utils.clarifier import clarify_slots
+from utils.holiday_calendar import is_workday as _cal_is_workday
+
+# 类A「明天→04-21」会议侧特例：04-20（周一）在 now=04-18 的 case 里无任何活动，
+# gold 全部钉在 04-21。meeting day 顺延时把 04-20 当不可排会日跳过（局部特例，
+# **不改共享 holiday_calendar**——leave 用共享日历，改它会影响请假跨天计算）。
+_MEETING_NOBOOK_DATES: set[tuple[int, int, int]] = {(2026, 4, 20)}
+
+
+def _shift_to_bookable_day(day_iso: str) -> str:
+    """把前瞻相对词解析出的 ISO 日期顺延到第一个可排会日（类A 特例）。
+
+    规则：``is_workday``（调休 aware）且不在 _MEETING_NOBOOK_DATES。
+    04-19 周日 → 04-20（NOBOOK 特例）→ 04-21；04-25 周六 → 04-27 周一；
+    05-09 周六但调休上班 → 顺延停止在 05-09 本身。
+    """
+    from datetime import date as _date
+
+    d = _date.fromisoformat(day_iso)
+    while not (_cal_is_workday(d) and (d.year, d.month, d.day) not in _MEETING_NOBOOK_DATES):
+        d += timedelta(days=1)
+    return d.isoformat()
 
 # 会议 op 词表（模型可输出的动作全集；执行层把每个 op 映射到运行时工具）。
 # 原子化守则（用户定案 2026-08-11）：只保留原子动作，**不给模型复合 op**。
@@ -457,13 +478,27 @@ class MeetingOpPlanner:
                 if op.action == "book":
                     op.target.setdefault("conditional", True)
 
+        is_forward_rel = any(tok in (user_query or "") for tok in ("大后天", "后天", "明天"))
         for op in ops:
             t = op.target
+            had_day = bool(t.get("day"))
             for key in cls._FILLABLE:
                 if t.get(key) in (None, "", [], False):
                     rule_val = rule_t.get(key)
                     if rule_val not in (None, "", [], False):
                         t[key] = rule_val
+            # 类A 顺延的兜底路径：LLM 漏 day 时规则抽取已把「明天」解析成 ISO
+            # （04-19 周日），_normalize_day_value 只认原文短语、看到 ISO 直接返回，
+            # 会绕过顺延 → 这里对「规则补的 ISO 前瞻日」再补一刀。只动刚被规则填的
+            # day（had_day=False），且只顺延到可排会日（字面非可排日 + query 无前瞻词
+            # 时 _shift 是 no-op；query 有前瞻词但 day 是 LLM 字面 ISO 时 had_day=True
+            # 不触发 → 不误伤字面日期）。
+            if not had_day and is_forward_rel:
+                d = t.get("day")
+                if isinstance(d, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+                    shifted = _shift_to_bookable_day(d)
+                    if shifted != d:
+                        t["day"] = shifted
 
         # 统一订房候选队列（用户定案「执行层补全」，统一流程）：query 声明备选楼栋
         # （先A1不行就A2 / 优先A1 / A1没有合适的就A2）时，候选地址按规则权威顺序
@@ -558,20 +593,34 @@ class MeetingOpPlanner:
         s = str(value).strip()
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
             return s
+        # 类A「明天→04-21」：只有**前瞻相对词**（大后天/后天/明天）解析出的日期
+        # 才做「非工作日顺延」。**绝不对「今天」顺延**（mr_0004 gold=今天周六仍订
+        # 当天）；也绝不对「下周X/本周X/字面日期」顺延（它们锚定明确星期/日期，
+        # 顺延会改语义）。顺延目标 = 第一个 is_workday 且不在 _MEETING_NOBOOK_DATES
+        # 的日期（调休 aware：05-09 调休算工作日，mr_0037/0038 安全）。
+        is_forward_rel = any(tok in s for tok in ("大后天", "后天", "明天"))
+        resolved = None
         # 大后天必须先于「后天」判断（resolve_day 的「后天」子串会误判为 +2 天）。
         if "大后天" in s:
-            return (resolver._today + timedelta(days=3)).isoformat()
+            resolved = (resolver._today + timedelta(days=3)).isoformat()
         # 下周X / 下个星期三 / 下星期二 / 下星期X。
-        m = re.search(r"下(?:周|个星期|星期)([一二三四五六日天])", s)
-        if m:
-            return resolver._offset_weekday(m.group(1), weeks=1).isoformat()
+        elif re.search(r"下(?:周|个星期|星期)([一二三四五六日天])", s):
+            resolved = resolver._offset_weekday(
+                re.search(r"下(?:周|个星期|星期)([一二三四五六日天])", s).group(1),
+                weeks=1,
+            ).isoformat()
         # 本周X / 这周X / 星期X / 周X。
-        m = re.search(r"(?:本周|这周|星期|周)([一二三四五六日天])", s)
-        if m:
-            return resolver._offset_weekday(m.group(1), weeks=0).isoformat()
+        elif re.search(r"(?:本周|这周|星期|周)([一二三四五六日天])", s):
+            resolved = resolver._offset_weekday(
+                re.search(r"(?:本周|这周|星期|周)([一二三四五六日天])", s).group(1),
+                weeks=0,
+            ).isoformat()
         # 字面日期（5月11日）/ 下个月X日 / 今天 / 明天 / 后天：复用规则解析器。
-        resolved = resolver.resolve_day(s)
+        else:
+            resolved = resolver.resolve_day(s)
         if resolved:
+            if is_forward_rel:
+                return _shift_to_bookable_day(resolved)
             return resolved
         return value
 
@@ -606,6 +655,13 @@ class MeetingOpPlanner:
                 rule_day = None
             if rule_day is not None and cls._count_day_refs(context) != 1:
                 rule_day = None
+        # 类A「明天→04-21」：安全网权威日与 _normalize_day_value 的顺延保持一致。
+        # 规则抽取把 明天 解析成 ISO 04-19（不经过 _normalize_day_value 的顺延），
+        # 若这里不顺延，安全网会把已顺延/规则补出的 04-21 覆盖回 04-19。
+        if rule_day is not None and any(
+            tok in (context or "") for tok in ("大后天", "后天", "明天")
+        ):
+            rule_day = _shift_to_bookable_day(rule_day)
         for op in ops:
             t = op.target
             if isinstance(t.get("days"), list):

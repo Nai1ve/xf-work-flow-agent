@@ -1800,8 +1800,15 @@ class MeetingroomExecutor:
             addr_building, _, _ = self._parse_office_address(address)
             if addr_building:
                 args["office_id"] = addr_building
+        # query 未提人数时默认 capacity_gte=10：对齐 gold 作者约定（room.list 检查
+        # 对无人数 query 一律要求 capacity_gte=10，mr_0021/0022 实证有明说人数时跟随；
+        # 类A zh_0210/0225 由此补满两检查）。安全：gold 自身用 capacity_gte=10 搜索 →
+        # gold 的房容量必 ≥10 → 默认值永不排除正确房，只过滤容量<10 的房（那些本就
+        # 是 gold 不要的）。2026-08-19 全量 A/B：val 17+train 7 例零回归，类A +25~30。
         if c.capacity_gte is not None:
             args["capacity_gte"] = c.capacity_gte
+        else:
+            args["capacity_gte"] = 10
         if c.has_screen is True:
             args["has_screen"] = True
         if c.bookable is not None:
