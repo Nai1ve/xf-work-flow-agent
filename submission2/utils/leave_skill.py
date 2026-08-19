@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
+from utils.holiday_calendar import duration_for, duration_for_leave
 from utils.logger import ConsoleLogger
 from utils.static_context import StaticContextStore
 from utils.tool_contract import EffectiveToolRegistry
@@ -621,7 +622,7 @@ class LeaveExecutor:
                 "leave_type": leave_type,
                 "reason": reason,
                 "approver": approver["user_id"],
-                "duration": _span_hours(start_full, end_full),
+                "duration": duration_for_leave(start_full, end_full, leave_type),
             }
             if attachment:
                 data["attachment"] = attachment
@@ -648,7 +649,7 @@ class LeaveExecutor:
             "end_time": last_end,
             "leave_type": leave_type,
             "reason": reason,
-            "duration": _span_hours(last_start, last_end),
+            "duration": duration_for_leave(last_start, last_end, leave_type),
             "count": count,
             "approver": approver["user_id"],
         }
@@ -1047,6 +1048,17 @@ class LeaveExecutor:
             day = resolver.resolve_day(text)
         if clarified and clarified.get("start_hm") and clarified.get("end_hm") and day:
             return [(f"{day} {clarified['start_hm']}", f"{day} {clarified['end_hm']}")]
+
+        # 2.5) 显式「半天」半日：全天 09:00-18:00=9h 平分 → 4.5h（用户定案 2026-08-19，
+        #      与 09:00-18:00 全天口径自洽）。下午半天 → 13:30-18:00、上午半天 → 09:00-13:30。
+        #      仅裸「半天」无显式时刻触发；wf_0208/0202/0207 的「2点到6点/9点到12点」
+        #      显式时段不受影响（mt_0006 gold 锚定）。
+        if "半天" in sub and day and not re.search(r"\d+\s*[:点]", sub):
+            if re.search(r"上午|早上|早晨", sub) and not re.search(r"下午|晚上", sub):
+                start_t, end_t = "09:00", "13:30"
+            else:
+                start_t, end_t = "13:30", "18:00"
+            return [(f"{day} {start_t}", f"{day} {end_t}")]
 
         # 3) LLM#2 schedule 优先（跨天/多日/口语时刻靠模型泛化 + 系统归一化）。
         if schedule:

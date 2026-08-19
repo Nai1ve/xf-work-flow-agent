@@ -259,6 +259,15 @@ class IntentRouter:
         ):
             return INTENT_REBOOK
 
+        # S4c 取消…然后/接着…订：无「换/重订/再订」显式词但用「然后/接着+订」表达
+        # 重订（mr_0235「取消原来的，然后在A2园区订同一时间」）。若判成纯取消，
+        # _rule_plan 只发 cancel 丢 book——重订语义 = cancel + book，判定更安全。
+        # 前提同时含取消类 hint 与「然后/接着 + 订/预订/再订/重订」。
+        if any(h in query for h in self._REBOOK_HINTS) and any(
+            t in query for t in ("然后", "接着", "之后")
+        ) and any(b in query for b in ("再订", "重订", "预订", "订")):
+            return INTENT_REBOOK
+
         # S4b 换大会议室（无显式取消词，如 0011「参会人加了4个，帮我换一个大一点的会议室」）。
         # 必须在参会人 hint（"参会人"）之前判定，否则 0011 会误判为 participant。
         # 「换大房」「换大」是 zh_0219/0226 的措辞变体——换大语义本身即重订。

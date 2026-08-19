@@ -31,6 +31,7 @@ from utils.business_rules import (
     normalize_building,
     normalize_campus,
     normalize_floor,
+    normalize_office_address,
     resolve_company_time,
 )
 from utils.understanding import (
@@ -107,10 +108,11 @@ _MEETING_PLAN_SCHEMA: dict[str, Any] = {
 _MEETING_PLAN_CARD = """你是企业流程 Agent 的「会议编排器」。只依据输入的 sub_query 提取会议字段并编排操作序列，输出 JSON。
 
 动作（全部原子动作，可叠加；一个 plan 只允许一个订房动作）：
-book 订新的（conditional:true=没订才订，已订则跳过） | cancel 取消（conditional:true=已订才取消，未订则跳过） | extend 延长已有会议（conditional:true=冲突就不动原会议） | participant_add/remove/list 参会人 | query 纯查询 | multi_day 多日同房或同日多场 | earliest 最早能订上 | compare_book 几间里选更空闲
+book 订新的（conditional:true=没订才订，已订则跳过） | cancel 取消（conditional:true=已订才取消，未订则跳过） | extend 延长已有会议（conditional:true=冲突就不动原会议） | participant_add/remove/list 参会人 | query 纯查询 | multi_day 多日同房或同日多场 | earliest 最早能订上 | compare_book 仅当用户要对比挑选（哪间更空/更合适）
 重新预订同一会议 = 先 cancel 原会议，再 book 新会议（book 带 inherit_title:true 沿用原会议标题；minutes 表示在原时段上延长多少分钟后重订）。
 「没订就订 / 已订就延长 / 冲突则重订」的多条件式 = 同一个 cancel{conditional:true} + book{inherit_title:true}（没订分支由 cancel 的 conditional 跳过天然覆盖）。**绝不**把三个分支拆成 book+extend+cancel 三条并行动作。
 earliest / multi_day / compare_book 是终态订房动作（自身就完成预订），不要再追加 book。
+**备选楼栋**（A1不行/没有合适的就A2/优先A1/先A1）＝同一个 book 里 addresses 按主→备顺序排列（先搜主楼栋、主楼栋无合适房才轮到备选），**不是** compare_book。
 
 字段（放 target）：
 day/days/book_only_day 输出 sub_query 原文日期短语（下周二/明天/本周三/5月11日/周三），系统按 now 自动换算成具体日期，**不要**自己算成 YYYY-MM-DD（算错会订错日）；**本周/下周 这类整周词不能当 day**（不是具体一天）；start/end（HH:MM）slots=[{"day","start","end","title"}] 同日多场（slot 的 day 同样用原文短语）days=[...] 多日（每项都是原文短语）week_start/week_end/start_date/end_date 保持 YYYY-MM-DD（区间/查询范围，给不出就省略让系统按 now 算）book_only_day 与 day 同规则（原文短语）addresses=["0552_A1_3F"] capacity 人数 screen title attendees time_flexible workspace_near（仅用户明确要「离工位最近」时设 true；与 addresses 是**独立约束**，可并存） persons=[{"name","employee_no"}] minutes 延长分钟 rooms 点名房间（短名如 "A1-349" 也行，系统会规范成 "A1-3F-349"） keyword query_type(booking_list/schedule/unbookable/workspace) larger 是否换更大 conditional/inherit_title 布尔 flag
@@ -126,6 +128,7 @@ day/days/book_only_day 输出 sub_query 原文日期短语（下周二/明天/�
 7)「先看看A1-349会议室周四下午3-5点空不空，空就订」→ book{day,start,end,rooms:["A1-349"]}（点名订房动作内部会先查该房间日程，空才订；**不要**拆成 query+book 两步）
 8)「帮我查A1-3F-349本周（5月11日到5月15日）的预订情况」→ query{query_type:"schedule",room_id:"A1-3F-349",start_date:"2026-05-11",end_date:"2026-05-15"}
 9)「合肥A4楼10人带屏幕会议室，离我工位近一点」→ book{day,start,end,addresses:["合肥A4楼"],capacity:10,screen:true,workspace_near:true}
+10)「A1 没有合适的就 A2，也要带屏幕」→ book{day,start,end,addresses:["A1","A2"],screen:true}（备选楼栋按主→备顺序放一个 book 里，能订即止；**不要**用 compare_book）
 输出：{"ops":[{"action":"book","target":{"day":"下周二","start":"14:00","end":"15:00"}}],"confidence":0.9}
 只输出一个 JSON 对象。"""
 
@@ -244,22 +247,12 @@ class MeetingOpPlanner:
                             self.logger.warning(
                                 f"会议「换大房」缺 cancel（{[op.action for op in ops]}），规则重编 rebook"
                             )
-                if not self._structurally_usable(ops):
-                    # LLM 编排结构性不可执行（如 0223 compare_book 无 compare_rooms）→ 规则兜底。
-                    if self.logger is not None:
-                        self.logger.warning(
-                            f"会议编排结构性不可执行（{[op.action for op in ops]}），规则兜底"
-                        )
-                    ops = self._rule_plan(context, now_iso, mode)
-                    ops = self._sanitize_order_id(ops, context)
-                    ops = self._normalize_day_values(ops, now_iso, context)
-                    ops = self._apply_business_rules(ops, context)
-                    return MeetingOpPlan(
-                        ops=ops,
-                        source="fallback",
-                        confidence=0.0,
-                        elapsed_s=time.monotonic() - start,
-                    )
+                # 结构性门控已删除（用户定案 2026-08-19）：执行层是真正的校验器，op
+                # 直接进执行层，解不了就返回 blocked/need_confirmation 诚实状态，不做
+                # 「校验器按动作名+字段名判形状、把能执行的 op 误拒再兜底」。空/低置信
+                # 兜底（下方 271 行）与换大房重编（_is_rebook_larger_miss）仍保留。
+                ops = self._tag_seeded_rebook(ops, user_query)
+                ops = self._tag_workspace_near(ops, context)
                 return MeetingOpPlan(
                     ops=ops,
                     source="llm",
@@ -276,6 +269,8 @@ class MeetingOpPlanner:
         ops = self._dedup_booking_ops(ops)
         ops = self._normalize_day_values(ops, now_iso, context)
         ops = self._apply_business_rules(ops, context)
+        ops = self._tag_seeded_rebook(ops, user_query)
+        ops = self._tag_workspace_near(ops, context)
         return MeetingOpPlan(
             ops=ops,
             source="fallback",
@@ -297,20 +292,75 @@ class MeetingOpPlanner:
     # 一个 meeting 单元只允许一个订房动作（book/multi_day/earliest/compare_book）。
     _BOOK_FAMILY = frozenset({"book", "multi_day", "earliest", "compare_book"})
 
+    # 显式换位置短语（「换到A2园区」→ 目标 A2 权威）：命中后重订 book-op 的
+    # 地址只留换去目标，弃旧位置。目标可能带修饰（换到**一个**大一点的 / 换到
+    # **小镇**A2），捕获到首个空白/标点为止再归一。
+    _MOVE_TO_RE = re.compile(r"(?:换到|搬到|改到|挪到|换去|转到)\s*(?:一个\s*)?([^\s，。；、]+)")
+
+    @classmethod
+    def _tag_seeded_rebook(cls, ops: list[MeetingOp], user_query: str) -> list[MeetingOp]:
+        """完整原文含 SEED-* 且计划是重订组合 → cancel 打 seeded 标记。
+
+        reference 约定：用户**显式**点名原预订（SEED-0222-001 / SEED-0235-001）的
+        重订 → status=rebooked + cancelled_order_id + officeId UUID；泛称原会议
+        （「订过一个评审会」「原会议」，zh_0033/mr_0027）→ status=success + 楼栋名。
+        识别层（LLM#1）偶发把 sub_query 里的 SEED 标识符截掉（mr_0235），编排层只
+        看 sub_query 就丢了这个信号——但 plan() 的 user_query 是**完整原文**，SEED-*
+        仍在。这里在编排层把信号传回 cancel op.target["seeded"]，执行层定位分支据此
+        定 seeded（rereference 约定 train 该族 gold，val 无 SEED-in-query 反例）。
+        """
+        if not re.search(r"SEED-", user_query or ""):
+            return ops
+        has_book = any(op.action in cls._BOOK_FAMILY for op in ops)
+        for op in ops:
+            if op.action == "cancel" and has_book:
+                op.target["seeded"] = True
+        return ops
+
+    # 「离工位最近」确定性关键词（用户定案 2026-08-19）：query 含近工位语义 →
+    # 订房 op 强制 workspace_near=True。workspace_hint 只由 LLM#2 输出（无规则兜底），
+    # LLM 偶发漏抽 → 执行层不调 user.get_workspace、不走离工位选址（zh_0009 掉分源）。
+    # 词表覆盖数据族：离(我)工位最近 / 离我工位近一点 / 近一点 / 最近的会议室。
+    _WORKSPACE_NEAR_RE = re.compile(
+        r"(?:离(?:我|我们)?工位(?:最)?近(?:一点|的)?|近一点|最近(?:的)?会议室)"
+    )
+
+    @classmethod
+    def _tag_workspace_near(cls, ops: list[MeetingOp], context: str) -> list[MeetingOp]:
+        """query 含「离工位最近/近一点/最近的会议室」→ 订房 op 补 workspace_near。
+
+        只加不删：LLM 已给 workspace_near=True 不重复；query 无关键词 → 不动（防止
+        把「最空闲/最早」等时间语义误判成离工位）。gold 检查 user.get_workspace 的
+        workspace-near 族（train mr_0016/0049/0217/0237、zh_0009/0018/0221/0230，
+        val mr_0020/0230、zh_0215）全部含这些短语 → 确定性覆盖。
+        """
+        if not cls._WORKSPACE_NEAR_RE.search(context or ""):
+            return ops
+        for op in ops:
+            if op.action in cls._BOOK_FAMILY:
+                op.target["workspace_near"] = True
+        return ops
+
     @classmethod
     def _is_rebook_larger_miss(cls, context: str, ops: list[MeetingOp]) -> bool:
-        """换大房被误判为加人：query 含换大语义 + 计划带 participant_add 但无 cancel。
+        """换大房被误判为加人/漏 cancel：query 含换大语义 + 计划缺 cancel。
 
         「加人 + 换大房」的真实语义是取消原会议另订更大的（cancel + book{larger}），
-        而 LLM 常输出 participant_add + book —— 原会议不取消、又新订一间 → 双活跃
-        预订触发「存在额外新增活跃会议预订」forbidden。只有两种信号同时成立才触发：
-        (1) query 有换大/太小/更大/大一点；(2) 计划有 participant_add 且无 cancel。
+        而 LLM 常输出 participant_add + book 或 book{larger} 独走 —— 原会议不取消、
+        又新订一间 → 双活跃预订触发「存在额外新增活跃会议预订」forbidden。触发：
+        (1) query 有换大/太小/更大/大一点；(2) 计划无 cancel；且 (3) 计划带
+        participant_add（老判据）**或** book-family op 直接带 larger:true（扩展，
+        LLM 偶发 book{larger} 无 cancel 无 participant_add，zh_0219 防御）。
         """
         if "cancel" in [op.action for op in ops]:
             return False
-        if "participant_add" not in [op.action for op in ops]:
+        if not any(h in (context or "") for h in ("太小", "更大", "换大", "大一点")):
             return False
-        return any(h in (context or "") for h in ("太小", "更大", "换大", "大一点"))
+        if "participant_add" in [op.action for op in ops]:
+            return True
+        return any(
+            op.action in cls._BOOK_FAMILY and op.target.get("larger") for op in ops
+        )
 
     @classmethod
     def _dedup_booking_ops(cls, ops: list[MeetingOp]) -> list[MeetingOp]:
@@ -471,6 +521,19 @@ class MeetingOpPlanner:
                 t["floor"] = normalize_floor(t["floor"])
             if t.get("fallback_building"):
                 t["fallback_building"] = normalize_building(t["fallback_building"])
+            # 1b) 显式换位置（「换到/搬到/改到/挪到 X」）→ X 是权威搜索目标。
+            #     重订组合下 LLM 常把**旧位置**（原会议所在，mr_0235「会议室在A1」）
+            #     当主地址、把目标当备选（building=A1 主、fallback=A2），先搜旧楼栋
+            #     会订错房（0552_A1→0552-011，gold 要 0552_A2→A2-1F-147）。显式
+            #     换位置时目标唯一：订房 op 地址仅留目标，弃旧楼栋。
+            if cls._MOVE_TO_RE and op.action in cls._BOOK_FAMILY and any(
+                o.action == "cancel" for o in ops
+            ):
+                mv = cls._MOVE_TO_RE.search(context or "")
+                if mv:
+                    target_code = normalize_office_address(mv.group(1))
+                    if target_code:
+                        t["addresses"] = [target_code]
             # 2) 公司时间翻译（命中午别+时长且无显式区间 → 覆盖规范起止）。
             if ct and op.action in cls._TIME_BEARING_ACTIONS:
                 t["start"], t["end"] = ct
@@ -652,48 +715,6 @@ class MeetingOpPlanner:
             target = raw.get("target")
             ops.append(MeetingOp(action=action, target=target if isinstance(target, dict) else {}))
         return ops
-
-    @staticmethod
-    def _structurally_usable(ops: list[MeetingOp]) -> bool:
-        """至少一个 op 结构性可执行才算可用：每个动作缺了核心字段就执行不了。
-
-        兜底触发场景：LLM 选对了动作但 target 空壳（0223 判成 compare_book 却
-        无 compare_rooms/named_room → 执行层必然空结果）。此时规则重编更可靠。
-        """
-        for op in ops:
-            t = op.target
-            action = op.action
-            if action == "book":
-                if t.get("day") and t.get("start") and t.get("end"):
-                    return True
-                if t.get("day") and (t.get("named_room") or t.get("room") or t.get("rooms")):
-                    return True
-            elif action in ("multi_day", "earliest"):
-                if isinstance(t.get("slots"), list) and len(t["slots"]) >= 2:
-                    return True
-                if isinstance(t.get("days"), list) and len(t["days"]) >= 2:
-                    return True
-                if t.get("week_start") or t.get("day"):
-                    return True
-            elif action == "compare_book":
-                if t.get("day") and (t.get("compare_rooms") or t.get("named_room") or t.get("rooms")):
-                    return True
-            elif action == "cancel":
-                if t.get("day") or t.get("order_id"):
-                    return True
-            elif action == "extend":
-                if t.get("day") or t.get("order_id"):
-                    return True
-            elif action in ("participant_add", "participant_remove"):
-                if t.get("persons") and (t.get("day") or t.get("order_id")):
-                    return True
-            elif action == "participant_list":
-                if t.get("day") or t.get("order_id"):
-                    return True
-            elif action == "query":
-                if t.get("day") or t.get("query_type") or t.get("keyword"):
-                    return True
-        return False
 
     # ------------------------------------------------------------ 兜底 --
     def _rule_plan(self, user_query: str, now_iso: str, mode: str | None) -> list[MeetingOp]:

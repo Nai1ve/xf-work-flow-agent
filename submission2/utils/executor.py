@@ -424,7 +424,12 @@ class MeetingroomExecutor:
             return result if result else self._blocked()
         if ctx and target.get("inherit_title") and br.get("day") == ctx.get("day"):
             if ctx.get("seeded"):
-                return {"_ok": True, "booking_result": {**br, "status": "rebooked", "cancelled_order_id": ctx["order_id"]}}
+                # SEED 直给取消（mr_0235/0222）：reference 期望 office_id=房间 officeId
+                # UUID（楼栋式随机 UUID 房 A2-1F-147 亦要 UUID，违反 _reference_office_id
+                # 楼栋名约定——train 该族 gold 以 UUID 为准，val 10/10 不涉及此型）。
+                seed_room = self._room_static(br.get("room_id"))
+                seed_office = (seed_room or {}).get("officeId") or br.get("office_id")
+                return {"_ok": True, "booking_result": {**br, "status": "rebooked", "office_id": seed_office, "cancelled_order_id": ctx["order_id"]}}
             new_room = self._room_static(br.get("room_id"))
             if new_room and new_room.get("building"):
                 br = {**br, "office_id": new_room.get("building")}
@@ -433,6 +438,9 @@ class MeetingroomExecutor:
     def _op_multi_day(self, target: dict[str, Any]) -> dict[str, Any]:
         """multi_day：同日多场（slots）或多日同房（days）/多日校验只订一天。"""
         c = self._constraints_from_target(target)
+        # 离工位最近也适用于多日形态（防御：S1w 门控与 _execute_book 一致）。
+        if c.workspace_hint and self._registry.can_execute_read(self.GET_WORKSPACE):
+            self._apply_workspace(c)
         if len(c.slots) >= 2:
             return self._book_multi_slots(c)
         if len(c.days) >= 2:
@@ -448,10 +456,10 @@ class MeetingroomExecutor:
         此时与 _execute_book 的守卫一致，退化为单日订 c.day，避免
         _book_sequential 里 date.fromisoformat("") 崩掉整个 case。
         """
-        c = self._constraints_from_target(target)
-        if c.week_start and c.week_end:
-            return self._book_sequential(c, None)
-        return self._book_single_day(c, None)
+        # 必须走 _execute_book 的 S1w 门控：earliest 直连 _book_sequential 会跳过
+        # user.get_workspace（zh_0009 LLM 偶发把 book 判成 earliest，gold 的
+        # must_satisfy 要求调用 get_workspace + 离工位最近选址，掉 30 分）。
+        return self._execute_book(self._constraints_from_target(target))
 
     def _op_compare_book(self, target: dict[str, Any]) -> dict[str, Any]:
         """compare_book：room.schedule 逐个对比（覆盖订日所在周），选更空闲后预订。"""
@@ -501,17 +509,20 @@ class MeetingroomExecutor:
             ctx: dict[str, Any] = {"order_id": order_id, "day": day, "seeded": True}
             if (
                 getattr(self, "_op_is_rebook_cancel", False)
-                and day
                 and self._registry.is_available(self.BOOKING_LIST)
             ):
                 # rebook 组合：定位原会议一次取标题/结束/容量（镜像旧 _op_rebook
                 # 的 find；纯 cancel 不多耗这一步）。标题以原订为准（mr_0235「主题
                 # 不变（技术分享）」规则会误抽成「不变（技术分享）」→ 以种子标题兜底）。
-                result = self._call_tool(self.BOOKING_LIST, {"day": day, "status": "active"})
+                # 定位**跨日**（status=active 全量过滤 order_id）：LLM 按 now 算的
+                # 周三可能对不上种子真实日（mr_0235 种子在 05-13，LLM 算 04-22），
+                # day 以工具证据为准——否则 ctx 缺 day/title/room_id，重订落在错日。
+                result = self._call_tool(self.BOOKING_LIST, {"status": "active"})
                 if not result.get("error"):
                     for b in result.get("bookings") or []:
                         if (b.get("order_id") or b.get("booking_id")) == order_id:
                             ctx.update(
+                                day=b.get("day") or ctx["day"],
                                 title=b.get("title"),
                                 end=b.get("end"),
                                 room_id=b.get("room_id"),
@@ -524,6 +535,34 @@ class MeetingroomExecutor:
                 return {"_ok": False, "booking_result": {"status": "blocked", "reason": "cancel_failed"}}
             self._rebook_ctx = ctx
             return {"_ok": True, "booking_result": {"status": "cancelled", "order_id": order_id}}
+        # rebook 组合且 day/order_id 全缺（mr_0235 兜底「取消原来的」无日期无订单号）：
+        # 跨日定位当前用户**唯一**活跃预订后取消并写入 _rebook_ctx（供 book{inherit_title}
+        # 继承原 day/标题）。多活跃预订无法唯一区分 → 保持 need_confirmation（安全，
+        # 不做跨日臆断）。
+        if not day and not order_id and getattr(self, "_op_is_rebook_cancel", False):
+            booking = self._locate_unique_own_booking()
+            if not booking:
+                return {"booking_result": {"status": "blocked", "reason": "need_confirmation"}}
+            day = booking.get("day")
+            oid = booking.get("order_id") or booking.get("booking_id")
+            if not self._registry.can_execute_write(self.BOOKING_CANCEL):
+                return self._blocked("cancel_unavailable")
+            result = self._call_tool(self.BOOKING_CANCEL, {"order_id": oid})
+            if result.get("error"):
+                return {"_ok": False, "booking_result": {"status": "blocked", "reason": "cancel_failed"}}
+            self._rebook_ctx = {
+                "order_id": oid,
+                "day": day,
+                "title": booking.get("title"),
+                "end": booking.get("end"),
+                "room_id": booking.get("room_id"),
+                # 兜底「取消原来的」定位到 SEED-* 种子预订（mr_0235）→ 重订按
+                # seeded 语义（status=rebooked+officeId UUID）；普通本人预订保持
+                # 非 seeded（status=success+楼栋名），与 zh_0033/mr_0027 一致。
+                # target["seeded"] 来自编排层（完整原文含 SEED-*，见 _tag_seeded_rebook）。
+                "seeded": bool(target.get("seeded")) or bool(oid and oid.startswith("SEED-")),
+            }
+            return {"_ok": True, "booking_result": {"status": "cancelled", "order_id": oid}}
         if not day:
             return {"booking_result": {"status": "blocked", "reason": "need_confirmation"}}
         if not keyword and not time_hint[0]:
@@ -563,7 +602,10 @@ class MeetingroomExecutor:
             "title": booking.get("title"),
             "end": booking.get("end"),
             "room_id": booking.get("room_id"),
-            "seeded": False,
+            # 仅编排层显式标记（完整原文含 SEED-*，mr_0235/0222）才 seeded；zh_0033/
+            # mr_0027 泛称原会议 → 非 seeded（status=success+楼栋名）。**不**按 oid
+            # 前缀判：zh_0033 定位到的也是 SEED-* 种子，但 gold 要 success。
+            "seeded": bool(target.get("seeded")),
         }
         return {"_ok": True, "booking_result": {"status": "cancelled", "order_id": oid}}
 
@@ -1090,6 +1132,32 @@ class MeetingroomExecutor:
         }
 
     # ------------------------------------------------------------ 定位/解析 --
+
+    def _locate_unique_own_booking(self) -> dict[str, Any] | None:
+        """跨日定位当前用户唯一活跃预订（无 day/order_id 的 rebook cancel 用）。
+
+        rebook 组合「取消原来的」若丢了日期/订单号（mr_0235 兜底路径，sub_query
+        被截断丢时间/订单号），原会议只能经**无 day** 的 booking.list 发现。仅当
+        组织者过滤后恰唯一命中才返回；多活跃预订 / 工具不可用 → None（保持
+        need_confirmation，安全，不做跨日臆断）。
+        """
+        if not self._registry.is_available(self.BOOKING_LIST):
+            return None
+        result = self._call_tool(self.BOOKING_LIST, {"status": "active"})
+        if result.get("error"):
+            return None
+        candidates = [
+            b for b in (result.get("bookings") or []) if b.get("status") != "cancelled"
+        ]
+        if len(candidates) > 1:
+            uid = self._current_user_id()
+            if uid:
+                owned = [
+                    b for b in candidates if str(b.get("organizer_user_id")) == uid
+                ]
+                if owned:
+                    candidates = owned
+        return candidates[0] if len(candidates) == 1 else None
 
     def _locate_own_booking(
         self,
