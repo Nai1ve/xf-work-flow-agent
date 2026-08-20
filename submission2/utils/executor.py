@@ -2048,15 +2048,23 @@ class MeetingroomExecutor:
 
     def _query_schedule(self, c: MeetingConstraints) -> dict[str, Any]:
         """查单房间区间日程（0211）。"""
-        if not c.schedule_room_id or not c.schedule_start_date or not c.schedule_end_date:
-            self._log_warning("日程查询缺参数，返回空")
+        if not c.schedule_room_id:
+            self._log_warning("日程查询缺房间，返回空")
+            return {}
+        # day 兜底：LLM 给单个 day（如「下周二」已归一成 ISO）而缺 start_date/end_date
+        # 时按单日区间查（mr_0033 线上 0 工具调用根因的执行层半段）；区间形态
+        # （「下周一到周三」）已由 meeting_skill._query_day_range 补成 start/end。
+        start = c.schedule_start_date or c.day
+        end = c.schedule_end_date or c.day
+        if not start or not end:
+            self._log_warning("日程查询缺日期，返回空")
             return {}
         result = self._call_tool(
             self.ROOM_SCHEDULE,
             {
                 "room_id": c.schedule_room_id,
-                "start_date": c.schedule_start_date,
-                "end_date": c.schedule_end_date,
+                "start_date": start,
+                "end_date": end,
             },
         )
         if result.get("error"):
@@ -2065,8 +2073,8 @@ class MeetingroomExecutor:
             "booking_result": {
                 "status": "queried",
                 "room_id": c.schedule_room_id,
-                "start_date": c.schedule_start_date,
-                "end_date": c.schedule_end_date,
+                "start_date": start,
+                "end_date": end,
             }
         }
 

@@ -664,6 +664,22 @@ class MeetingOpPlanner:
             rule_day = _shift_to_bookable_day(rule_day)
         for op in ops:
             t = op.target
+            # query/schedule 区间日：「下周一到周三」这类 day 是**区间**（周一~周三），
+            # 卡片契约要求 start_date/end_date 直出 ISO，但 LLM 偶发把区间塞进 day。
+            # 拆成起止两日补成 start_date/end_date——否则 `_query_schedule` 只认
+            # 区间字段、对 day 直接空返回（mr_0033 线上 0 工具调用根因）。
+            # 必须在 day 归一循环前检测（day 循环会把原文短语消费成单日 ISO）。
+            if (
+                op.action == "query"
+                and t.get("query_type") == "schedule"
+                and isinstance(t.get("day"), str)
+                and t["day"].strip()
+                and not t.get("start_date")
+                and not t.get("end_date")
+            ):
+                span = cls._query_day_range(t["day"].strip(), resolver)
+                if span:
+                    t["start_date"], t["end_date"] = span
             if isinstance(t.get("days"), list):
                 t["days"] = [cls._normalize_day_value(d, resolver) for d in t["days"]]
             if isinstance(t.get("slots"), list):
@@ -706,6 +722,28 @@ class MeetingOpPlanner:
                 else:
                     t[key] = cls._normalize_day_value(v, resolver)
         return ops
+
+    @staticmethod
+    def _query_day_range(day_phrase: str, resolver: TemporalResolver) -> tuple[str, str] | None:
+        """解析 query/schedule 的区间日短语 → (start_iso, end_iso)。
+
+        「下周一到周三」「周一到周五」「下周一到周五」→ 起止两星期。
+        周前缀（下/本/这）统一作用于两端：`下周一到周三` 的 周三 也在下周。
+        非区间短语（单个 day，如「下周二」）返回 None，交执行层 day 兜底。
+        """
+        # 起止两段都允许带周前缀（下周/本周/这周/星期/周）：起始段必带前缀才能区分
+        # 周次，结束段前缀可省略（「下周一到周三」的 周三 沿用起始段的下周语义）。
+        m = re.search(
+            r"(下(?:周|个星期|星期)|本周|这周|(?:星期|周))([一二三四五六日天])"
+            r"\s*到\s*(?:(下(?:周|个星期|星期))|(?:星期|周))?([一二三四五六日天])",
+            day_phrase or "",
+        )
+        if not m:
+            return None
+        weeks = 1 if "下" in (m.group(1) or "") else 0
+        start = resolver._offset_weekday(m.group(2), weeks=weeks)
+        end = resolver._offset_weekday(m.group(4), weeks=weeks)
+        return start.isoformat(), end.isoformat()
 
     @staticmethod
     def _count_day_refs(context: str) -> int:

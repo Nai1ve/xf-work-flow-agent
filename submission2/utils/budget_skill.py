@@ -552,6 +552,7 @@ _MATERIAL_SUBCLASS_MAP: dict[str, str] = {
     "定制促品": "定制促品",
     "定制服装": "定制服装",
     "活动服装": "定制服装",
+    "活动T恤": "定制服装",
 }
 
 # ============================================================
@@ -1405,6 +1406,21 @@ class BudgetExecutor:
         return clarify_slots(self._env, text, specs)
 
     # -------------------------------------------------- 项目解析 --
+    @staticmethod
+    def _project_name_in_text(p: dict[str, Any], text: str) -> bool:
+        """候选项目名（去「项目/工程/平台」后缀）是否作为子串出现在文本里。
+
+        前缀码多命中时的名称消歧信号：query/澄清答复点名了该候选项目
+        （wf_0247「治理方案咨询草稿」→ 候选「治理方案咨询项目」去后缀即命中）。
+        """
+        if not text:
+            return False
+        pn = (p.get("project_name") or "").strip()
+        if not pn:
+            return False
+        base = re.sub(r"(项目|工程|平台)$", "", pn)
+        return bool(base and (pn in text or base in text))
+
     def _resolve_project(
         self,
         draft: BudgetDraft,
@@ -1446,7 +1462,22 @@ class BudgetExecutor:
                 f"候选={[p.get('project_name') for p in search_results[:5]]}"
             )
             if len(search_results) > 1:
-                # 前缀码命中多个项目（N-2602000 → N-260200005/015）：无法唯一 → block。
+                # 前缀码命中多个项目（S-2602000 → S-2602000xx）：query/澄清答复若点名了
+                # 其中某个项目名（去「项目/工程/平台」后缀后是文本子串）→ 取唯一命中者
+                # （wf_0247「按项目编码 S-2602000 …治理方案咨询草稿」）。仍 >1/0 →
+                # 真歧义 ambiguous_project（wf_0258 前缀码多命中，query 没点名）。
+                name_matched = [
+                    p for p in search_results
+                    if self._project_name_in_text(p, text)
+                    or (
+                        clarified.get("project_phrase")
+                        and self._project_name_in_text(p, clarified["project_phrase"])
+                    )
+                ]
+                if len(name_matched) == 1:
+                    p = name_matched[0]
+                    self._log_project_resolved(f"code:{code} 名称消歧", self._project_dict(p))
+                    return self._project_dict(p)
                 self._log_warning(f"[项目搜索] 编码 {code} 多命中，项目未决 → ambiguous_project")
                 return {"error_reason": "ambiguous_project"}
             if search_results:

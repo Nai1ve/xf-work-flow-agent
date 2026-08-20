@@ -787,7 +787,12 @@ class LeaveExecutor:
                 # zh_0035/0206/0220/0224/0215：title=经理 歧义 [研发经理, 产品经理]，
                 # gold 5/5 选产品经理王芳/120004。命名了审批人（hint 非空）不兜底——
                 # zh_0210/0228 两个王芳 → 预期阻塞（不 save）。
-                if not hint and re.search(r"提交", sub_query or ""):
+                # 提交意图词与 budget 的 _SUBMIT_PATTERNS 对齐（提掉/直接提等口语），
+                # 但**绝不**含「申请」（几乎所有请假句都有「请假申请」，会无差别
+                # 触发兜底、破坏 mt_0208/wf_0034 未指名不提交→预期阻塞）。
+                if not hint and re.search(
+                    r"提交|提掉|直接提|提交掉|提上去|走流程", sub_query or ""
+                ):
                     for p in people:
                         if "产品经理" in (p.get("title") or ""):
                             return {"user_id": p.get("user_id")}
