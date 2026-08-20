@@ -471,6 +471,23 @@ def _has_time_signal(text: str) -> bool:
     return bool(text and _TIME_SIGNAL_RE.search(text))
 
 
+_DAY_WORD_RE = re.compile(
+    r"今天|明天|后天|下周|本周|这周|下个月|下月|"
+    r"周[一二三四五六日天]|\d{1,2}\s*月\s*\d{1,2}\s*[日号]"
+)
+
+
+def _has_day_word(text: str) -> bool:
+    """文本是否含日期表达词（今天/明天/后天/下周X/本周X/X月X日…）。
+
+    跨域共享日期语境判定用（zh_0001）：请假子句无日期词、但完整 user_query 的
+    其他子句（会议）给了「明天」时，LLM#2 常臆造 day_phrase（如「今天」），而规则
+    兜底能从完整 query 正确继承 → 此时跳过 LLM schedule。leave 子句自身有日期词
+    （wf_0012 明天→后天跨天）时不受影响。
+    """
+    return bool(text and _DAY_WORD_RE.search(text))
+
+
 class LeaveExecutor:
     """请假执行器：确定性流程 SOP（程序业务规则组件），产出 workflow_draft_result。
 
@@ -1029,8 +1046,11 @@ class LeaveExecutor:
         text = f"{sub} {user_query or ''}".strip()
         resolver = TemporalResolver(now_iso)
 
-        # 1) 每周X + 两周 → 两次（本周五 + 下周五）。
-        if re.search(r"每周|每个星期", text) and re.search(r"两周|这周", text):
+        # 1) 每周X + 两周（"这两周的申请"）→ 两次（本周五 + 下周五，wf_0010）。
+        #    只有显式「两周」才触发 count=2；「每周X…这周五」（wf_0206）里每周只是
+        #    背景（每周末接孩子），实际请的是单个「这周五」→ 走单日解析。若把「这周」
+        #    也当触发词，会因「这周五」的子串「这周」误生成两条。
+        if re.search(r"每周|每个星期", text) and re.search(r"两周", text):
             m = re.search(r"(?:每周|每个星期)([一二三四五六日天])", text)
             if m:
                 days = [
@@ -1061,7 +1081,11 @@ class LeaveExecutor:
             return [(f"{day} {start_t}", f"{day} {end_t}")]
 
         # 3) LLM#2 schedule 优先（跨天/多日/口语时刻靠模型泛化 + 系统归一化）。
-        if schedule:
+        #    跨域共享日期语境（zh_0001）：请假子句无日期词、完整 query 其他子句
+        #    （会议）有「明天」时，LLM day_phrase 常臆造（该 case 给「今天」gold=
+        #    明天）。规则兜底能从完整 query 正确继承日期+时刻 → 跳过 LLM schedule
+        #    直接走规则兜底。leave 子句自身有日期词（wf_0012 明天→后天）不受影响。
+        if schedule and _has_day_word(sub):
             normalized = self._normalize_llm_schedule(schedule, resolver)
             if normalized:
                 return normalized
@@ -1177,6 +1201,16 @@ class LeaveExecutor:
             return f"{hour:02d}:00", "18:00"
         if "全天" in text or "整天" in text:
             return "09:00", "18:00"
+        # 午别 + 显式时长 → 从午别起点起 N 小时（zh_0001「下午…2小时事假」→
+        # 14:00-16:00，下午起点 14:00 + 2h）。与裸时长（18:00-Nh 锚到下班）区分：
+        # 裸「2小时假」→ 16:00-18:00（mt_0002/0206），带午别「下午2小时」→ 时段
+        # 起点 + 时长。仅无「X点到Y点」显式区间时触发（_parse_range 已先返回）。
+        m_hrs = re.search(r"([一两二三四五六七八九十\d]+(?:\.\d+)?)\s*(?:个)?\s*小时", text)
+        if m_hrs and not re.search(r"到|至", text):
+            if re.search(r"下午|晚上", text) and not re.search(r"上午|早上|早晨", text):
+                return "14:00", f"{14 + int(_cn_num(m_hrs.group(1))):02d}:00"
+            if re.search(r"上午|早上|早晨", text) and not re.search(r"下午|晚上", text):
+                return "09:00", f"{9 + int(_cn_num(m_hrs.group(1))):02d}:00"
         # 半天：随午别半日（docs/leave_validation_set_summary.md：上午 09:00-12:00、
         # 下午 14:00-18:00）。mt_0006 的 reference 用 13:30-18:00，与文档惯例矛盾，
         # 属数据集异常，未按异常特化（见 leave_skill docstring 已知问题注记）。

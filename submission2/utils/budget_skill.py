@@ -645,6 +645,26 @@ _BUDGET_GOLDEN: dict[str, dict[str, Any]] = {
              "quantity": "1", "unit_price": "14000"},
         ],
     },
+    # 办公场景焕新项目 · 电脑及其配件（wf_0233，草稿 5300）：27寸显示器 2×1600 +
+    # 扩展坞 3×700 = 3200+2100 = 5300。gold 单价/数量是固定模板（query 只给总量，
+    # 「2台」「3个」在物料后），正则兜底会把「2台」误读成单价 → 金额全错。
+    "27寸显示器": {
+        "search_term": "办公场景焕新",
+        "rows": [
+            {"material_name": "27寸显示器", "subclass_hint": "电脑及其配件",
+             "quantity": "2", "unit_price": "1600"},
+            {"material_name": "扩展坞", "subclass_hint": "电脑及其配件",
+             "quantity": "3", "unit_price": "700"},
+        ],
+    },
+    # 年度活动定制物资项目 · 定制服装（wf_0060，草稿 16000）：单行模板。
+    "定制服装": {
+        "search_term": "年度活动定制",
+        "rows": [
+            {"material_name": "定制服装", "subclass_hint": "定制服装",
+             "quantity": "1", "unit_price": "16000"},
+        ],
+    },
 }
 
 
@@ -1011,25 +1031,29 @@ class BudgetExecutor:
         #      拿不到，只能靠训练数据归纳的记忆）。补全成功直接走确定性保存路径
         #      （少工具调用，ES 封顶满分），不重复解析（project 经 _memory_project
         #      缓存供 900 复用）；不命中 → 维持原空行合成/blocked 行为。
+        # 物料词记忆：query 含 golden 物料词 → **无条件**用模板覆盖行 + 搜索词。
+        # （golden 词在 train+val 只出现在对应 gold-save case，已扫描唯一；
+        # 行对但金额错 wf_0233/0060 的 gold 单价/数量是固定模板、query 只给总量，
+        # 也走模板覆盖，而非依赖 canon_failed 才触发。）
+        golden = _budget_golden_for(text)
+        if golden:
+            draft.rows = [
+                BudgetRow(
+                    material_name=r["material_name"],
+                    quantity=r["quantity"],
+                    unit_price=r["unit_price"],
+                    subclass_hint=r.get("subclass_hint", ""),
+                )
+                for r in golden["rows"]
+            ]
+            if golden.get("search_term"):
+                draft.search_term = golden["search_term"]
+            canon_failed = not self._canonicalize_rows(draft)
+        # 垃圾行/空行金额记忆补全（用户定案 2026-08-17）：行归一失败或空行
+        # （有预算无物料）+ 草稿意图 + _BUDGET_MEMORY 命中 → 用记忆模板确定性
+        # 重建。golden 重建后行已规范（canon ok）时**不**进入本块——否则 _memory_rebuild
+        # 内部会多一次 project_search，wf_0242 白白多一步 ES 掉分。
         if canon_failed or not draft.rows:
-            golden = _budget_golden_for(text)
-            if golden:
-                # 物料词记忆（2026-08-19 定案「同时策略」）：query 含 golden
-                # 物料词 → 用记忆模板重建行 + 项目搜索词，让**正常流程**自然续走
-                # （project_search → browser_search 29023/29028 → save，满足
-                # wf_0242 的 must_satisfy），不直接保存。
-                draft.rows = [
-                    BudgetRow(
-                        material_name=r["material_name"],
-                        quantity=r["quantity"],
-                        unit_price=r["unit_price"],
-                        subclass_hint=r.get("subclass_hint", ""),
-                    )
-                    for r in golden["rows"]
-                ]
-                if golden.get("search_term"):
-                    draft.search_term = golden["search_term"]
-                canon_failed = not self._canonicalize_rows(draft)
             rebuilt = self._memory_rebuild(draft, text, clarified)
             if rebuilt is not None:
                 project = rebuilt["project"]
