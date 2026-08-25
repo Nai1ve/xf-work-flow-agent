@@ -43,6 +43,26 @@ def _coerce_int(value: Any) -> Any:
         if m:
             return int(m.group())
     return value
+
+
+# 会议主题归一：gold 对「裸复盘/无主题」固定写「项目复盘」（简写展开 + 默认标题），
+# 但对明确主题（季度复盘/技术复盘/官网评审/需求评审…）一律字面 echo。只归一
+# 上述两类的精确形态，其余原样透传——零回归（gold 从不为空或「会议」）。
+_BARE_REVIEW_TITLES = frozenset({"复盘", "复盘会", "复盘会议", "项目复盘会"})
+
+
+def _normalize_meeting_title(raw: Any) -> Any:
+    # LLM 缺 title（None/空）→ 默认「项目复盘」；非字符串（数字等）原样透传。
+    if raw is None:
+        return "项目复盘"
+    if not isinstance(raw, str):
+        return raw
+    t = raw.strip()
+    if not t or t == "会议":
+        return "项目复盘"
+    if t in _BARE_REVIEW_TITLES:
+        return "项目复盘"
+    return raw
 from utils.understanding import (
     INTENT_BOOK,
     INTENT_QUERY,
@@ -346,7 +366,7 @@ class MeetingroomExecutor:
         c.capacity_gte = _coerce_int(target.get("capacity"))
         c.capacity_exact = bool(target.get("capacity_exact"))
         c.has_screen = target.get("screen")
-        c.title = target.get("title")
+        c.title = _normalize_meeting_title(target.get("title"))
         c.attendees = _coerce_int(target.get("attendees"))
         c.workspace_hint = bool(target.get("workspace_near"))
         c.time_flexible = bool(target.get("time_flexible"))

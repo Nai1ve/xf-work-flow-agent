@@ -624,8 +624,29 @@ class LeaveExecutor:
             sub_query, user_query, leave_type, delete_old=delete_old
         )
 
-        # 8) 提交/存草稿（公司约定关键词，确定性业务规则）。
-        submit = bool(re.search(r"提交", sub_query or ""))
+        # 8) 提交/存草稿（公司约定关键词，确定性业务规则）。决策次序：
+        #    负向「不提交/先不提交…」> 明确存草稿 > 明确提交 > 事件假（婚假/
+        #    丧假/陪产假）默认提交 > 默认存草稿。
+        #    数据全量一致：年/事/病/育假（N/L/S/Y）无关键词一律 draft_saved
+        #    （20 例）；婚假/丧假/陪产假（M/F/P）一律 submitted（含 wf_0204
+        #    无关键词「我下周要结婚…婚假」）——事件假走正式申请，默认提交。
+        #    「不要保存草稿」反向否定草稿（wf_0224 直接提交不要保存草稿 → 提交）。
+        negate_submit = bool(
+            re.search(r"不提交|别提交|晚点提交|稍后提交|暂不提交", text)
+        )
+        no_draft = bool(
+            re.search(
+                r"不要保存草稿|不要存草稿|别存草稿|别保存草稿|不用存草稿|不要草稿",
+                text,
+            )
+        )
+        has_draft_word = bool(re.search(r"草稿|存草稿|存一下|先存|先保存|暂存", text))
+        explicit_draft = has_draft_word and not no_draft
+        explicit_submit = bool(re.search(r"提交", text)) and not negate_submit
+        event_leave = bool(re.search(r"婚假|结婚|丧假|丧事|陪产假|产假|生育", text))
+        submit = explicit_submit or (
+            (not explicit_draft) and event_leave and not negate_submit
+        )
 
         # 9) 保存（每周反复 → 多次保存；drafts[-1] 为最后一次）。
         count = 0

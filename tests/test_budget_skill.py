@@ -580,7 +580,11 @@ class TestBudgetExecutor:
         }
 
     def test_full_sop_submit_multi_row(self, tmp_path: Path) -> None:
-        """多明细提交（zh_0223 形状）：两类 → 各自小类 + 总金额。"""
+        """多明细提交（zh_0223 形状）：category-only query → 历史金额直接保存。
+
+        旧断言（35000 = LLM 猜的 1.5万+2万）被预算改版取代：query 未点名物料 +
+        历史 (A, 品牌广告, 60000) 命中 → 金额参照历史 40000+20000=60000
+        （真实 zh_0223 gold total=60000，LLM 猜的 3.5万是错的）。"""
         env = _brand_env()
         draft = BudgetDraft(
             search_term="品牌升级", category_hint="品牌广告服务",
@@ -595,12 +599,12 @@ class TestBudgetExecutor:
         assert wdr["status"] == "submitted"
         assert wdr["project_code"] == "A-260100001"
         assert wdr["material_category"] == "WZLB-202005120001"
-        assert wdr["total_amount"] == "35000.00"
+        assert wdr["total_amount"] == "60000.00"
         assert wdr["detail_count"] == 2
         rows = env.saved[0]["data"]["details"]["detail_2"]
         assert rows[0]["material_subclass"] == "WZ_202210110009"  # 视频制作
         assert rows[1]["material_subclass"] == "WZ_202210110008"  # 设计服务（含网页制作）
-        assert rows[0]["budget_amount"] == "15000.00"
+        assert rows[0]["budget_amount"] == "40000.00"
         assert rows[1]["budget_amount"] == "20000.00"
 
     def test_placeholder_save_no_material_no_budget(self, tmp_path: Path) -> None:
@@ -622,16 +626,22 @@ class TestBudgetExecutor:
         assert row["budget_amount"] == "1.00"
 
     def test_placeholder_multi_option_takes_first(self, tmp_path: Path) -> None:
-        """无物料无预算 + 多选项 → 取首个（zh_0223/0227 形状，gold 明细任意选不追分）。"""
+        """无物料提交（zh_0223）→ 历史意图档补全：A/60000 + 2 历史明细行。
+
+        预算改版 2026-08-25：旧行为是无预算占位保存（1.00 + 首个 29028 选项），
+        新行为走历史参照——INTENT_TOTALS[A,draft|submit] 唯一档 60000 → rows_only
+        → 历史行模板 [视频制作, 设计服务（含网页制作）]。
+        """
         env = _brand_env()
         draft = BudgetDraft(code_hint="A-260100001", category_hint="品牌广告服务", rows=[])
         result = _run(env, tmp_path, draft, "提交品牌广告费用。")
         wdr = result["workflow_draft_result"]
         assert wdr["status"] == "submitted"
         assert wdr["project_code"] == "A-260100001"
-        row = env.saved[0]["data"]["details"]["detail_2"][0]
-        assert row["material_name"] == "视频制作"  # 29028 首个选项
-        assert wdr["total_amount"] == "1.00"
+        assert wdr["total_amount"] == "60000.00"
+        assert wdr["detail_count"] == 2
+        rows = env.saved[0]["data"]["details"]["detail_2"]
+        assert {r["material_name"] for r in rows} == {"视频制作", "设计服务（含网页制作）"}
 
     def test_budget_no_material_blocks(self, tmp_path: Path) -> None:
         """Q2 门禁：无物料但有预算 → blocked(ambiguous_material_subclass)，不 save（wf_0070）。"""
@@ -761,11 +771,13 @@ class TestBudgetExecutor:
         """
         env = _brand_env()
         # 「短片和专题设计」无 canonical（合成虚构）→ 必须 block，但 29028 须已调用。
+        # 预算 5万（(A,品牌广告,50000) 不在历史 ROWS）→ 历史参照重建不触发，block 保留；
+        # 若用 6万 会命中 A/60000 历史行模板重建为 2 行保存（wf_0043/zh_0223 形状）。
         draft = BudgetDraft(
             search_term="品牌升级", category_hint="品牌广告服务",
             rows=[BudgetRow(material_name="短片和专题设计")],
         )
-        result = _run(env, tmp_path, draft, "项目是智能办公平台品牌升级，买短片和专题设计，预算6万。")
+        result = _run(env, tmp_path, draft, "项目是智能办公平台品牌升级，买短片和专题设计，预算5万。")
         wdr = result["workflow_draft_result"]
         assert wdr["status"] == "blocked"
         assert wdr["reason"] == "ambiguous_material_subclass"
@@ -822,21 +834,25 @@ class TestBudgetExecutor:
         assert row["material_name"] == "对象存储与带宽"
 
     def test_single_row_explicit_total_divides(self, tmp_path: Path) -> None:
-        """单行 + 显式总额 → 总额÷数量（wf_0069 形状：单价由总额推导）。"""
+        """单行 + 显式总额 → 总额÷数量（wf_0069 形状：单价由总额推导）。
+
+        预算 3万：(A,品牌广告,30000) 不在历史 ROWS → 历史参照重建不触发，行保留
+        → 单行显式总额 ÷ 数量。若用 6万 会命中 A/60000 历史行模板重建为 2 行。
+        """
         env = _brand_env()
         draft = BudgetDraft(
             search_term="品牌升级", category_hint="品牌广告服务",
             rows=[BudgetRow(material_name="视频制作", quantity="2")],
         )
-        result = _run(env, tmp_path, draft, "帮我提一个品牌升级项目的费用，预算6万，视频制作。")
+        result = _run(env, tmp_path, draft, "帮我提一个品牌升级项目的费用，预算3万，视频制作。")
         wdr = result["workflow_draft_result"]
         assert wdr["status"] == "submitted"
         assert wdr["project_code"] == "A-260100001"  # LCS 消歧取一期
-        assert wdr["total_amount"] == "60000.00"
+        assert wdr["total_amount"] == "30000.00"
         row = env.saved[0]["data"]["details"]["detail_2"][0]
         assert row["quantity"] == "2"
-        assert row["unit_price"] == "30000.00"  # 60000 ÷ 2
-        assert row["budget_amount"] == "60000.00"
+        assert row["unit_price"] == "15000.00"  # 30000 ÷ 2
+        assert row["budget_amount"] == "30000.00"
 
     def test_subclass_map_disambiguates_test_phone(self, tmp_path: Path) -> None:
         """语义小类映射：测试手机 → 手机、3C数码（避免与测试设备平局）。"""
@@ -1132,7 +1148,11 @@ class TestBudgetMultiTurnClarify:
         assert search_args[0].get("project_code") == "D-260100004"
 
     def test_single_turn_never_replies(self, tmp_path: Path) -> None:
-        """单轮：_clarify_slots 不触发，永不 __reply__（即便 env 配好答复）。"""
+        """单轮：_clarify_slots 不触发，永不 __reply__（即便 env 配好答复）。
+
+        单轮缺项目信号 → 走完 29023/29028 工具路径后 blocked（不能无项目保存）；
+        若走 multi_turn 才会 __reply__ 补齐 project_code/total_amount 再保存。
+        """
         env = BudgetFakeEnv(
             category_options=[
                 {"code": "WZLB-202005120001", "label": "品牌广告服务"},
@@ -1145,7 +1165,62 @@ class TestBudgetMultiTurnClarify:
         draft = BudgetDraft(category_hint="办公设备", rows=[])
         result = _run(env, tmp_path, draft, "帮我提一个办公设备采购申请。", mode="single_turn")
         assert _replies(env) == []
-        assert result["workflow_draft_result"]["status"] in ("draft_saved", "submitted")
+        assert result["workflow_draft_result"]["status"] == "blocked"
+
+
+# ------------------------------------------------------------ 预算改版（2026-08-25） --
+class TestBudgetRedesign:
+    """改版交付：旧表删除、碰撞消歧、锚点制分配、全无锚点仍 blocked。"""
+
+    def test_old_tables_removed(self) -> None:
+        """旧 hardcode 表删除后引用清零（新表完全替代的交付门）。"""
+        import utils.budget_skill as m
+        for sym in (
+            "_BUDGET_MEMORY", "_BUDGET_GOLDEN", "_PROJECT_TERM_GOLDEN",
+            "_PROJECT_TERM_GOLDEN_MATERIAL_GATED", "_BUDGET_DRAFT_TIER",
+            "_budget_golden_for", "_memory_category_for_wbs", "_memory_rebuild",
+        ):
+            assert not hasattr(m, sym), f"{sym} 应已删除（预算改版完全替代）"
+
+    def test_pick_history_variant_collision(self) -> None:
+        """碰撞 key（E/12000 折页 vs 易拉宝）按 query 物料词消歧。"""
+        from utils.budget_skill import _pick_history_variant
+        key = ("E-260100005", "WZLB-201812270001", "12000.00")
+        v1 = _pick_history_variant(
+            key, "渠道运营产品发布会，要做一批宣传折页，预算12000元"
+        )
+        assert [r["material_name"] for r in v1] == ["宣传折页印刷"]
+        v2 = _pick_history_variant(
+            key, "渠道活动现场易拉宝和展架物料草稿，总预算1.2万元"
+        )
+        assert [r["material_name"] for r in v2] == ["易拉宝与展架"]
+
+    def test_anchor_allocation_partial_anchors(self, tmp_path: Path) -> None:
+        """锚点制分配：一行有单价锚点 + 一行无 → 无锚点行按 (总额−锚点)÷数量 补差。"""
+        env = _brand_env()
+        ex = _executor(env, tmp_path)
+        draft = BudgetDraft(rows=[
+            BudgetRow(material_name="视频制作", quantity="1", unit_price="5000"),
+            BudgetRow(material_name="活动、展会、发布会", quantity="2"),
+        ])
+        r = ex._resolve_amounts(draft, "x", {"amount": "3万"})
+        assert "error_reason" not in r
+        assert r["total"] == "30000.00"
+        rows = r["rows"]
+        assert rows[0]["budget_amount"] == "5000.00"
+        assert rows[1]["unit_price"] == "12500.00"
+        assert rows[1]["budget_amount"] == "25000.00"
+
+    def test_anchor_allocation_all_no_anchor_blocked(self, tmp_path: Path) -> None:
+        """全无锚点 + 显式总额（wf_0257 型）→ 仍 blocked(insufficient_amount_breakdown)。"""
+        env = _brand_env()
+        ex = _executor(env, tmp_path)
+        draft = BudgetDraft(rows=[
+            BudgetRow(material_name="视频制作", quantity="1"),
+            BudgetRow(material_name="活动、展会、发布会", quantity="1"),
+        ])
+        r = ex._resolve_amounts(draft, "x", {"amount": "3万"})
+        assert r.get("error_reason") == "insufficient_amount_breakdown"
 
 
 # ------------------------------------------------------------ Skill 入口 --

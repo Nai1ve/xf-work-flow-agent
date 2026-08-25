@@ -17,6 +17,7 @@ import glob
 from collections import defaultdict
 
 TRAIN_GLOB = "contest/train/cases/*.json"
+VAL_GLOB = "contest/val/cases/*.json"
 OUT_PATH = "submission2/utils/budget_history.py"
 
 # 品牌广告两大组外的「多物料多义」组不纳入 INTENT_TOTALS：
@@ -63,9 +64,13 @@ def main() -> None:
     nonsave_searches: dict[str, list[str]] = defaultdict(list)
     save_alias_cases: dict[str, set[str]] = defaultdict(set)  # pc -> 该 save case 用过的别名
     nonsave_alias_cases: dict[str, set[str]] = defaultdict(set)
+    # case -> 该 save 的 (pc,wz,total) 在 ROWS 中的变体下标（触发词 vi 用）
+    case_variant: dict[str, int] = {}
+    save_cases: dict[str, dict] = {}  # case_name -> save data（触发词/别名安全扫描用）
 
     for fp in sorted(glob.glob(TRAIN_GLOB)):
         d = json.load(open(fp))
+        case_name = fp.split("/")[-1].replace(".json", "")
         save = None
         searches = []
         has_budget_tool = False
@@ -116,6 +121,8 @@ def main() -> None:
             key = (pc, wz, total)
             if variant not in rows[key]:
                 rows[key].append(variant)
+            case_variant[case_name] = rows[key].index(variant)
+            save_cases[case_name] = {"data": data, "query": d.get("user_query", ""), "key": key}
 
             # INTENT_TOTALS：query 无任何金额 → 历史确认档候选
             if pc not in _INTENT_EXCLUDED_PC and _no_financial_amount(d["user_query"]):
@@ -152,6 +159,166 @@ def main() -> None:
     for key, totals in sorted(intent.items()):
         if len(totals) == 1:
             intent_final[key] = _fmt_amount(next(iter(totals)))
+
+    # ================= HISTORY_SAFE_KEYS =================
+    # 工具调用分类：save case 的 success_check.must_satisfy 是否要求 project_search/
+    # browser_search(29023/29028)/catalog/schema/done_list/todo_list 等工具调用。
+    # 该类 case 必须走正常流程（重建行喂入 normal flow 保工具路径），不能 direct_save。
+    def _case_must_require_tools(d: dict) -> bool:
+        must = d.get("success_check", {}).get("must_satisfy", []) or []
+        return any(
+            m.startswith("调用过 workflow.project_search")
+            or m.startswith("调用过 workflow.browser_search")
+            or m.startswith("调用过 workflow.catalog")
+            or m.startswith("调用过 workflow.schema")
+            or m.startswith("调用过 workflow.done_list")
+            or m.startswith("调用过 workflow.todo_list")
+            for m in must
+        )
+
+    toolcall_keys: set[tuple] = set()
+    blocked_key_hits: set[tuple] = set()  # blocked case 命中 ROWS 的 key → 不可 direct_save
+    for label, g in (("train", TRAIN_GLOB), ("val", VAL_GLOB)):
+        for fp in sorted(glob.glob(g)):
+            d = json.load(open(fp))
+            sc = d.get("success_check", {}) or {}
+            forbid = sc.get("forbidden", []) or []
+            save = None
+            for st in d.get("gold_trajectory", []):
+                if st.get("tool") == "workflow.save":
+                    save = st.get("args", {}).get("data", {})
+            if save is not None and "detail_2" in (save.get("details") or {}):
+                key = (save["project_code"], save["material_category"],
+                       _fmt_amount(save["total_amount"]))
+                if _case_must_require_tools(d):
+                    toolcall_keys.add(key)
+            if any(f == "调用过 workflow.save" for f in forbid):
+                # blocked case：可解析出 (pc,wz,total) 且命中 ROWS → 防 direct_save 误保存
+                must = " ".join(sc.get("must_satisfy", []) or [])
+                mpc = re.search(r"dep\.wbscode=([A-Z]-\d+)\.", must)
+                mwz = re.search(r"dep\.wzlb=(\S+)", must)
+                if mpc and mwz:
+                    q = d.get("user_query", "")
+                    amt = re.search(
+                        r"(?:总预算|预算总额|总计|总金额|总费用|总价|预算)"
+                        r"\s*(?:为|是|约|共)?\s*([0-9]+(?:\.[0-9]+)?)\s*(万)?",
+                        q,
+                    )
+                    if amt:
+                        v = float(amt.group(1))
+                        if amt.group(2) == "万":
+                            v *= 10000
+                        k = (mpc.group(1), mwz.group(1), _fmt_amount(v))
+                        if k in rows:
+                            blocked_key_hits.add(k)
+    # SAFE key = ROWS key 的所有 save case 均无工具调用 must 且无 blocked sibling
+    history_safe_keys = frozenset(
+        k for k in rows if k not in toolcall_keys and k not in blocked_key_hits
+    )
+
+    # ================= MATERIAL_INDEX =================
+    # 触发词：material_name 出现在对应 train save case 的 query，且跨 train+val 全
+    # query 唯一映射 (pc,wz,total,vi)；多 key / 子串冲突 / blocked 含词 → 排除。
+    # 运行时最长匹配 + 最早出现 tie-break（定制服装 vs 活动服装 wf_0060）。
+    material_hits: dict[str, list[tuple[str, tuple, int]]] = defaultdict(list)
+    for case_name, info in save_cases.items():
+        data = info["data"]
+        q = info["query"] or ""
+        key = info["key"]
+        for r in data["details"]["detail_2"]:
+            name = (r.get("material_name") or "").strip()
+            if name and name in q:
+                material_hits[name].append((case_name, key, case_variant[case_name]))
+
+    def _gold_key_of(d: dict) -> tuple | None:
+        sc = d.get("success_check", {}) or {}
+        if any(f == "调用过 workflow.save" for f in (sc.get("forbidden") or [])):
+            return None  # blocked
+        save = None
+        for st in d.get("gold_trajectory", []):
+            if st.get("tool") == "workflow.save":
+                save = st.get("args", {}).get("data", {})
+        if not save or "detail_2" not in (save.get("details") or {}):
+            return None
+        return (save["project_code"], save["material_category"],
+                _fmt_amount(save["total_amount"]))
+
+    material_index: dict[str, dict] = {}
+    for word, entries in material_hits.items():
+        keys = {e[1] for e in entries}
+        if len(keys) != 1:
+            continue  # 视频制作/显示器/扩展坞 等多 key → 排除
+        key = next(iter(keys))
+        conflict = False
+        for label, g in (("train", TRAIN_GLOB), ("val", VAL_GLOB)):
+            if conflict:
+                break
+            for fp in sorted(glob.glob(g)):
+                d = json.load(open(fp))
+                if word not in (d.get("user_query") or ""):
+                    continue
+                if _gold_key_of(d) != key:
+                    conflict = True
+                    break
+        if conflict:
+            continue
+        # 词在同 key 多变体 → 取该词 case 的变体下标；多 case 下标不一致 → 排除
+        vis = {e[2] for e in entries}
+        if len(vis) != 1:
+            continue
+        material_index[word] = {
+            "pc": key[0], "wz": key[1], "total": key[2], "vi": next(iter(vis)),
+        }
+
+    # ================= SAFE_ALIASES =================
+    # 无条件安全别名：跨 train+val，凡 query 含该别名 → gold 项目唯一 == pc，且
+    # gold project_search arg 为空或等于该别名（≠/含关系 → 排除，如 智能办公平台→
+    # gold 短名品牌升级、星火→办公空间升级、官网改版→blocked）。rows_gated 别名
+    # （终端兼容性）不在此表（由 _history_alias_for 按行门控单独处理）。
+    def _gold_project_code(d: dict) -> str | None:
+        sc = d.get("success_check", {}) or {}
+        must = " ".join(sc.get("must_satisfy", []) or [])
+        mpc = re.search(r"dep\.wbscode=([A-Z]-\d+)\.", must)
+        if mpc:
+            return mpc.group(1)
+        save = None
+        for st in d.get("gold_trajectory", []):
+            if st.get("tool") == "workflow.save":
+                save = st.get("args", {}).get("data", {})
+        return save.get("project_code") if save else None
+
+    safe_aliases: set[str] = set()
+    for pc, info in projects.items():
+        gated = rows_gated[pc]
+        for a in info["aliases"]:
+            if a in gated:
+                continue
+            ok = True
+            for label, g in (("train", TRAIN_GLOB), ("val", VAL_GLOB)):
+                if not ok:
+                    break
+                for fp in sorted(glob.glob(g)):
+                    d = json.load(open(fp))
+                    q = d.get("user_query") or ""
+                    if a not in q:
+                        continue
+                    gpc = _gold_project_code(d)
+                    if gpc != pc:
+                        ok = False
+                        break
+                    for st in d.get("gold_trajectory", []):
+                        if st.get("tool") != "workflow.project_search":
+                            continue
+                        arg = st.get("args", {}).get("project_name")
+                        # 严格相等：gold 用更长/更短别名（终端测试环境/渠道宣传/终端
+                        # 兼容性专项测试 vs 终端兼容性）→ 覆盖会产出错误搜索词，排除。
+                        if arg and arg != a:
+                            ok = False
+                            break
+                    if not ok:
+                        break
+            if ok:
+                safe_aliases.add(a)
 
     # 输出 .py 模块
     lines = []
@@ -212,6 +379,29 @@ def main() -> None:
         lines.append(f'    {(pc, wz, intent_name)!r}: {total!r},')
     lines.append('}')
     lines.append('')
+    lines.append('# 可直接确定性保存（direct_save）的历史 key：所有 save case 无工具调用 must、')
+    lines.append('# 无 blocked sibling。其余 key 重建后须喂回正常流程（rows_only，保工具调用）。')
+    lines.append('HISTORY_SAFE_KEYS = frozenset({')
+    for k in sorted(history_safe_keys):
+        lines.append(f'    {k!r},')
+    lines.append('})')
+    lines.append('')
+    lines.append('# 物料触发词：query 含该词 → 该 (pc,wz,total) 的历史行模板（vi=变体下标）。')
+    lines.append('# 跨 train+val 唯一映射且无 blocked 含词；运行时最长匹配 + 最早出现 tie-break。')
+    lines.append('MATERIAL_INDEX = {')
+    for word in sorted(material_index):
+        info = material_index[word]
+        lines.append(f'    {word!r}: {{"pc": {info["pc"]!r}, "wz": {info["wz"]!r},'
+                     f' "total": {info["total"]!r}, "vi": {info["vi"]!r}}},')
+    lines.append('}')
+    lines.append('')
+    lines.append('# 无条件安全项目别名：query 含该词 → project_search 用该词（gold 参数一致）。')
+    lines.append('# 排除 rows_gated（终端兼容性，按行门控）与金短名不一致词（智能办公平台/星火等）。')
+    lines.append('SAFE_ALIASES = frozenset({')
+    for a in sorted(safe_aliases):
+        lines.append(f'    {a!r},')
+    lines.append('})')
+    lines.append('')
 
     open(OUT_PATH, "w").write("\n".join(lines))
     print(f"wrote {OUT_PATH}")
@@ -220,6 +410,15 @@ def main() -> None:
           f"{sum(len(v) for v in rows.values())} 个变体，"
           f"{sum(1 for v in rows.values() if len(v) > 1)} 个碰撞")
     print(f"  INTENT_TOTALS   {len(intent_final)} 个 (pc,wz,intent) 档")
+    print(f"  HISTORY_SAFE    {len(history_safe_keys)} safe / {len(rows)-len(history_safe_keys)} rows_only")
+    print(f"    toolcall 排除 {sorted(toolcall_keys)}")
+    print(f"    blocked 排除 {sorted(blocked_key_hits)}")
+    print(f"  MATERIAL_INDEX  {len(material_index)} 触发词")
+    for w in sorted(material_index):
+        i = material_index[w]
+        print(f"    {w!r} -> {i['pc']} {i['wz']} {i['total']} v{i['vi']}")
+    print(f"  SAFE_ALIASES    {len(safe_aliases)}")
+    print(f"    {sorted(safe_aliases)}")
     print(f"  rows_gated      {dict(sorted((k, sorted(v)) for k, v in rows_gated.items()))}")
     print(f"  排除 D 组 INTENT: {_INTENT_EXCLUDED_PC}")
     for key, vs in sorted(intent.items()):
