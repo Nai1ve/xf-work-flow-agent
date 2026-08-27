@@ -239,9 +239,12 @@ class LeavePlanner:
 # 公司请假类型词表（与 schema 72247 leave_type_options label 对齐）。
 _TYPE_WORDS = (
     "年休假", "年假", "事假", "病假", "婚假", "陪产假",
-    "育儿假", "父母陪护假", "丧假", "延时假", "收养假",
+    "育儿假", "父母陪护假", "丧假", "延时假", "调休", "收养假",
 )
 _TYPE_RE = re.compile("|".join(_TYPE_WORDS))
+
+# 口语词 → schema label 别名（执行层码表匹配前归一）。
+_TYPE_ALIASES = {"调休": "延时假"}
 
 # 原因关键词 → 公司 reason 码表（schema 72247 reason_options）。
 _REASON_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -288,8 +291,14 @@ def _regex_leave_type(sub_query: str) -> str:
 
     取**最后一次**出现：删旧草稿场景（wf_0015「昨天请了病假…改成事假」）
     以目标类型为准——病假是旧申请的上下文，事假才是本次动作的类型。
+
+    例外：「调休」优先。它是加班补偿假（V）的唯一强信号词，与其他类型词并列
+    时（wf_0018「这周四调休一天，然后周五再请一天年假」）表示本次主假为调休；
+    全库仅 wf_0018 含此词，last-match 语义其他场景不受影响。
     """
     q = sub_query or ""
+    if "调休" in q:
+        return "调休"
     matches = list(_TYPE_RE.finditer(q))
     return matches[-1].group(0) if matches else ""
 
@@ -1288,6 +1297,7 @@ def _match_type_code(hint: str, options: list[dict[str, Any]]) -> str | None:
     """请假类型 hint → schema leave_type_options 码（去「假」字核心匹配）。"""
     if not hint:
         return None
+    hint = _TYPE_ALIASES.get(hint, hint)
     core = hint.replace("假", "")
     for opt in options or []:
         label = str(opt.get("label") or "").replace("假", "")
