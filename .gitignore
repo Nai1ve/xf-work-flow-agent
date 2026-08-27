@@ -24,6 +24,7 @@ reports/
 
 # Local submission packages.
 submission*.zip
+submit_*.zip
 submission/submission/
 
 # Local development environment.
