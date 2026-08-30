@@ -88,6 +88,15 @@ python scripts/package_submission.py \
 
 脚本把 `submission2/` 映射为 zip 内的 `submission/`，剔除文档、训练数据、报告、缓存、日志和本地配置，递归清空认证字段，并检查 `submission/my_agent.py`、大小和疑似密钥。当前验收包约 185KB。
 
+若需要把已确认的本地 key 一并打入仅供提交测试的包：
+
+```bash
+python scripts/package_submission.py --include-key \
+  --output submission2/dist/submit_v2_with_key.zip
+```
+
+该模式只读取本地 `submission2/config.json`，不修改源文件；输出目录已忽略，带 key 的 zip 不得提交 Git 或公开分享。
+
 ## 设计文档
 
 - [architecture.md](docs/architecture.md)：模块边界和数据流

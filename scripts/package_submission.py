@@ -2,15 +2,17 @@
 """构建官方可提交的 V2 zip。
 
 默认把 ``submission2`` 编译为 zip 内的 ``submission/`` 目录。脚本不会读取或复制
-``config.local.json``、日志、缓存、训练数据和 reports；``config.json`` 会递归清空
-认证字段，运行时请通过环境变量提供 API key。打包过程只使用标准库，方便在 Docker
-和本地重复执行。
+``config.local.json``、日志、缓存、训练数据和 reports；``config.json`` 默认递归清空
+认证字段，运行时请通过环境变量提供 API key。若明确传入 ``--include-key``，则从
+本地 ``submission2/config.json`` 读取当前 key 写入**未跟踪的本地测试包**，适合提交
+前联调；该模式不会修改源文件，也不会进入 Git。打包过程只使用标准库。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -42,7 +44,7 @@ def _redact(value: Any, key: str | None = None) -> Any:
     return value
 
 
-def _copy_source(stage_submission: Path) -> None:
+def _copy_source(stage_submission: Path, *, include_key: bool = False) -> None:
     if not SOURCE.is_dir():
         raise FileNotFoundError(f"找不到源目录: {SOURCE}")
     for source in SOURCE.rglob("*"):
@@ -71,27 +73,45 @@ def _copy_source(stage_submission: Path) -> None:
                 config = json.loads(source.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
                 raise RuntimeError(f"config.json 无法解析: {exc}") from exc
+            if include_key:
+                # 仅从本地 config.json 读取 key；若该文件未配置，则允许使用已确认
+                # 的环境变量。值只在临时 staging 和 zip 内存中流转，绝不打印。
+                llm = config.setdefault("llm", {})
+                if not isinstance(llm, dict):
+                    raise RuntimeError("config.json 的 llm 配置不是对象")
+                if not str(llm.get("api_key") or "").strip() and os.getenv("OPENAI_API_KEY"):
+                    llm["api_key"] = os.environ["OPENAI_API_KEY"]
+                if not str(llm.get("api_key") or "").strip():
+                    raise RuntimeError("--include-key 需要 submission2/config.json 或 OPENAI_API_KEY 中存在可用 key")
+                output_config = config
+            else:
+                output_config = _redact(config)
             destination.write_text(
-                json.dumps(_redact(config), ensure_ascii=False, indent=2) + "\n",
+                json.dumps(output_config, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
         else:
             shutil.copy2(source, destination)
 
 
-def _write_readme(stage_root: Path) -> None:
+def _write_readme(stage_root: Path, *, include_key: bool = False) -> None:
+    key_note = (
+        "submission/config.json 已包含本地测试 key；请勿将此包或 key 提交到 Git。"
+        if include_key
+        else
+        "submission/config.json 不包含密钥，请通过 OPENAI_API_KEY 注入。"
+    )
     (stage_root / "README.md").write_text(
-        """# NL2Workflow V2 submission
+        f"""# NL2Workflow V2 submission
 
 入口为 `submission/my_agent.py`，依赖仅使用 Python 标准库。
-请通过 `OPENAI_API_KEY`（以及可选的 `OPENAI_BASE_URL`、`OPENAI_MODEL`）注入模型配置；
-submission/config.json 不包含密钥。
+{key_note}
 """,
         encoding="utf-8",
     )
 
 
-def _check_archive(path: Path) -> tuple[int, list[str]]:
+def _check_archive(path: Path, *, allow_config_key: bool = False) -> tuple[int, list[str]]:
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
         required = {"submission/my_agent.py", "submission/config.json", "submission/utils/__init__.py"}
@@ -119,18 +139,19 @@ def _check_archive(path: Path) -> tuple[int, list[str]]:
                             return any(has_secret(v) for v in value)
                         return False
                     config_secret = has_secret(parsed)
-            if config_secret or (not name.endswith(".json") and SECRET_PATTERN.search(content.decode("utf-8", errors="ignore"))):
+            config_allowed = allow_config_key and name == "submission/config.json"
+            if (config_secret and not config_allowed) or (not name.endswith(".json") and SECRET_PATTERN.search(content.decode("utf-8", errors="ignore"))):
                 missing.append(f"疑似密钥: {name}")
     return path.stat().st_size, missing
 
 
-def build(output: Path) -> Path:
+def build(output: Path, *, include_key: bool = False) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="nl2workflow_v2_") as temp_dir:
         stage_root = Path(temp_dir)
         stage_submission = stage_root / "submission"
-        _copy_source(stage_submission)
-        _write_readme(stage_root)
+        _copy_source(stage_submission, include_key=include_key)
+        _write_readme(stage_root, include_key=include_key)
         if not (stage_submission / "my_agent.py").is_file():
             raise RuntimeError("submission/my_agent.py 不存在")
         if output.exists():
@@ -139,7 +160,7 @@ def build(output: Path) -> Path:
             for source in sorted(stage_root.rglob("*")):
                 if source.is_file():
                     archive.write(source, source.relative_to(stage_root).as_posix())
-    size, problems = _check_archive(output)
+    size, problems = _check_archive(output, allow_config_key=include_key)
     if problems:
         output.unlink(missing_ok=True)
         raise RuntimeError("提交包检查失败: " + "; ".join(problems))
@@ -162,8 +183,13 @@ def main() -> int:
         default=ROOT / "submission2" / "dist" / "submit_v2.zip",
         help="输出 zip 路径",
     )
+    parser.add_argument(
+        "--include-key",
+        action="store_true",
+        help="将本地 config.json/API key 写入测试包（仅本地使用，勿提交 Git）",
+    )
     args = parser.parse_args()
-    build(args.output)
+    build(args.output, include_key=args.include_key)
     return 0
 
 

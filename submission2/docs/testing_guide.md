@@ -35,4 +35,16 @@ AGENT_EXECUTION_PROFILE=hybrid_compat PYTHONPATH=submission2 \
   --output reports/runs/v2_val.json --log-output reports/runs/v2_val.stdout
 ```
 
+## 构建带 key 的本地提交包
+
+默认打包会清空认证字段；用户已确认复用当前 key 时，用独立输出文件执行：
+
+```bash
+python scripts/package_submission.py --include-key \
+  --output submission2/dist/submit_v2_with_key.zip
+```
+
+`--include-key` 只读取本地 `submission2/config.json`（或环境变量
+`OPENAI_API_KEY`），不修改源文件；该 zip 已被 `.gitignore` 忽略，切勿提交到 Git 或分享。
+
 公开 Gold 冲突只能通过 `scripts/audit_conflicts.py` 离线分析；该脚本不被提交包导入。
