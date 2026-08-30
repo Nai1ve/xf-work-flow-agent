@@ -66,13 +66,13 @@ PYTHONPATH=submission2 .venv/bin/python scripts/run_agent.py \
 ```bash
 AGENT_EXECUTION_PROFILE=hybrid_compat \
 PYTHONPATH=submission2 .venv/bin/python scripts/run_agent.py \
-  --split train --agent submission2/my_agent.py --parallel 4 --timeout 60 \
+  --split train --agent submission2/my_agent.py --parallel 1 --timeout 60 \
   --skip-variants --output reports/runs/v2_train.json \
   --log-output reports/runs/v2_train.stdout
 
 AGENT_EXECUTION_PROFILE=hybrid_compat \
 PYTHONPATH=submission2 .venv/bin/python scripts/run_agent.py \
-  --split val --agent submission2/my_agent.py --parallel 4 --timeout 60 \
+  --split val --agent submission2/my_agent.py --parallel 1 --timeout 60 \
   --skip-variants --output reports/runs/v2_val.json \
   --log-output reports/runs/v2_val.stdout
 ```

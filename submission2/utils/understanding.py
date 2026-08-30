@@ -142,6 +142,7 @@ class MeetingConstraints:
     attendees: int | None = None
     workspace_hint: bool = False
     time_flexible: bool = False
+    search_free_slot: bool = False
     query_type: str | None = None
     schedule_room_id: str | None = None
     schedule_start_date: str | None = None
@@ -584,6 +585,16 @@ class TemporalResolver:
         Returns:
             ISO 日期字符串；无法解析返回 None。
         """
+        # 已由跨 Task 事实账本绑定的 ISO 日期直接通过；这不是模型生成的业务
+        # ID，而是本用例内 runtime/tool fact 的日期，供请假 schedule 归一化使用。
+        iso = re.fullmatch(r"\s*(\d{4}-\d{2}-\d{2})\s*", query or "")
+        if iso:
+            try:
+                date.fromisoformat(iso.group(1))
+            except ValueError:
+                return None
+            return iso.group(1)
+
         # 字面日期：5月11日 / 5月11号。
         m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]", query)
         if m:
@@ -635,7 +646,9 @@ class TemporalResolver:
             (起始日 ISO, 结束日 ISO)；无匹配返回 (None, None)。搜索起始日
             不会早于今天（本周已过去的日期自动顺延到下周一并剪掉）。
         """
-        if "最早" not in query:
+        # “下周哪天/本周哪天”也是范围搜索；仅有“下周二”仍是单日。
+        range_request = bool(re.search(r"(?:本周|这周|下周)\s*(?:哪一?天|哪日)", query or ""))
+        if "最早" not in query and not range_request:
             return None, None
         this_monday = self._today - timedelta(days=self._today.weekday())
         weeks = 0
@@ -787,6 +800,18 @@ class MeetingConstraintExtractor:
         {"下午", "上午", "中午", "晚上", "明天", "今天", "下周", "这个", "那个",
          "一个", "周三", "周二", "周一", "周四", "周五", "周六", "周日",
          "会议室", "会议", "下周二", "下周三", "下周一", "下周四", "下周五"}
+    )
+    # 同日多场的时间区间。标题不由这个表达式直接捕获，避免把最短的两个
+    # 汉字（例如「需求」）误当成完整主题；后续由 ``_slot_title_from_segment``
+    # 按标点/下一个约束截断。
+    _SLOT_TIME_RE = re.compile(
+        r"(上午|下午|晚上|中午)?\s*(\d{1,2})\s*点\s*(半)?\s*"
+        r"(?:到|至|~|—)\s*(上午|下午|晚上|中午)?\s*(\d{1,2})\s*点\s*(半)?"
+    )
+    _SLOT_TITLE_RE = re.compile(
+        r"(?:开|召开|进行|安排|做)\s*"
+        r"([^\s，,。；;、！？!?]{1,30})"
+        r"(?=\s*(?:，|,|。|；|;|、|！|？|需要|要求|同一|容量|人数|有屏幕|带屏幕|$))"
     )
 
     def extract(self, query: str, resolver: TemporalResolver) -> MeetingConstraints:
@@ -957,6 +982,8 @@ class MeetingConstraintExtractor:
         # 时段柔性：「如果这个时间不行，前后半小时看看」→ 主时段无解时执行层回退。
         if any(h in query for h in ("这个时间不行", "前后半小时", "时间不行", "没有合适的")):
             c.time_flexible = True
+        if any(h in query for h in ("连续", "空档", "有空", "空闲")):
+            c.search_free_slot = True
 
     # ------------------------------------------------------------ S2 --
 
@@ -1080,11 +1107,7 @@ class MeetingConstraintExtractor:
         请假/预算的时段误当第二场会议（wf_0006 多订一间会触发 forbidden）。
         """
         out: list[dict] = []
-        for m in re.finditer(
-            r"(上午|下午|晚上|中午)?\s*(\d{1,2})\s*点\s*(半)?\s*"
-            r"(?:到|至|~|—)\s*(上午|下午|晚上|中午)?\s*(\d{1,2})\s*点\s*(半)?",
-            query,
-        ):
+        for m in self._SLOT_TIME_RE.finditer(query):
             window = query[m.end(): m.end() + 40]
             before = query[max(0, m.start() - 40): m.start()]
             # 时段后紧跟会议语境 → 入槽；否则看前缀：被句号/分号分隔（跨域
@@ -1102,12 +1125,7 @@ class MeetingConstraintExtractor:
             end_min += 30 if m.group(6) == "半" else 0
             if end_min <= start_min:
                 continue
-            title: str | None = None
-            t_m = re.search(
-                r"开([一-龥A-Za-z0-9]{2,12}?)", query[m.end():m.end() + 24]
-            )
-            if t_m:
-                title = t_m.group(1)
+            title = self._slot_title_from_segment(query[m.end():m.end() + 48])
             slot = {
                 "day": c.day,
                 "start": f"{start_min // 60:02d}:{start_min % 60:02d}",
@@ -1118,6 +1136,33 @@ class MeetingConstraintExtractor:
             if key not in {(s["start"], s["end"]) for s in out}:
                 out.append(slot)
         return out if len(out) >= 2 else []
+
+    @classmethod
+    def _slot_title_from_segment(cls, segment: str) -> str | None:
+        """从时间区间后的短语取完整会议主题。
+
+        旧实现对 ``开([\u4e00-\u9fff]{2,12}?)`` 使用非贪婪最短匹配，
+        因而「开需求评审」被截成「需求」。这里以用户原文的标点和下一个
+        约束词为边界，保持主题是可观测原文事实，不让模型/规则创造内容。
+        """
+        match = cls._SLOT_TITLE_RE.search(segment or "")
+        if not match:
+            return None
+        value = match.group(1).strip()
+        return value or None
+
+    @classmethod
+    def extract_slot_titles(cls, query: str) -> list[str]:
+        """提取 query 中每个时间区间后的显式主题，供计划修复使用。
+
+        该方法只返回用户原文中存在的标题，不做同义扩展或候选猜测；调用方
+        应仅在已经确认是 ``multi_day`` 会议任务时使用。
+        """
+        titles: list[str] = []
+        for match in cls._SLOT_TIME_RE.finditer(query or ""):
+            title = cls._slot_title_from_segment((query or "")[match.end(): match.end() + 48])
+            titles.append(title or "")
+        return titles
 
     def _fill_schedule_range(
         self, query: str, resolver: TemporalResolver, c: MeetingConstraints

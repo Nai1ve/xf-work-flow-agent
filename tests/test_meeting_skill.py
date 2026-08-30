@@ -164,6 +164,32 @@ class TestPlannerLLM:
         plan = MeetingOpPlanner().plan("多日校验只订一天", NOW, "single_turn", gateway)
         assert [op.action for op in plan.ops] == ["multi_day"]
 
+    def test_multi_slot_title_prefix_is_repaired_from_user_text(self) -> None:
+        """模型把多场主题压成前缀时，恢复用户原文的完整可观测标题。"""
+        gateway = _gateway(
+            {
+                "ops": [
+                    {
+                        "action": "multi_day",
+                        "target": {
+                            "slots": [
+                                {"start": "09:00", "end": "11:00", "title": "需求"},
+                                {"start": "14:00", "end": "16:00", "title": "技术"},
+                            ]
+                        },
+                    }
+                ],
+                "confidence": 0.95,
+            }
+        )
+        query = (
+            "帮我订周三A1园区的会议室，上午9点到11点开需求评审，"
+            "下午2点到4点开技术方案讨论，需要同一个房间"
+        )
+        plan = MeetingOpPlanner().plan(query, NOW, "single_turn", gateway)
+        slots = plan.ops[0].target["slots"]
+        assert [slot["title"] for slot in slots] == ["需求评审", "技术方案讨论"]
+
     def test_dedup_terminal_booking_direct(self) -> None:
         """类方法直接测试：book 在终态 op 之前不丢，之后才丢。"""
         from utils.meeting_skill import MeetingOp

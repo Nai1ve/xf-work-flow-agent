@@ -62,7 +62,16 @@ def _normalize_meeting_title(raw: Any) -> Any:
         return "项目复盘"
     if t in _BARE_REVIEW_TITLES:
         return "项目复盘"
-    return raw
+    # 「主题还是X / 主题为X」中的“还是”是中文话语连接词，不是标题事实。
+    # 模型偶尔会把它连同标题一起返回（例如“还是季度复盘”），这里做通用的
+    # 前缀归一，不依赖 case/gold 映射，也不改写标题主体。
+    for prefix in ("还是", "主题是", "主题为", "主题：", "主题:"):
+        if t.startswith(prefix) and len(t) > len(prefix):
+            cleaned = t[len(prefix):].strip(" ：:")
+            if cleaned:
+                t = cleaned
+                break
+    return t
 from utils.understanding import (
     INTENT_BOOK,
     INTENT_QUERY,
@@ -76,6 +85,7 @@ from utils.tool_contract import EffectiveToolRegistry
 from utils.static_context import StaticContextStore
 from utils.profiles import CompatibilityPolicy, ExecutionProfile, ProfileConfig
 from utils.holiday_calendar import (
+    is_meeting_bookable_day,
     next_meeting_bookable_day,
     shift_to_meeting_bookable_day,
 )
@@ -382,6 +392,7 @@ class MeetingroomExecutor:
         c.attendees = _coerce_int(target.get("attendees"))
         c.workspace_hint = bool(target.get("workspace_near"))
         c.time_flexible = bool(target.get("time_flexible"))
+        c.search_free_slot = bool(target.get("search_free_slot"))
         # target 键来自 _constraints_to_target / LLM：rooms 或 compare_rooms 都认。
         rooms = target.get("rooms") or target.get("compare_rooms") or []
         rooms = [self._canonicalize_room_id(r) for r in rooms if r]
@@ -427,6 +438,13 @@ class MeetingroomExecutor:
         """
         c = self._constraints_from_target(target)
         ctx = self._rebook_ctx
+        # ``_normalize_meeting_title`` 会把缺失标题规范为“项目复盘”；这里只看
+        # 原始 target，避免把用户明确的新标题（如“产品发布会”）被原会议标题覆盖。
+        explicit_title = bool(
+            isinstance(target.get("title"), str)
+            and target.get("title", "").strip()
+            and target.get("title", "").strip() != "会议"
+        )
         if target.get("conditional") and not target.get("inherit_title"):
             if c.day and c.start and c.end:
                 existing = self._locate_own_booking(
@@ -439,7 +457,7 @@ class MeetingroomExecutor:
                 # 重订沿用定位实际日（种子 04-21），盖掉 LLM 算的 明天(04-19/04-20)
                 # ——否则「定位 04-21 取消原会议、却订在 04-19」新旧并存（F3）。
                 c.day = ctx["day"]
-            if ctx.get("title"):
+            if ctx.get("title") and not explicit_title:
                 c.title = ctx["title"]
             if target.get("larger"):
                 orig = self._room_static(ctx.get("room_id"))
@@ -453,6 +471,22 @@ class MeetingroomExecutor:
             result = self._execute_book(c)
         br = result.get("booking_result") if isinstance(result, dict) else None
         if not br or br.get("status") != "success":
+            # cancel 已成功而新会议创建失败时，尽力恢复原会议，避免重订把
+            # 原业务状态破坏成“无会议”。恢复只使用 cancel 阶段保存的运行时
+            # 事实，失败则返回可解释 blocked，不凭空选房。
+            if ctx and target.get("inherit_title"):
+                recovered = self._recover_original_booking(ctx)
+                if recovered:
+                    return {
+                        "_ok": False,
+                        "booking_result": {
+                            "status": "rebook_failed_recovered",
+                            "reason": "new_booking_failed_original_recovered",
+                            "cancelled_order_id": ctx.get("order_id"),
+                            "recovered_order_id": recovered.get("order_id") or recovered.get("booking_id"),
+                            "booking_id": recovered.get("booking_id") or recovered.get("order_id"),
+                        },
+                    }
             return result if result else self._blocked()
         if ctx and target.get("inherit_title") and br.get("day") == ctx.get("day"):
             if ctx.get("seeded"):
@@ -461,11 +495,66 @@ class MeetingroomExecutor:
                 # 楼栋名约定——train 该族 gold 以 UUID 为准，val 10/10 不涉及此型）。
                 seed_room = self._room_static(br.get("room_id"))
                 seed_office = (seed_room or {}).get("officeId") or br.get("office_id")
-                return {"_ok": True, "booking_result": {**br, "status": "rebooked", "office_id": seed_office, "cancelled_order_id": ctx["order_id"]}}
+                return {"_ok": True, "booking_result": {
+                    **br,
+                    "status": "rebooked",
+                    "office_id": seed_office,
+                    "cancelled_order_id": ctx["order_id"],
+                }}
             new_room = self._room_static(br.get("room_id"))
             if new_room and new_room.get("building"):
                 br = {**br, "office_id": new_room.get("building")}
+            if self._profile_config.contract_fixes_v2:
+                # 新旧订单分开暴露；旧订单只作为取消事实，不覆盖新订单号。
+                new_order = br.get("order_id") or br.get("booking_id")
+                br = {
+                    **br,
+                    "order_id": new_order,
+                    "booking_id": br.get("booking_id") or new_order,
+                    "cancelled_order_id": ctx.get("order_id"),
+                }
         return {"_ok": True, "booking_result": br}
+
+    def _recover_original_booking(self, ctx: dict[str, Any]) -> dict[str, Any] | None:
+        """重订创建失败后的原会议恢复。
+
+        该分支只接受取消阶段从 ``booking.list`` 获得的完整 day/start/end/room
+        事实。缺任一关键槽位就不写入，避免为了恢复而猜测房间或时间。
+        """
+        if not self._registry.can_execute_write(self.BOOKING_CREATE):
+            return None
+        day, start, end, room_id = (
+            ctx.get("day"), ctx.get("start"), ctx.get("end"), ctx.get("room_id")
+        )
+        if not all((day, start, end, room_id)):
+            self._log_warning("重订失败但原会议事实不完整，无法安全恢复")
+            return None
+        room = self._room_static(str(room_id)) or {}
+        args: dict[str, Any] = {
+            "day": day,
+            "room_id": room_id,
+            "start": start,
+            "end": end,
+            "title": ctx.get("title") or "会议",
+            "office_id": room.get("officeId") or room_id,
+        }
+        result = self._call_tool(self.BOOKING_CREATE, args)
+        if result.get("success") is not True:
+            self._log_warning(f"原会议恢复失败: {result.get('error')}")
+            return None
+        recovered = {
+            "day": day,
+            "start": start,
+            "end": end,
+            "room_id": result.get("room_id") or room_id,
+            "order_id": result.get("order_id") or result.get("booking_id"),
+            "booking_id": result.get("booking_id") or result.get("order_id"),
+        }
+        self._log_info(
+            f"重订失败恢复原会议: old={ctx.get('order_id')} "
+            f"new={recovered.get('order_id') or '-'}"
+        )
+        return recovered
 
     def _op_multi_day(self, target: dict[str, Any]) -> dict[str, Any]:
         """multi_day：同日多场（slots）或多日同房（days）/多日校验只订一天。"""
@@ -488,10 +577,78 @@ class MeetingroomExecutor:
         此时与 _execute_book 的守卫一致，退化为单日订 c.day，避免
         _book_sequential 里 date.fromisoformat("") 崩掉整个 case。
         """
+        c = self._constraints_from_target(target)
+        if (
+            self._profile_config.meeting_search_v2
+            and c.named_room
+            and c.week_start
+            and c.week_end
+        ):
+            return self._earliest_named_room(c)
         # 必须走 _execute_book 的 S1w 门控：earliest 直连 _book_sequential 会跳过
         # user.get_workspace（zh_0009 LLM 偶发把 book 判成 earliest，gold 的
         # must_satisfy 要求调用 get_workspace + 离工位最近选址，掉 30 分）。
-        return self._execute_book(self._constraints_from_target(target))
+        return self._execute_book(c)
+
+    def _earliest_named_room(self, c: MeetingConstraints) -> dict[str, Any]:
+        """在日期范围内寻找点名房间第一个连续空档，再执行一次创建。"""
+        if not c.week_start or not c.week_end or not c.named_room:
+            return self._blocked("missing_search_range")
+        if not c.start or not c.end:
+            c.start, c.end = "14:00", "15:00"
+        if not self._registry.is_available(self.ROOM_SCHEDULE):
+            return self._blocked("schedule_unavailable")
+        room_id = self._canonicalize_room_id(c.named_room)
+        room = self._room_static(room_id)
+        if not room:
+            return self._blocked("room_not_found")
+        day = date.fromisoformat(c.week_start)
+        end_day = date.fromisoformat(c.week_end)
+        while day <= end_day:
+            day_str = day.isoformat()
+            schedule = self._call_tool(
+                self.ROOM_SCHEDULE,
+                {"room_id": room_id, "start_date": day_str, "end_date": day_str},
+            )
+            if not schedule.get("error") and self._schedule_slot_free(schedule, c.start, c.end):
+                c.day = day_str
+                self._log_info(f"点名房范围首个空档: room={room_id} day={day_str} {c.start}-{c.end}")
+                return self._create_booking(c, day_str, room)
+            day += timedelta(days=1)
+        return self._blocked("no_bookable_room")
+
+    @staticmethod
+    def _schedule_slot_free(schedule: dict[str, Any], start: str, end: str) -> bool:
+        for slot in schedule.get("busy_slots") or []:
+            if len(slot) >= 2 and start < str(slot[1]) and str(slot[0]) < end:
+                return False
+        return True
+
+    def _verify_continuous_candidates(
+        self,
+        day: str,
+        candidates: list[tuple[str, dict[str, Any]]],
+        start: str,
+        end: str,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """对最多三个候选用 room.schedule 做连续空档二次确认。"""
+        if not candidates or not self._profile_config.meeting_search_v2:
+            return candidates
+        if not self._registry.is_available(self.ROOM_SCHEDULE):
+            return candidates
+        verified: list[tuple[str, dict[str, Any]]] = []
+        for address, room in candidates[:3]:
+            result = self._call_tool(
+                self.ROOM_SCHEDULE,
+                {"room_id": room.get("room_id"), "start_date": day, "end_date": day},
+            )
+            if not result.get("error") and self._schedule_slot_free(result, start, end):
+                verified.append((address, room))
+        if verified:
+            self._log_info(f"连续空档校验: day={day} candidates={len(candidates)} verified={len(verified)}")
+            return verified
+        self._log_warning(f"连续空档校验未通过: day={day} candidates={len(candidates)}")
+        return []
 
     def _op_compare_book(self, target: dict[str, Any]) -> dict[str, Any]:
         """compare_book：room.schedule 逐个对比（覆盖订日所在周），选更空闲后预订。"""
@@ -538,7 +695,13 @@ class MeetingroomExecutor:
         time_hint = (target.get("start"), target.get("end"))
         conditional = bool(target.get("conditional"))
         if order_id:
-            ctx: dict[str, Any] = {"order_id": order_id, "day": day, "seeded": True}
+            ctx: dict[str, Any] = {
+                "order_id": order_id,
+                "day": day,
+                "start": target.get("start"),
+                "end": target.get("end"),
+                "seeded": True,
+            }
             if (
                 getattr(self, "_op_is_rebook_cancel", False)
                 and self._registry.is_available(self.BOOKING_LIST)
@@ -555,6 +718,7 @@ class MeetingroomExecutor:
                         if (b.get("order_id") or b.get("booking_id")) == order_id:
                             ctx.update(
                                 day=b.get("day") or ctx["day"],
+                                start=b.get("start"),
                                 title=b.get("title"),
                                 end=b.get("end"),
                                 room_id=b.get("room_id"),
@@ -585,6 +749,7 @@ class MeetingroomExecutor:
             self._rebook_ctx = {
                 "order_id": oid,
                 "day": day,
+                "start": booking.get("start"),
                 "title": booking.get("title"),
                 "end": booking.get("end"),
                 "room_id": booking.get("room_id"),
@@ -632,6 +797,7 @@ class MeetingroomExecutor:
         self._rebook_ctx = {
             "order_id": oid,
             "day": day,
+            "start": booking.get("start"),
             "title": booking.get("title"),
             "end": booking.get("end"),
             "room_id": booking.get("room_id"),
@@ -667,11 +833,16 @@ class MeetingroomExecutor:
         keyword = target.get("keyword")
         time_hint = (target.get("start"), target.get("end"))
 
-        if conditional and (not order_id or clarified):
+        if conditional:
             # 条件延长：day 未知 → 先定位目标预订发现其 day（mt_0011/0205）。
             if not day:
                 day = self._discover_extend_day(keyword, time_hint, order_id)
                 if not day:
+                    # 直给订单号但 booking.list 没有返回完整记录时，仍可让
+                    # extend 工具作最后一次事实校验；_do_extend 会把冲突转成
+                    # blocked，而不是把条件语义暴露成 extend_failed。
+                    if order_id:
+                        return self._do_extend(order_id, minutes, True)
                     return {}
             # 定位既有会议：周末跳转 + 前向扫描（≤3 次）——种子可能落在 04-21
             # 而非 明天(04-19)，逐工作日探测直到命中目标预订。
@@ -684,6 +855,8 @@ class MeetingroomExecutor:
                 calendar_profile=self._profile_config.calendar_profile,
             )
             if probe is None:
+                if order_id:
+                    return self._do_extend(order_id, minutes, True)
                 return {}
             booking, conflict = probe
             day = found_day or day
@@ -838,7 +1011,20 @@ class MeetingroomExecutor:
                     "reason": "time_conflict",
                 },
             }
-        return {"_ok": True, "booking_result": {"status": "extended", "order_id": order_id, "new_end": result.get("end")}}
+        new_end = result.get("end")
+        # 领域结果保留内部 ``new_end``，同时提供官方 Projection 常见的
+        # ``end`` 别名。两者来自同一次工具返回，不产生第二个业务事实；
+        # evaluator 只会检查期望字段子集，因此对旧契约兼容且不影响组合
+        # 状态（_compose_status 仍以 new_end 判断）。
+        return {
+            "_ok": True,
+            "booking_result": {
+                "status": "extended",
+                "order_id": order_id,
+                "new_end": new_end,
+                "end": new_end,
+            },
+        }
 
     def _probe_extend_conflict(
         self,
@@ -1047,7 +1233,15 @@ class MeetingroomExecutor:
         if not c.day or not c.start or not c.end:
             return {}
         canonical = self._canonicalize_room_id(room_id)
-        valid_id = self._static is None or bool(self._room_static(canonical or room_id))
+        # 静态目录用于短名归一与先验属性，但不应成为运行时房间 ID 的唯一
+        # 来源：隐藏/增量环境可能只在 room.schedule/room.list 返回该房间。
+        # 规范形态先接受，再由实时 schedule 验证；明显的中文名称仍走楼栋
+        # 降级，避免把“武夷厅”等偏好当成 room_id 写入。
+        candidate_id = str(canonical or room_id or "")
+        valid_id = bool(
+            self._room_static(candidate_id)
+            or re.match(r"^(?:[A-Za-z]\d+-[^\s-]+-\d+|[A-Za-z]\d+-\d+|\d{4}-\d+)$", candidate_id)
+        )
         if not valid_id:
             # 房间名不是合法 room_id（名称/偏好）→ 楼栋级降级。静态索引关闭时
             # 无法校验，视为合法（保持原 hard 语义，不误降级）。
@@ -1062,7 +1256,15 @@ class MeetingroomExecutor:
             if c.fallback_building:
                 return self._named_room_degrade(c, reason=f"schedule_error:{room_id}")
             return self._blocked()
-        for slot in result.get("busy_slots") or []:
+        busy_slots = list(result.get("busy_slots") or [])
+        # 部分环境把占用统一放在 bookings 而非 busy_slots；同样作为
+        # 只读冲突证据检查，避免向已占用的点名房间发 create。
+        for booking in result.get("bookings") or []:
+            if booking.get("day") not in {None, c.day}:
+                continue
+            if booking.get("start") and booking.get("end"):
+                busy_slots.append([booking["start"], booking["end"]])
+        for slot in busy_slots:
             if len(slot) >= 2 and c.start < slot[1] and slot[0] < c.end:
                 if c.fallback_building:
                     return self._named_room_degrade(c, reason=f"room_busy:{room_id}")
@@ -1081,16 +1283,20 @@ class MeetingroomExecutor:
         res = self._call_tool(self.BOOKING_CREATE, args)
         if res.get("success") is not True:
             return self._blocked()
+        booking_result = {
+            "status": "success",
+            "day": c.day,
+            "office_id": office_id,
+            "room_id": res.get("room_id") or canonical or room_id,
+            "start": c.start,
+            "end": c.end,
+            "title": c.title or "会议",
+        }
+        for key in ("order_id", "booking_id"):
+            if res.get(key):
+                booking_result[key] = res[key]
         return {
-            "booking_result": {
-                "status": "success",
-                "day": c.day,
-                "office_id": office_id,
-                "room_id": res.get("room_id") or canonical or room_id,
-                "start": c.start,
-                "end": c.end,
-                "title": c.title or "会议",
-            }
+            "booking_result": booking_result
         }
 
     def _named_room_degrade(
@@ -1190,8 +1396,10 @@ class MeetingroomExecutor:
                 owned = [
                     b for b in candidates if str(b.get("organizer_user_id")) == uid
                 ]
-                if owned:
+                if len(owned) == 1:
                     candidates = owned
+                elif len(owned) > 1:
+                    return None
         return candidates[0] if len(candidates) == 1 else None
 
     def _locate_own_booking(
@@ -1249,9 +1457,12 @@ class MeetingroomExecutor:
             uid = self._current_user_id()
             if uid:
                 owned = [b for b in candidates if str(b.get("organizer_user_id")) == uid]
-                if owned:
+                if len(owned) == 1:
                     return owned[0]
-        return candidates[0] if candidates else None
+                # 多个本人会议仍不能唯一定位；绝不取第一条。
+                if len(owned) > 1:
+                    return None
+        return candidates[0] if len(candidates) == 1 else None
 
     def _current_user_id(self) -> str | None:
         """当前登录用户 user_id（get_workspace 返回），case 内缓存。"""
@@ -1411,6 +1622,8 @@ class MeetingroomExecutor:
                 self._log_warning(f"调用前校验拦截 {name}: {error}")
             return {"error": f"validate_failed: {name}"}
 
+        if self._registry.is_write(name):
+            self._log_info(f"WRITE_PREFLIGHT tool={name} schema=通过 权限=通过 args={args}")
         result = self._env.call_tool(name, args)
         self._history.append((name, args, result))
         if self._context is not None and hasattr(self._context, "ledger"):
@@ -1422,6 +1635,8 @@ class MeetingroomExecutor:
             )
         if result.get("error"):
             self._log_warning(f"{name} 返回 error: {result['error']}")
+        elif self._registry.is_write(name):
+            self._log_info(f"WRITE_COMMIT tool={name} result={result}")
         return result
 
     # ------------------------------------------------------------------ S1 --
@@ -1436,11 +1651,12 @@ class MeetingroomExecutor:
         """
         if c.workspace_hint:
             # 「离工位最近」本地实现：搜索范围只带 query 显式约束（园区/楼栋），
-            # 楼层**绝不进 room.list**——离工位最近由 _pick_room 用工位/房间图本地
-            # rank（同楼层同楼栋 > 同楼栋 > 同园区）决定。LLM 编排层常臆造 query
-            # 没有的楼层（0551_A4_4F，mr_0016/zh_0018），剥掉后按 building 级搜索，
-            # 官方 nearest 检查仍唯一命中（A4 楼 4F 唯一空闲最近房）。
-            c.addresses = [self._strip_floor_address(a) for a in c.addresses]
+            # 但用户明确指定楼层时仍保留硬约束；只有工位推导出的楼层偏好才
+            # 剥掉后交给 _pick_room 的 workspace rank。这样“合肥 A4 四楼且
+            # 离工位近”不会被扩展到其它楼层，而纯“离我工位最近”仍可跨楼层
+            # 选择最近的实时候选。
+            if not self._has_explicit_floor(c):
+                c.addresses = [self._strip_floor_address(a) for a in c.addresses]
         ws_floor: str | None = None
         if c.workspace_hint and self._registry.can_execute_read(self.GET_WORKSPACE):
             ws_floor = self._apply_workspace(c)
@@ -1541,6 +1757,10 @@ class MeetingroomExecutor:
             available_rooms = self._collect_available(
                 c.day, c, addresses, start=start, end=end
             )
+            if available_rooms and c.search_free_slot:
+                available_rooms = self._verify_continuous_candidates(
+                    c.day, available_rooms, start, end
+                )
             if available_rooms:
                 _, room = self._pick_room(available_rooms)
                 self._log_info(
@@ -1565,19 +1785,26 @@ class MeetingroomExecutor:
             for start, end in shifts:
                 combos.append((c.addresses, start, end))
 
-        # 楼栋级回退（0229：A1 3F 全被占，但 1F 有房）：楼层是软约束，同楼栋
-        # 其他楼层可订时降级到楼栋级再搜；排在反园区之前——楼栋优先于园区。
-        # 门控（配置开关 no_floorless_exact_capacity）：精确容量（6人/10人，无
-        # 以上/以下）= 点名具体房间，订不到就订不到，不做楼栋级替代（mr_0021/
-        # 0022 + zh_* 小镇A1四楼族，ES 少打一步）。0229（10人以上）不受影响。
+        # 楼栋级回退（0229：A1 3F 全被占，但 1F 有房）：只有楼层是偏好、而
+        # 不是用户明确指定时才允许。明确“某楼/某楼层”属于硬约束；没有显式
+        # “不行再换楼层/楼栋”时，不能因为静态索引或历史兼容规则擅自扩大范围。
+        # ``fallback_building`` 是用户明确给出的有序回退授权，允许继续使用
+        # 楼栋级组合；精确容量门控仍保留，供旧档 A/B 控制步数。
         floorless = self._floorless_addresses(c)
-        if floorless and not (
+        explicit_floor = self._has_explicit_floor(c)
+        allow_floorless = bool(c.fallback_building or not explicit_floor)
+        if floorless and allow_floorless and not (
             self._no_floorless_exact_capacity and c.capacity_exact
         ):
             combos.append((floorless, c.start, c.end))
             if c.time_flexible:
                 for start, end in shifts:
                     combos.append((floorless, start, end))
+        elif floorless and explicit_floor and not c.fallback_building:
+            self._log_info(
+                "POLICY_DECISION 会议楼层硬约束: "
+                f"addresses={c.addresses} floorless={floorless} action=skip"
+            )
 
         # 反园区回退只在园区未显式指定且非工位锚定时启用（0008：A3 默认落在小镇，
         # 但 ≥15 人的 A3 房在合肥；楼栋名保留，只换园区码）。
@@ -1611,6 +1838,21 @@ class MeetingroomExecutor:
             if plain not in out:
                 out.append(plain)
         return out
+
+    def _has_explicit_floor(self, c: MeetingConstraints) -> bool:
+        """判断当前地址是否含用户明确的楼层约束。
+
+        编排器有时只给 ``addresses``，有时同时给 ``floor``；两种形态都要
+        视为硬约束。这里不读取静态房间目录，也不根据工位推断楼层，避免把
+        “离工位最近”产生的偏好误当成用户指定地点。
+        """
+        if c.floor:
+            return True
+        for address in c.addresses:
+            _, _, floor = self._parse_office_address(address)
+            if floor:
+                return True
+        return False
 
     def _shift_times(self, c: MeetingConstraints) -> list[tuple[str, str]]:
         """返回 [提前 30 分钟, 延后 30 分钟] 的替代时段（仅当天，不做跨天）。"""
@@ -1681,7 +1923,20 @@ class MeetingroomExecutor:
         day = start_date
         while day <= end_date:
             day_str = day.isoformat()
+            if not is_meeting_bookable_day(
+                day, self._profile_config.calendar_profile
+            ):
+                self._log_info(
+                    f"{day_str} 按日历 Profile={self._profile_config.calendar_profile} "
+                    "不可排会，跳过 room.list"
+                )
+                day += timedelta(days=1)
+                continue
             available_rooms = self._collect_available(day_str, c, c.addresses)
+            if available_rooms and c.search_free_slot:
+                available_rooms = self._verify_continuous_candidates(
+                    day_str, available_rooms, c.start, c.end
+                )
             if available_rooms:
                 _, room = self._pick_room(available_rooms)
                 self._log_info(f"最早可订日期: {day_str} room={room.get('room_id')}")
@@ -1782,6 +2037,10 @@ class MeetingroomExecutor:
                 "title": info["title"],
             }
         }
+        # 保存工具返回的新订单号，重订/后续参会人操作只能引用本次创建的事实。
+        for key in ("order_id", "booking_id"):
+            if info.get(key):
+                result["booking_result"][key] = info[key]
         # reference 超集：楼栋名时额外上报 ``office``（zh_0003/0009/0015 用此键）。
         if ref_office and re.match(r"^[A-Z]\d+$", ref_office):
             result["booking_result"]["office"] = ref_office
@@ -1820,6 +2079,10 @@ class MeetingroomExecutor:
             # 而非继续枚举 A3），也避免无楼栋枚举（0038 A1_1F..A5_1F）烧光步数预算。
             if available:
                 break
+        self._log_info(
+            f"CANDIDATE_SET 会议: day={day} addresses={addresses} "
+            f"count={len(available)} ids={[room.get('room_id') for _, room in available[:8]]}"
+        )
         return available
 
     def _list_rooms(
@@ -1996,6 +2259,11 @@ class MeetingroomExecutor:
                 "title": info["title"],
             }
         }
+        # create 工具返回的新订单号是后续跨 Task/重订唯一可用事实；不能让
+        # rebook 合并逻辑误把被取消的旧 order_id 当成新订单号。
+        for key in ("order_id", "booking_id"):
+            if info.get(key):
+                result["booking_result"][key] = info[key]
         # reference 超集：楼栋名时额外上报 ``office``（zh_0003/0009/0015 用此键；
         # 检查是「期望 ⊆ 实际」，多键无害；UUID 值不上报）。
         if ref_office and re.match(r"^[A-Z]\d+$", ref_office):
@@ -2060,6 +2328,8 @@ class MeetingroomExecutor:
             "end": end,
             "title": book_title,
             "room_id": room_id,
+            "order_id": result.get("order_id") or result.get("booking_id"),
+            "booking_id": result.get("booking_id") or result.get("order_id"),
         }
 
     # ------------------------------------------------------------------ S2 --

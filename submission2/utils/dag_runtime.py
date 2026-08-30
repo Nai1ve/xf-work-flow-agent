@@ -36,6 +36,8 @@ class TaskSpec:
     intent: str
     sub_query: str = ""
     dependencies: list[str] = field(default_factory=list)
+    order_after: list[str] = field(default_factory=list)
+    requires: list[str] = field(default_factory=list)
     skill: str | None = None
     budget: int | None = None
 
@@ -101,6 +103,9 @@ class DagTask:
     unit_type: str
     sub_query: str
     depends_on: list[str] = field(default_factory=list)
+    # 新接口：order_after 只控制顺序；depends_on 作为旧接口保留并视为硬依赖。
+    order_after: list[str] = field(default_factory=list)
+    requires: list[str] = field(default_factory=list)
     handler: Callable[["DagTask", CaseContext], NodeOutcome] | None = None
 
 
@@ -119,9 +124,10 @@ class TaskDag:
 
     def validate(self) -> None:
         for task in self.tasks.values():
-            if task.task_id in task.depends_on:
+            edges = list(dict.fromkeys([*task.depends_on, *task.order_after, *task.requires]))
+            if task.task_id in edges:
                 raise ValueError(f"self dependency: {task.task_id}")
-            missing = [d for d in task.depends_on if d not in self.tasks]
+            missing = [d for d in edges if d not in self.tasks]
             if missing:
                 raise ValueError(f"missing dependency {task.task_id}: {missing}")
         self.topological_order()
@@ -139,7 +145,7 @@ class TaskDag:
                 return
             state[task_id] = 1
             task = self.tasks[task_id]
-            for dep in task.depends_on:
+            for dep in list(dict.fromkeys([*task.depends_on, *task.order_after, *task.requires])):
                 visit(dep)
             state[task_id] = 2
             result.append(task)
@@ -150,9 +156,10 @@ class TaskDag:
 
     def validate_without_recursion(self) -> None:
         for task in self.tasks.values():
-            if task.task_id in task.depends_on:
+            edges = list(dict.fromkeys([*task.depends_on, *task.order_after, *task.requires]))
+            if task.task_id in edges:
                 raise ValueError(f"self dependency: {task.task_id}")
-            if any(dep not in self.tasks for dep in task.depends_on):
+            if any(dep not in self.tasks for dep in edges):
                 raise ValueError(f"missing dependency for {task.task_id}")
 
     def run(self, context: CaseContext) -> dict[str, NodeOutcome]:
@@ -169,8 +176,9 @@ class TaskDag:
             task_ctx = context.tasks.get(task.task_id)
             if task_ctx is not None:
                 task_ctx.status = NodeStatus.READY.value
+            # 新建任务使用 order_after；depends_on 仍是旧调用方的硬依赖。
             blocked_by = [
-                dep for dep in task.depends_on
+                dep for dep in list(dict.fromkeys([*task.depends_on, *task.requires]))
                 if outcomes.get(dep, NodeOutcome(NodeStatus.FAILED)).status
                 not in {NodeStatus.SUCCEEDED}
             ]

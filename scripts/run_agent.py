@@ -466,6 +466,33 @@ def main() -> int:
             results = load_json(output)
             if not isinstance(results, list):
                 raise TypeError(f"runner output must be a list: {output}")
+            # 官方 evaluator 只在本地 runner 返回后可见；将每个 case 的正式
+            # 评分追加到普通文本日志，和 Agent 自身的 CASE_END/SELF_AUDIT
+            # 区分，线上 agent 不伪造这些字段。
+            for item in results:
+                failed_success = [
+                    str(check.get("condition", ""))
+                    for check in item.get("success_checks", []) or []
+                    if not check.get("passed")
+                ]
+                failed_submission = [
+                    str(check.get("field", ""))
+                    for check in item.get("submission_checks", []) or []
+                    if not check.get("passed")
+                ]
+                log_stage(
+                    "EVALUATION "
+                    f"case={item.get('case_id', '')} score={item.get('total', 0)} "
+                    f"TSR={item.get('TSR', 0)} AS={item.get('AS', 0)} "
+                    f"ES={item.get('ES', 0)} RS={item.get('RS', 0)} "
+                    f"passed={bool(item.get('task_passed'))} "
+                    f"failed_success={','.join(failed_success) or '-'} "
+                    f"failed_submission={','.join(failed_submission) or '-'} "
+                    f"violations={','.join(map(str, item.get('violations', []) or [])) or '-'} "
+                    f"steps={item.get('steps_used', 0)}",
+                    log_file,
+                    "evaluation",
+                )
             compare_results = None
             if args.compare_to:
                 compare_path = Path(args.compare_to)

@@ -58,6 +58,7 @@ def _copy_source(stage_submission: Path, *, include_key: bool = False) -> None:
             "config.local.example.json",
             "agent_runtime.log",
             "README.md",
+            ".DS_Store",
         }:
             continue
         if relative.suffix in {".pyc", ".pyo", ".log"}:

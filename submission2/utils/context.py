@@ -13,6 +13,14 @@ from typing import Any
 from .workflow_registry import WorkflowSchemaRegistry
 
 
+WRITE_FACT_SOURCES = frozenset({
+    "USER_EXPLICIT",
+    "DIALOGUE_REPLY",
+    "RUNTIME_TOOL",
+    "TASK_OUTPUT",
+})
+
+
 @dataclass
 class EvidenceRecord:
     kind: str
@@ -75,6 +83,132 @@ class EvidenceLedger:
 
 
 @dataclass
+class ResolvedFact:
+    """当前 case 内已经解析的事实；不跨 case 共享。"""
+
+    key: str
+    value: Any
+    source: str
+    task_id: str | None = None
+    confidence: float = 1.0
+    shareable: bool = True
+    evidence_ids: list[str] = field(default_factory=list)
+    supersedes: str | None = None
+    fact_id: str = ""
+    timestamp: float = field(default_factory=time.monotonic)
+
+    @property
+    def can_drive_write(self) -> bool:
+        return self.source in WRITE_FACT_SOURCES
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "fact_id": self.fact_id,
+            "key": self.key,
+            "value": self.value,
+            "source": self.source,
+            "task_id": self.task_id,
+            "confidence": self.confidence,
+            "shareable": self.shareable,
+            "evidence_ids": list(self.evidence_ids),
+            "supersedes": self.supersedes,
+        }
+
+
+class FactStore:
+    """用例内事实账本。
+
+    同一槽位的新明确事实不会删除旧记录，而是通过 ``supersedes`` 串起来；查询
+    默认只返回最新有效值。只有显式来源可以驱动写入，INFERRED 仅供排序。
+    """
+
+    def __init__(self) -> None:
+        self._facts: list[ResolvedFact] = []
+        self._counter = 0
+
+    def upsert(
+        self,
+        key: str,
+        value: Any,
+        *,
+        source: str,
+        task_id: str | None = None,
+        confidence: float = 1.0,
+        shareable: bool = True,
+        evidence_ids: list[str] | None = None,
+    ) -> ResolvedFact:
+        normalized_source = str(source or "").upper()
+        self._counter += 1
+        previous = self.latest(key, task_id=task_id, shareable_only=False)
+        fact = ResolvedFact(
+            key=str(key),
+            value=value,
+            source=normalized_source,
+            task_id=task_id,
+            confidence=max(0.0, min(float(confidence), 1.0)),
+            shareable=bool(shareable),
+            evidence_ids=list(evidence_ids or []),
+            supersedes=previous.fact_id if previous is not None else None,
+            fact_id=f"fact-{self._counter}",
+        )
+        self._facts.append(fact)
+        return fact
+
+    def all(self, *, task_id: str | None = None) -> list[ResolvedFact]:
+        return [f for f in self._facts if task_id is None or f.task_id == task_id]
+
+    def latest(
+        self,
+        key: str,
+        *,
+        task_id: str | None = None,
+        shareable_only: bool = False,
+    ) -> ResolvedFact | None:
+        for fact in reversed(self._facts):
+            if fact.key != key:
+                continue
+            if task_id is not None and fact.task_id != task_id:
+                continue
+            if shareable_only and not fact.shareable:
+                continue
+            return fact
+        return None
+
+    def candidates(
+        self,
+        key: str,
+        *,
+        task_id: str | None = None,
+        shareable_only: bool = True,
+    ) -> list[ResolvedFact]:
+        values: list[ResolvedFact] = []
+        superseded_ids = {fact.supersedes for fact in self._facts if fact.supersedes}
+        seen: set[str] = set()
+        for fact in reversed(self._facts):
+            if fact.key != key or (task_id is not None and fact.task_id != task_id):
+                continue
+            if fact.fact_id in superseded_ids:
+                continue
+            if shareable_only and not fact.shareable:
+                continue
+            marker = repr(fact.value)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            values.append(fact)
+        return list(reversed(values))
+
+    def unique_value(self, key: str, *, task_id: str | None = None) -> Any:
+        candidates = self.candidates(key, task_id=task_id, shareable_only=True)
+        if len(candidates) == 1 and candidates[0].can_drive_write:
+            return candidates[0].value
+        return None
+
+    def as_dict(self) -> list[dict[str, Any]]:
+        return [f.as_dict() for f in self._facts]
+
+
+@dataclass
 class TaskContext:
     task_id: str
     unit_type: str
@@ -82,6 +216,8 @@ class TaskContext:
     status: str = "PENDING"
     output: dict[str, Any] = field(default_factory=dict)
     failure_code: str | None = None
+    order_after: list[str] = field(default_factory=list)
+    requires: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -94,9 +230,26 @@ class CaseContext:
     tasks: dict[str, TaskContext] = field(default_factory=dict)
     policy_decisions: list[dict[str, Any]] = field(default_factory=list)
     schema_registry: WorkflowSchemaRegistry = field(default_factory=WorkflowSchemaRegistry)
+    facts: FactStore = field(default_factory=FactStore)
+    run_id: str | None = None
+    package_version: str = ""
 
-    def add_task(self, task_id: str, unit_type: str, sub_query: str) -> TaskContext:
-        task = TaskContext(task_id, unit_type, sub_query)
+    def add_task(
+        self,
+        task_id: str,
+        unit_type: str,
+        sub_query: str,
+        *,
+        order_after: list[str] | None = None,
+        requires: list[str] | None = None,
+    ) -> TaskContext:
+        task = TaskContext(
+            task_id,
+            unit_type,
+            sub_query,
+            order_after=list(order_after or []),
+            requires=list(requires or []),
+        )
         self.tasks[task_id] = task
         return task
 
@@ -105,5 +258,34 @@ class CaseContext:
         self.policy_decisions.append(payload)
         self.ledger.add("policy_decision", payload.get("policy_id", "policy") if isinstance(payload, dict) else "policy", payload, provenance="policy")
 
+    def upsert_fact(self, key: str, value: Any, *, source: str, task_id: str | None = None,
+                    confidence: float = 1.0, shareable: bool = True,
+                    evidence_ids: list[str] | None = None) -> ResolvedFact:
+        fact = self.facts.upsert(
+            key,
+            value,
+            source=source,
+            task_id=task_id,
+            confidence=confidence,
+            shareable=shareable,
+            evidence_ids=evidence_ids,
+        )
+        self.ledger.add(
+            "fact_upsert",
+            key,
+            fact.as_dict(),
+            task_id=task_id,
+            provenance="fact_store",
+        )
+        return fact
 
-__all__ = ["EvidenceRecord", "EvidenceLedger", "TaskContext", "CaseContext"]
+
+__all__ = [
+    "WRITE_FACT_SOURCES",
+    "EvidenceRecord",
+    "EvidenceLedger",
+    "ResolvedFact",
+    "FactStore",
+    "TaskContext",
+    "CaseContext",
+]

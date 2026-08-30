@@ -1,0 +1,91 @@
+NL2Workflow V2 冲突隔离与 DAG 改造审核记录（普通文本）
+================================================================
+
+[阶段1/第1轮审核] 数据与运行时骨架
+检查项：Profile、CaseContext/EvidenceLedger、Task DAG、ToolRegistry、WorkflowRegistry、MeetingroomDirectory、四类 Skill 接口。
+发现问题：会议“延长失败后恢复重订”分支在缺少显式 minutes 时没有继承配置默认，导致恢复预订时段缩短；Task 依赖来源是模型下标，未过滤越界/自依赖风险；静态 workflow 索引会把 sample_draft 一并带入。
+修复：增加 meeting_default_extend_minutes（默认30，可环境变量覆盖）；恢复节点只填充缺失 minutes，不覆盖用户明确值；解析依赖时过滤非法边并在 DAG 非法时按用户顺序串行；静态索引只编译 schema/字段依赖/候选结构，剔除 sample_draft。
+验证：纯 V2 测试 5 项通过；代表性会议恢复用例工具状态正确，分数由 71 提升至 100。
+
+[阶段1/第2轮审核] 契约与回滚
+检查项：静态索引构建、运行时工具对账、Profile 切换、提交投影、异常兜底。
+发现问题：构建脚本无 PYTHONPATH 时默认导入旧 submission；新 workflows.index.json 生成后旧最小 fixture 会产生噪声；跨域/单域 office_id 契约不能用一个业务规则解释。
+修复：构建脚本优先 submission2 并默认输出 submission2/static_context；workflow 索引作为可选资源逐项容错；office_id 改为晚绑定，工具始终使用实时合法 ID，hybrid 跨域才输出语义楼栋，单域保留 legacy。
+验证：工具/静态上下文/理解层/V2 回归 85 项通过；legacy_current 入口仍保留，可用环境变量回滚。
+
+[阶段2/第1轮审核] 模型、日志与上下文
+发现问题：模型日志默认只截断到 1200 字符，难以完整审阅长 Prompt；LeaveSkill/BudgetSkill 的 run 参数曾将 CaseContext 覆盖成拼接字符串，工具证据无法归属 Task；环境层只记录工具轨迹，调用前阻断和追问结果不够明显。
+修复：日志默认上限提升到 4000，可用 AGENT_LOG_MAX_CHARS 调整；修复 sub_context/context 参数隔离，所有工具结果写入当前 Task ledger；_RecordingEnv 统一记录中文的工具调用、结果、异常、追问、追问结果，LLMGateway 记录 Prompt、payload、原始输出、结构化结果、重试和兜底。
+验证：compileall、git diff --check、85 项回归通过；日志为普通 UTF-8 .log，不写 API key、Gold 或答案表。
+
+[阶段2/第2轮审核] 跨域定向回放
+命令：AGENT_EXECUTION_PROFILE=hybrid_compat PYTHONPATH=submission2 .venv/bin/python scripts/run_agent.py --split val --agent submission2/my_agent.py --case beta_mr_wf_0006 beta_zh_0207 beta_zh_0210 beta_zh_0213 beta_zh_0225 beta_zh_0228 beta_zh_0219 beta_zh_0203 beta_zh_0014 beta_zh_0227 beta_zh_0215 --skip-variants --timeout 60
+结果：10/11 通过，平均 96.65。会议延长恢复、费用跨域、请假跨域和部分成功均按独立 Task 完成。
+遗留：beta_zh_0215 的 Gold 将“下周二”要求为 2026-04-28，而 obs.now=2026-04-18、工具和用户语义均只能支持普通公历 2026-04-21。该差异没有运行时可观测依据，按规则不加入 case 特判，归入 legacy/batch anomaly；generic_v2 也不会猜测 4/28。
+
+未解决问题（第二轮后保留隔离）：
+1. 请假同义表达存在不可观测的时长 Gold 冲突（raw/工作日/自然日）。hybrid 保留 raw 默认，明确口径才切换。
+2. 费用宽泛描述中的隐藏数量/单价无法由工具推出。generic 阻断或追问，legacy 仅保留旧模板开关。
+3. 单域基本会议 office_id 同时出现语义楼栋和 UUID，缺少可观测业务变量。采用 late-bound + legacy。
+4. 仓库中部分旧测试仍断言已撤回接口（rebook/旧预算模板等），属于测试债务，未为通过旧测试恢复数据泄漏逻辑。
+
+审核结论：可解释的业务规则已进入 V2；不可观测 Gold 冲突已隔离并可回滚；下一步执行打包检查与 Train/Val 全量回归。
+
+[阶段3/第1轮审核] 全量回归与日志
+检查项：Train 200、Val 50、跨域/会议/工作流失败簇、模型和工具普通文本日志。
+结果：Train 平均 96.57（178/200），Val 平均 97.78（46/50）；两套数据均无 violation、无未捕获异常。日志同时包含 Prompt、payload、原始模型输出、结构化结果、工具调用/结果、追问/回复、Task DAG、Projection 和计时。
+问题：Train/Val 仍有 booking_result 投影残差；请假日期与时长存在无运行时依据的 Gold 差异；个别预算/审批歧义不能由单轮输入唯一确定。
+处理：保留 late-bound/superset projection；不可观测差异不写入用例特判，继续走 hybrid/legacy 隔离。
+
+[阶段3/第2轮审核] 提交包与可复现性
+检查项：官方入口、包内资源、密钥清理、包大小、解压编译和运行时路径。
+结果：`submission2/dist/submit_v2.zip` 26 个文件、约 184.7KB，包含 `submission/my_agent.py`、`config.json`、静态索引和 utils；解压后 `compileall` 通过，配置认证字段为空，无 logs/cache/reports/训练数据。
+遗留：仓库旧测试中仍有 29 项断言撤回接口或旧模板，属于测试债务，不恢复数据泄漏逻辑；候选提交前以 V2 定向测试、官方 runner 和包解压检查为准。
+
+[阶段4/第1轮审核] 确定性契约修复
+检查项：SpeechActDecision、请假/费用提交语气、跨域 OA 门控、会议取消唯一性、重订标题与订单投影。
+发现问题：负向短语“暂不提交”同时包含“提交”字样，初版正则会误报语气冲突；会议定位在多个本人会议时仍有取首条风险；重订结果丢失新 booking_id/order_id，且原标题会覆盖用户明确新标题。
+修复：先从积极语句中移除负向短语；多候选统一返回 None 并阻断；保存工具返回的新旧订单字段，明确新标题优先；跨域 OA 只有用户明确要求待办/已办时调用。
+验证：`compileall`、`git diff --check`、新增 4 个 SpeechAct 纯函数测试通过；现有仓库中 2 个旧 MeetingOp 断言仍失败，属于已知测试债务，未恢复旧复合 skill。
+遗留：第一轮尚未覆盖模型请求关联 Header 与 case_final/plan_checkpoint；下一轮补齐日志追踪后复审。
+
+[阶段4/第2轮审核] 追踪关联与确定性恢复
+检查项：run_id/Task/Stage Header、plan_checkpoint/case_final 带外上报、LLM 失败日志、重订失败恢复、跨 Task 会议引用。
+发现问题：LLM 校验分支初版缩进会在 schema 失败时误判成功；多 Meeting Task 的后续计划在前序事实产生前就编排；点名房间只在静态目录中存在时才允许 schedule。
+修复：修正 LLM 重试状态机并分别记录非 JSON/schema 失败；依赖会议 Task 延迟编排并从 requires 指向的事实晚绑定订单/日期/房间；规范房间 ID 先以实时 schedule 验证，静态目录只作归一先验；创建失败时按取消阶段完整事实恢复原会议。
+验证：29 个契约/运行时/网关测试通过；新增跨 Task 会议事实测试 3 项、重订恢复测试 1 项；compileall 与 diff 检查通过。
+遗留：旧测试仍断言 rebook/decide 复合接口，未恢复该接口；旧 OA 自动查询断言与新“仅用户明确要求才查”规则冲突，保留为测试债务。
+
+[阶段5/第1轮审核] 费用实时绑定与金额守恒
+检查项：项目/大类/小类候选来源、泛词搜索、逐行金额绑定、写前 evidence、candidate_v2 资源开关。
+发现问题：模型猜出的单价可能在无用户金额时直接进入保存；多行只有总额时按模型比例缩放，无法证明行级事实；candidate_v2 仍使用长 legacy Prompt。
+修复：candidate/generic 无原文金额即阻断；多行只有总额且没有逐行金额时返回 insufficient_amount_breakdown；项目、大类、小类记录候选集合并要求本轮工具 evidence；candidate_v2 与 generic_v2 均使用短结构化 Prompt，legacy 模板仅在兼容档可用。
+验证：费用定向金额/项目/小类测试与既有 52 项通过；旧模板删除和自动 OA 断言按设计保留失败，未为测试恢复数据泄漏。
+
+[阶段5/第2轮审核] 费用回归与日志审查
+检查项：金额四舍五入、单行总额、部分锚点、候选平局、LLM schema 失败日志和 runner EVALUATION 行。
+结果：定向 5 项费用测试通过；完整费用套件 52 通过、4 项为已登记旧契约债务；LLM 网关 29 项与候选事实 11 项通过；runner 在 evaluator 返回后向普通文本日志追加每 case 的 score/TSR/AS/ES/RS、失败条件、违规和步数。
+遗留：candidate_v2 需要在官方隐藏集确认严格金额阻断是否带来收益，默认仍保持 hybrid_compat 以便回滚。
+
+[阶段6/第1轮审核] 会议日期范围与多 Task 调度
+检查项：下周/本周范围、连续空档、同房间验证、多 Meeting Task、条件延长冲突和点名房间实时验证。
+修复：TemporalResolver 将“本周/下周哪天”展开为工作日范围；连续空档最多验证 3 个候选；TaskDag 的 order_after 与 requires 分离，前序失败不阻断独立 Task；条件延长冲突统一返回 blocked；点名规范 ID 用实时 schedule 验证并读取 bookings 占用。
+验证：会议范围/连续空档/延长/对比预订定向测试通过；旧复合 op 断言仍列为债务。
+
+[阶段6/第2轮审核] 发布前静态检查
+检查项：全模块语法、普通日志格式、追踪脱敏/容量、提交包过滤、测试失败分类。
+结果：`python -m compileall -q submission2 scripts` 与 `git diff --check` 通过；日志为控制台+UTF-8 `.log` 单行事件，telemetry 超时 1 秒且失败静默，密钥不写日志；提交脚本过滤 docs/dist/cache/log 并支持无 key 与本地 include-key 两种包。
+遗留：完整全量 Train/Val 需在当前模型服务可用时执行；candidate 默认不开启，待正式 runner 对比后按问题簇单独切换。
+
+[阶段7/第1轮审核] 共性契约、上下文、会议范围与诊断日志
+检查项：SpeechAct、Task DAG 的 order_after/requires、FactStore 隔离、费用实时候选与金额守恒、会议连续空档/日期范围、重订恢复、模型关联 Header、计划点与终局 telemetry、中文普通文本日志。
+发现问题：模型可回填 code_hint；模型展开跨 Task 指代时可能丢 requires；无前序事实时可能回退定位；显式楼层可能被自动放宽；正常日历相对日期可能落周末；telemetry 摘要没有完整的任务/事实关联；合并服务只有总额时不能证明行级金额；同日多场标题偶发截成前缀；“X项目需要……”结构可能提取不到项目名。
+修复：编码只接受用户原文并由实时 project_search 验证；跨 Task 只消费本 case 唯一可写事实，前序失败不阻断无关任务；保留显式楼层硬约束并区分工位软偏好；normal/simulator_compat 日历按 Profile；补充 run/case/task/stage Header、plan_checkpoint/case_final 和超限/脱敏策略；合并服务明细写前阻断；用原文标题前缀修复和通用项目短语句法抽取；统一记录候选、预检、提交、领域结果和 Projection。
+验证：费用与合同定向测试 38 项通过；`beta_wf_0257` 100/100、`beta_mr_0043` 98/100（通过）、`beta_mr_0048` 保留为不可观测标题冲突；`beta_mr_0011` 标题归一修复后定向 100/100；`beta_wf_0250` 项目短语修复后定向 100/100。
+遗留：beta_mr_0048 的用户标题与评测参考不可由运行时事实区分；隐式 OA 尾查批次差异由 `AGENT_LEGACY_OA_COMPAT` 隔离；Train 的历史预算隐藏明细/Projection 和少量请假批次差异继续保留 legacy；仓库 27 个旧接口测试失败属于测试债务，不恢复已撤回复合 API 或数据模板。
+
+[阶段7/第2轮审核] 串行全量回归与发布检查
+检查项：当前模型服务下 Val 50、Train 200 历史基线、定向回放、日志/Telemetry 关联、编译与差异检查、提交包过滤和可回滚 Profile。
+结果：最新串行 Val `fix_round18` 平均 98.00，46/50 通过，TSR=59.75、AS=19.90、ES=9.15，平均 5.66 步、11.90 秒；无 violation、无未捕获异常。剩余 1 个 booking_result（`beta_mr_0048` 为不可观测冲突；`beta_mr_0011` 已定向修复），3 个跨域用例仅缺隐式 `oa.done.list`，开启兼容开关可恢复。Train `fix_round11` 为 91.79，157/200 通过，无 violation/exception；该批与 Val 非同一时刻采集，受模型服务波动影响，发布前须串行复测。
+静态检查：`compileall`、`git diff --check` 通过；普通日志只写 `.log`，Prompt/模型结果经过单行化和脱敏，Header 不含认证；`legacy_current` 与问题簇开关仍可回滚。
+结论：可观测业务规则已迁入 V2；candidate 仍默认不开启。以 `hybrid_compat` 作为诊断/提交候选，保留 `AGENT_LEGACY_OA_COMPAT=1` 的 A/B 选项；不新增 Case ID、Gold 或训练答案映射。

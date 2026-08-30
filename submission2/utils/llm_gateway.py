@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import sys
@@ -26,6 +27,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+from .redaction import redact_text
 
 
 def _load_config() -> dict[str, Any]:
@@ -90,6 +93,7 @@ class HttpBackend:
         temperature: float,
         max_tokens: int,
         require_json_object: bool = True,
+        request_headers: dict[str, str] | None = None,
     ) -> str:
         """发一次补全请求，返回 assistant 的 content 文本；异常由调用方兜底。
 
@@ -106,14 +110,19 @@ class HttpBackend:
         }
         if require_json_object:
             body["response_format"] = {"type": "json_object"}
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+        }
+        # 只合并关联元数据；调用方不得把 Authorization 放入 request_headers。
+        if request_headers:
+            headers.update({str(k): str(v) for k, v in request_headers.items()
+                            if str(k).lower() not in {"authorization", "cookie"}})
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json; charset=utf-8",
-                "Accept": "application/json",
-            },
+            headers=headers,
             method="POST",
         )
         try:
@@ -265,7 +274,9 @@ class LLMGateway:
         config: 覆盖自动合并配置（测试用）；None 时读 config.json + config.local.json + env。
     """
 
-    def __init__(self, logger: Any = None, *, backend: Any = None, config: dict[str, Any] | None = None) -> None:
+    def __init__(self, logger: Any = None, *, backend: Any = None,
+                 config: dict[str, Any] | None = None, trace_context: Any = None,
+                 stage: str = "") -> None:
         cfg = dict(config) if config is not None else _load_config()
         self.provider = str(cfg.get("provider") or "")
         self.base_url = str(cfg.get("base_url") or "").rstrip("/")
@@ -276,6 +287,8 @@ class LLMGateway:
         self.llm_budget_s = float(cfg.get("llm_budget_s", 35.0))
         self._spent_s = 0.0
         self.logger = logger
+        self.trace_context = trace_context
+        self.stage = stage
         # 轨迹记录开关（default False：未配置不额外发请求，避免额外成本）。
         trace_cfg = cfg.get("trace") or {}
         self.trace_enabled = bool(trace_cfg.get("enabled", False))
@@ -331,6 +344,7 @@ class LLMGateway:
                 temperature=0.0,
                 max_tokens=16,
                 require_json_object=False,
+                request_headers=self._trace_headers(stage="telemetry", attempt=0),
             )
             return True
         except Exception:  # noqa: BLE001 —— 记录失败不影响主流程
@@ -357,7 +371,37 @@ class LLMGateway:
 
     def _log(self, level: str, message: str) -> None:
         if self.logger is not None:
+            # LLM 日志与工具/Projection 日志共享同一条 case 关联链；服务端还会
+            # 收到同样的 X-Agent-* Header。把 run/case/task 放在普通文本行前面，
+            # 人工查看单个 case 时无需依赖 logger 的层级前缀或日志顺序。
+            ctx = self.trace_context
+            if ctx is not None:
+                run_id = getattr(ctx, "run_id", "") if not isinstance(ctx, dict) else ctx.get("run_id", "")
+                case_id = getattr(ctx, "case_id", "") if not isinstance(ctx, dict) else ctx.get("case_id", "")
+                task_id = getattr(ctx, "task_id", "") if not isinstance(ctx, dict) else ctx.get("task_id", "")
+                message = f"run_id={run_id} case={case_id} task={task_id or '-'} {message}"
             getattr(self.logger, level, lambda _m: None)(message)
+
+    def _trace_headers(self, *, stage: str | None = None, attempt: int = 0) -> dict[str, str]:
+        """生成不含认证信息的服务端关联 Header。"""
+        ctx = self.trace_context
+        if ctx is None:
+            return {}
+        if hasattr(ctx, "headers"):
+            try:
+                return ctx.headers(stage=stage or self.stage, attempt=attempt)
+            except Exception:  # noqa: BLE001
+                return {}
+        if isinstance(ctx, dict):
+            return {
+                "X-Agent-Run-Id": str(ctx.get("run_id", "")),
+                "X-Agent-Case-Id": str(ctx.get("case_id", "")),
+                "X-Agent-Task-Id": str(ctx.get("task_id", "")),
+                "X-Agent-Stage": str(stage or self.stage or ctx.get("stage", "")),
+                "X-Agent-Prompt-Version": str(ctx.get("prompt_version", "v2")),
+                "X-Agent-Attempt": str(attempt),
+            }
+        return {}
 
     @staticmethod
     def _audit_text(value: Any, limit: int | None = None) -> str:
@@ -379,7 +423,7 @@ class LLMGateway:
                 text = json.dumps(value, ensure_ascii=False, default=str)
         except (TypeError, ValueError):
             text = str(value)
-        text = " ".join(text.replace("\r", " ").replace("\n", " ").split())
+        text = redact_text(text)
         return text[:limit] + ("…" if len(text) > limit else "")
 
     # ------------------------------------------------------------ 核心入口 --
@@ -418,7 +462,10 @@ class LLMGateway:
         # 便于在 agent_runtime.log 中逐调用回放。模型输出在每次尝试后记录。
         self._log(
             "info",
-            f"LLM 请求 prompt={self._audit_text(prompt_card)} payload={self._audit_text(payload)}",
+            f"LLM_REQUEST stage={self.stage or 'llm'} prompt_id="
+            f"{hashlib.sha256(prompt_card.encode('utf-8')).hexdigest()[:12]} "
+            f"schema_id={hashlib.sha256(json.dumps(output_schema, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()[:12]} "
+            f"attempts=2 prompt={self._audit_text(prompt_card)} payload={self._audit_text(payload)}",
         )
         last_error: str = "未知错误"
         call_start = time.monotonic()
@@ -443,10 +490,15 @@ class LLMGateway:
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     require_json_object=use_json_object,
+                    request_headers=self._trace_headers(stage=self.stage or "llm", attempt=attempt),
                 )
                 self._log(
                     "info",
                     f"LLM 原始输出 attempt={attempt}: {self._audit_text(content)}",
+                )
+                self._log(
+                    "info",
+                    f"LLM_RESPONSE stage={self.stage or 'llm'} attempt={attempt} 原始输出={self._audit_text(content)}",
                 )
             except Exception as exc:  # noqa: BLE001 —— 网络/超时/HTTP 错误全部兜底
                 last_error = repr(exc)
@@ -461,11 +513,21 @@ class LLMGateway:
                 if parsed is None:
                     last_error = "LLM 返回非 JSON"
                     self._log("warning", f"LLM 返回非 JSON（第 {attempt} 次），重试")
+                    self._log(
+                        "warning",
+                        f"LLM_RESPONSE stage={self.stage or 'llm'} attempt={attempt} "
+                        "解析=失败 校验=未执行 reason=非JSON",
+                    )
                 else:
                     errors = _schema_errors(parsed, output_schema)
                     if errors:
                         last_error = f"LLM 输出未过 schema 校验: {errors}"
                         self._log("warning", f"LLM 输出未过校验（第 {attempt} 次）: {errors}")
+                        self._log(
+                            "warning",
+                            f"LLM_RESPONSE stage={self.stage or 'llm'} attempt={attempt} "
+                            f"解析=成功 校验=失败 errors={self._audit_text(errors)}",
+                        )
                     else:
                         self._spent_s += time.monotonic() - attempt_start
                         self._log("info", f"LLM 识别成功（第 {attempt} 次）: 耗时 {time.monotonic() - attempt_start:.2f}s")
@@ -473,15 +535,23 @@ class LLMGateway:
                             "info",
                             f"LLM 结构化结果 attempt={attempt}: {self._audit_text(parsed)}",
                         )
+                        self._log(
+                            "info",
+                            f"LLM_RESPONSE stage={self.stage or 'llm'} attempt={attempt} 解析=成功 校验=通过 结果={self._audit_text(parsed)}",
+                        )
                         result = parsed
                         succeeded = True
                         break
             self._spent_s += time.monotonic() - attempt_start
-            if attempt < 3:
+            if attempt < 2:
                 time.sleep(0.25)  # 失败后短暂退避，避免长跑中对抖动供应商连续冲击
 
         call_elapsed = time.monotonic() - call_start
         if not succeeded:
             self._log("warning", f"LLM 识别失败（总耗时 {call_elapsed:.2f}s）: {last_error}，走兜底")
+            self._log(
+                "warning",
+                f"LLM_RESPONSE stage={self.stage or 'llm'} 解析=失败 fallback=启用 reason={last_error}",
+            )
         self._record_call(succeeded, call_elapsed)
         return result

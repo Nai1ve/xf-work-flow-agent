@@ -53,6 +53,7 @@ from utils.budget_skill import (
 from utils.llm_gateway import FakeBackend, LLMGateway
 from utils.static_context import StaticContextStore
 from utils.tool_contract import ToolContractReconciler
+from utils.profiles import ExecutionProfile, ProfileConfig
 
 # 显式测试配置（非真实密钥）。
 CFG = {
@@ -355,6 +356,8 @@ class TestBudgetPlannerFallback:
         assert _regex_search_term("项目是星火质量工程平台，买2台显示器") == "终端测试环境"
         assert _regex_search_term("项目是数字员工平台") == "数字员工"
         assert _regex_project_phrase("项目是数字员工。") == "数字员工"
+        assert _regex_project_phrase("办公场景焕新项目需要一台高速扫描仪") == "办公场景焕新"
+        assert _regex_project_phrase("帮我申请办公场景焕新项目的设备费用") == "办公场景焕新"
 
     def test_regex_project_code(self) -> None:
         assert _regex_project_code("按项目编码 D-260100004 提") == "D-260100004"
@@ -1221,6 +1224,46 @@ class TestBudgetRedesign:
         ])
         r = ex._resolve_amounts(draft, "x", {"amount": "3万"})
         assert r.get("error_reason") == "insufficient_amount_breakdown"
+
+    def test_candidate_rejects_model_only_amount(self, tmp_path: Path) -> None:
+        """candidate 不把模型猜测的单价当作可写金额事实。"""
+        env = _brand_env()
+        ex = BudgetExecutor(
+            env,
+            _registry(env, tmp_path),
+            None,
+            profile_config=ProfileConfig(
+                profile=ExecutionProfile.HYBRID_COMPAT,
+                requested_profile=ExecutionProfile.CANDIDATE_V2,
+            ),
+        )
+        result = ex._resolve_amounts(
+            BudgetDraft(rows=[BudgetRow(material_name="视频制作", quantity="1", unit_price="1500")]),
+            "视频制作，项目是数字员工",
+            {},
+        )
+        assert result.get("error_reason") == "amount_unresolved"
+
+    def test_candidate_blocks_multi_row_total_without_line_amounts(self, tmp_path: Path) -> None:
+        env = _brand_env()
+        ex = BudgetExecutor(
+            env,
+            _registry(env, tmp_path),
+            None,
+            profile_config=ProfileConfig(
+                profile=ExecutionProfile.HYBRID_COMPAT,
+                requested_profile=ExecutionProfile.CANDIDATE_V2,
+            ),
+        )
+        result = ex._resolve_amounts(
+            BudgetDraft(rows=[
+                BudgetRow(material_name="视频制作", quantity="1", unit_price="1500"),
+                BudgetRow(material_name="活动、展会、发布会", quantity="1", unit_price="2000"),
+            ]),
+            "总预算3万元",
+            {},
+        )
+        assert result.get("error_reason") == "insufficient_amount_breakdown"
 
 
 # ------------------------------------------------------------ Skill 入口 --

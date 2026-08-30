@@ -24,14 +24,17 @@ AGENT_EXECUTION_PROFILE=hybrid_compat PYTHONPATH=submission2 \
 
 ## 全量
 
+全量默认串行（`--parallel 1`）：模拟器的会议/工作流状态属于同一运行树，
+并发 worker 会互相看到临时写入，造成伪冲突；只有在专门做并发诊断时才提高该值。
+
 ```bash
 AGENT_EXECUTION_PROFILE=hybrid_compat PYTHONPATH=submission2 \
   .venv/bin/python scripts/run_agent.py --split train \
-  --agent submission2/my_agent.py --parallel 4 --timeout 60 --skip-variants \
+  --agent submission2/my_agent.py --parallel 1 --timeout 60 --skip-variants \
   --output reports/runs/v2_train.json --log-output reports/runs/v2_train.stdout
 AGENT_EXECUTION_PROFILE=hybrid_compat PYTHONPATH=submission2 \
   .venv/bin/python scripts/run_agent.py --split val \
-  --agent submission2/my_agent.py --parallel 4 --timeout 60 --skip-variants \
+  --agent submission2/my_agent.py --parallel 1 --timeout 60 --skip-variants \
   --output reports/runs/v2_val.json --log-output reports/runs/v2_val.stdout
 ```
 

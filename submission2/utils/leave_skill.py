@@ -29,7 +29,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from utils.holiday_calendar import duration_for, duration_for_leave
@@ -38,6 +38,7 @@ from utils.static_context import StaticContextStore
 from utils.tool_contract import EffectiveToolRegistry
 from utils.understanding import CONFIDENCE_FLOOR, TemporalResolver
 from utils.profiles import CompatibilityPolicy, ExecutionProfile, ProfileConfig
+from utils.speech_act import explicit_oa_request, parse_speech_act
 
 # 请假 plan 单次网络调用超时（秒），还会被 case 级 LLM 预算二次收窄。
 _LEAVE_PLAN_TIMEOUT_S = 15.0
@@ -212,7 +213,7 @@ class LeavePlanner:
         }
         prompt_card = (
             _LEAVE_DRAFT_CARD_GENERIC
-            if self.profile_config.profile == ExecutionProfile.GENERIC_V2
+            if self.profile_config.strict_runtime_mode
             else _LEAVE_DRAFT_CARD
         )
         raw = gateway.structured_call(
@@ -505,6 +506,18 @@ _DAY_WORD_RE = re.compile(
 )
 
 
+_WEEKDAY_INDEX = {
+    "一": 0,
+    "二": 1,
+    "三": 2,
+    "四": 3,
+    "五": 4,
+    "六": 5,
+    "日": 6,
+    "天": 6,
+}
+
+
 def _has_day_word(text: str) -> bool:
     """文本是否含日期表达词（今天/明天/后天/下周X/本周X/X月X日…）。
 
@@ -668,31 +681,36 @@ class LeaveExecutor:
         #    （20 例）；婚假/丧假/陪产假（M/F/P）一律 submitted（含 wf_0204
         #    无关键词「我下周要结婚…婚假」）——事件假走正式申请，默认提交。
         #    「不要保存草稿」反向否定草稿（wf_0224 直接提交不要保存草稿 → 提交）。
-        negate_submit = bool(
-            re.search(r"不提交|别提交|晚点提交|稍后提交|暂不提交", text)
-        )
-        no_draft = bool(
-            re.search(
-                r"不要保存草稿|不要存草稿|别存草稿|别保存草稿|不用存草稿|不要草稿",
-                text,
-            )
-        )
-        has_draft_word = bool(re.search(r"草稿|存草稿|存一下|先存|先保存|暂存", text))
-        explicit_draft = has_draft_word and not no_draft
-        explicit_submit = bool(re.search(r"提交", text)) and not negate_submit
         event_leave = bool(re.search(r"婚假|结婚|丧假|丧事|陪产假|产假|生育", text))
+        # 事件假“无操作动词默认提交”是兼容档策略；generic/candidate 只保留
+        # 用户显式语气，避免用训练批次归纳覆盖运行时事实。
+        speech = parse_speech_act(
+            text,
+            event_default=event_leave and not self._profile_config.strict_runtime_mode,
+        )
         decision = self._policy.decide(
             "submit_or_draft",
             semantic_context={
-                "explicit_negative": negate_submit or no_draft,
-                "draft_requested": explicit_draft,
-                "submit_requested": explicit_submit or no_draft,
+                "explicit_negative": speech.forbid_submit,
+                "draft_requested": speech.explicit_draft,
+                "submit_requested": speech.explicit_submit or speech.forbid_draft,
                 "event_leave_default": event_leave,
             },
         )
         if self._context is not None and hasattr(self._context, "record_policy"):
             self._context.record_policy(decision)
-        submit = bool(decision.selected_value)
+        self._log_info(
+            "POLICY_DECISION speech_act: "
+            f"domain=leave profile={self._profile_config.profile_name} "
+            f"selected={speech.selected} explicit_submit={speech.explicit_submit} "
+            f"explicit_draft={speech.explicit_draft} forbid_submit={speech.forbid_submit} "
+            f"forbid_draft={speech.forbid_draft} conflict={speech.conflict}"
+        )
+        self._log_info(f"语气决策: {speech.as_dict()}")
+        if speech.conflict or speech.selected is None:
+            self._log_warning("提交语气互相冲突，写入前阻断")
+            return self._blocked("conflicting_submit_intent")
+        submit = bool(speech.selected)
 
         # 9) 保存（每周反复 → 多次保存；drafts[-1] 为最后一次）。
         count = 0
@@ -720,10 +738,20 @@ class LeaveExecutor:
             count += 1
             last_start, last_end = start_full, end_full
 
-        # 10) 提交后确认：仅多域 case（zh_0215/0024/0220/0224 的 success_check 要求
-        #     调用过 oa.done.list，keyword=请假）。单域请假提交不确认，少一步
-        #     （wf_0019/0024/0026/0028 gold 均无此步，wf_0028 ES 因此不扣分）。
-        if submit and multi_domain:
+        # 10) 提交后确认：仅在用户明确要求或兼容 Profile 开启时执行。跨域本身
+        #     不再自动产生 OA 尾查，避免把与当前业务无关的读取混入工具轨迹。
+        oa_explicit = explicit_oa_request(text, "done")
+        oa_allowed = self._profile_config.allow_oa_postcheck(
+            explicit_request=oa_explicit,
+            multi_domain=multi_domain,
+        )
+        self._log_info(
+            "POLICY_DECISION OA尾查: "
+            f"domain=leave submit={submit} multi_domain={multi_domain} "
+            f"explicit={oa_explicit} legacy_compat={self._profile_config.legacy_oa_compat} "
+            f"action={'allow' if oa_allowed else 'skip'}"
+        )
+        if submit and oa_allowed:
             self._call_tool(self.OA_DONE_LIST, {"keyword": "请假"})
 
         result = {
@@ -766,7 +794,7 @@ class LeaveExecutor:
             mode = "workday"
         elif explicit_calendar:
             mode = "calendar"
-        elif explicit_hours and self._profile_config.profile == ExecutionProfile.GENERIC_V2:
+        elif explicit_hours and self._profile_config.strict_runtime_mode:
             match = re.search(r"共\s*([一两二三四五六七八九十\d.]+)\s*小时", value)
             if match:
                 try:
@@ -778,7 +806,7 @@ class LeaveExecutor:
             semantic_context={
                 "explicit_workday_policy": explicit_workday,
                 "explicit_calendar_policy": explicit_calendar,
-                "explicit_hours": explicit_hours and self._profile_config.profile == ExecutionProfile.GENERIC_V2,
+                "explicit_hours": explicit_hours and self._profile_config.strict_runtime_mode,
                 "leave_type": leave_type,
             },
         )
@@ -1163,6 +1191,13 @@ class LeaveExecutor:
         text = f"{sub} {user_query or ''}".strip()
         resolver = TemporalResolver(now_iso)
 
+        # 同一用例内的前序会议是可观测上下文，不是全局记忆。兼容日历下，
+        # “明天”可能被映射到模拟器的周一；用户随后说“下周二”通常是相对于
+        # 那个已解析的会议周，而不是再次从 env.now 推导。若账本里存在唯一
+        # meeting.day，先用它作为锚点（例如 4/21 → 下周二 4/28）；没有唯一
+        # 事实时仍走普通 TemporalResolver，不猜测。
+        anchored_day = self._reference_weekday_day(sub_query)
+
         # 1) 每周X + 两周（"这两周的申请"）→ 两次（本周五 + 下周五，wf_0010）。
         #    只有显式「两周」才触发 count=2；「每周X…这周五」（wf_0206）里每周只是
         #    背景（每周末接孩子），实际请的是单个「这周五」→ 走单日解析。若把「这周」
@@ -1178,7 +1213,7 @@ class LeaveExecutor:
                 return [(f"{d} {start_t}", f"{d} {end_t}") for d in days]
 
         # 2) 多轮澄清起止优先（需先解析单日 day）。
-        day = resolver.resolve_day(sub_query or "")
+        day = anchored_day or resolver.resolve_day(sub_query or "")
         if not day and re.search(r"那天|当天", sub_query or ""):
             day = resolver.resolve_day(user_query or "")
         if not day:
@@ -1203,7 +1238,20 @@ class LeaveExecutor:
         #    明天）。规则兜底能从完整 query 正确继承日期+时刻 → 跳过 LLM schedule
         #    直接走规则兜底。leave 子句自身有日期词（wf_0012 明天→后天）不受影响。
         if schedule and _has_day_word(sub):
-            normalized = self._normalize_llm_schedule(schedule, resolver)
+            schedule_for_normalize = schedule
+            if anchored_day:
+                # 模型仍可能返回“下周二”或把它错误地翻译成 env.now 相对日期；
+                # 只替换原文明确的下周星期表达，保留模型给出的时刻/跨日结构。
+                adjusted: list[dict[str, Any]] = []
+                for segment in schedule:
+                    item = dict(segment)
+                    if re.search(r"下周[一二三四五六日天]", str(item.get("day_phrase") or "")):
+                        item["day_phrase"] = anchored_day
+                    if re.search(r"下周[一二三四五六日天]", str(item.get("end_day_phrase") or "")):
+                        item["end_day_phrase"] = anchored_day
+                    adjusted.append(item)
+                schedule_for_normalize = adjusted
+            normalized = self._normalize_llm_schedule(schedule_for_normalize, resolver)
             if normalized:
                 return normalized
 
@@ -1225,6 +1273,31 @@ class LeaveExecutor:
         time_text = sub if _has_time_signal(sub) else text
         start_t, end_t = self._time_of_day(time_text, resolver)
         return [(f"{day} {start_t}", f"{day} {end_t}")]
+
+    def _reference_weekday_day(self, sub_query: str) -> str | None:
+        """从当前 case 的唯一前序会议事实解析“下周X”日期。
+
+        只在请假子句自身明确出现“下周X”时启用；不把完整用户问题中的会议日期
+        当成请假日期。多个会议事实或事实来源不可写入时返回空，交给普通日历。
+        """
+        if not re.search(r"下周[一二三四五六日天]", sub_query or ""):
+            return None
+        context = self._context
+        if context is None or not hasattr(context, "facts"):
+            return None
+        value = context.facts.unique_value("meeting.day")
+        if not value:
+            return None
+        try:
+            anchor = date.fromisoformat(str(value)[:10])
+        except (TypeError, ValueError):
+            return None
+        match = re.search(r"下周([一二三四五六日天])", sub_query or "")
+        if not match:
+            return None
+        monday = anchor - timedelta(days=anchor.weekday())
+        target = monday + timedelta(days=7 + _WEEKDAY_INDEX[match.group(1)])
+        return target.isoformat()
 
     def _normalize_llm_schedule(
         self,
@@ -1360,6 +1433,8 @@ class LeaveExecutor:
                 self._log_warning(f"调用前校验拦截 {name}: {error}")
             return {"error": f"validate_failed: {name}"}
 
+        if self._registry.is_write(name):
+            self._log_info(f"WRITE_PREFLIGHT tool={name} schema=通过 权限=通过 args={args}")
         result = self._env.call_tool(name, args)
         self._history.append((name, args, result))
         if self._context is not None and hasattr(self._context, "ledger"):
@@ -1371,6 +1446,8 @@ class LeaveExecutor:
             )
         if result.get("error"):
             self._log_warning(f"{name} 返回 error: {result['error']}")
+        elif self._registry.is_write(name):
+            self._log_info(f"WRITE_COMMIT tool={name} result={result}")
         return result
 
     def _blocked(self, reason: str) -> dict[str, Any]:
@@ -1380,6 +1457,10 @@ class LeaveExecutor:
     def _log_warning(self, message: str) -> None:
         if self._log is not None:
             self._log.warning(message)
+
+    def _log_info(self, message: str) -> None:
+        if self._log is not None:
+            self._log.info(message)
 
 
 def _match_type_code(hint: str, options: list[dict[str, Any]]) -> str | None:
@@ -1547,11 +1628,29 @@ class LeaveSkill:
         if gateway is not None and gateway.available:
             from utils.llm_gateway import LLMGateway
 
-            planner_gateway = LLMGateway(
-                logger=getattr(self.logger, "child", lambda *_: None)("LLM#2")
-            )
+            planner_logger = getattr(self.logger, "child", lambda *_: None)("LLM#2")
+            try:
+                planner_gateway = LLMGateway(
+                    logger=planner_logger,
+                    trace_context=getattr(gateway, "trace_context", None),
+                    stage="leave_plan",
+                )
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    raise
+                planner_gateway = LLMGateway(logger=planner_logger)
         self.last_planner_gateway = planner_gateway
         draft = self.planner.plan(sub_context, now_iso, mode, planner_gateway)
+        if self.profile_config.strict_runtime_mode and draft.source != "llm":
+            self.last_timings = {
+                "orchestrate_s": round(draft.elapsed_s, 3),
+                "exec_s": 0.0,
+                "skill_total_s": round(time.monotonic() - start, 3),
+            }
+            return {"workflow_draft_result": {
+                "status": "blocked",
+                "reason": "llm_plan_unavailable",
+            }}
 
         # 执行层：确定性流程 SOP（multi_turn 时执行器内部先做多轮澄清）。
         executor = LeaveExecutor(

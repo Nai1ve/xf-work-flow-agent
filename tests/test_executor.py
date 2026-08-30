@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from utils.executor import MeetingroomExecutor
+from utils.executor import MeetingroomExecutor, _normalize_meeting_title
 from utils.static_context import StaticContextStore
 from utils.tool_contract import ToolContractReconciler
 from utils.understanding import (
@@ -129,6 +129,13 @@ def registry(static_store: StaticContextStore) -> ToolContractReconciler:
 
 def _executor(env: FakeEnv, registry) -> MeetingroomExecutor:
     return MeetingroomExecutor(env, registry, None)
+
+
+def test_normalize_discourse_prefix_in_meeting_title() -> None:
+    """标题前的中文话语词不能被写入业务标题。"""
+    assert _normalize_meeting_title("还是季度复盘") == "季度复盘"
+    assert _normalize_meeting_title("主题是技术分享") == "技术分享"
+    assert _normalize_meeting_title("季度复盘") == "季度复盘"
 
 
 # ---------------------------------------------------------------------- 预订 --
@@ -286,9 +293,27 @@ class TestBookSingleDay:
         assert not any(name == "meetingroom.booking.create" for name, _ in env.calls)
 
     def test_floorless_fallback_combo(self, registry) -> None:
-        """楼层无解时 _search_combos 追加楼栋级候选（软约束楼层）。"""
+        """有明确回退授权时 _search_combos 追加楼栋级候选。"""
         env = FakeEnv()
         executor = _executor(env, registry)
+        c = MeetingConstraints(
+            intent=INTENT_BOOK,
+            day="2026-05-14",
+            start="15:00",
+            end="17:00",
+            addresses=["0552_A1_3F"],
+            fallback_building="A2",
+            capacity_gte=10,
+            title="头脑风暴",
+        )
+        combos = executor._search_combos(c)
+        # 主地址(楼层级)在前，楼栋级(去楼层)紧随其后，不早于反园区。
+        assert combos[0][0] == ["0552_A1_3F"]
+        assert ["0552_A1"] in [combo[0] for combo in combos]
+
+    def test_explicit_floor_is_hard_without_fallback(self, registry) -> None:
+        """只指定楼层且未授权回退时，不查询同楼栋其它楼层。"""
+        executor = _executor(FakeEnv(), registry)
         c = MeetingConstraints(
             intent=INTENT_BOOK,
             day="2026-05-14",
@@ -299,9 +324,7 @@ class TestBookSingleDay:
             title="头脑风暴",
         )
         combos = executor._search_combos(c)
-        # 主地址(楼层级)在前，楼栋级(去楼层)紧随其后，不早于反园区。
-        assert combos[0][0] == ["0552_A1_3F"]
-        assert ["0552_A1"] in [combo[0] for combo in combos]
+        assert ["0552_A1"] not in [combo[0] for combo in combos]
 
     def test_workspace_hint_create_uses_office_id(self, registry) -> None:
         """S1w：create 的 office_id 传房间 officeId（官方最近工位检查要求全等）。"""
@@ -888,6 +911,36 @@ class TestOpExtend:
 
 
 class TestOpRebook:
+    def test_rebook_create_failure_recovers_original(self, op_registry, op_store) -> None:
+        """新会议创建失败时，使用取消阶段的运行时事实恢复原会议。"""
+        env = OpFakeEnv()
+        env.bookings = [_booking("SEED-REBOOK-RECOVER", title="季度复盘")]
+        env.rooms_by_address["0552_A1"] = [_room("A1-3F-349", building="A1", capacity=14)]
+        original_call = env.call_tool
+        create_count = 0
+
+        def fail_first_create(name: str, args: dict) -> dict:
+            nonlocal create_count
+            if name == "meetingroom.booking.create":
+                create_count += 1
+                if create_count == 1:
+                    env.calls.append((name, args))
+                    return {"success": False, "error": "target unavailable"}
+            return original_call(name, args)
+
+        env.call_tool = fail_first_create
+        executor = _op_executor(env, op_registry, op_store)
+        result = executor.execute_ops(_plan(
+            ("cancel", {"order_id": "SEED-REBOOK-RECOVER", "day": "2026-04-21",
+                         "start": "14:00", "end": "15:00"}),
+            ("book", {"day": "2026-04-21", "start": "14:00", "end": "15:00",
+                       "addresses": ["0552_A1"], "inherit_title": True}),
+        ))
+        assert result["booking_result"]["status"] == "rebook_failed_recovered"
+        assert result["booking_result"]["cancelled_order_id"] == "SEED-REBOOK-RECOVER"
+        assert result["booking_result"]["recovered_order_id"]
+        assert create_count == 2
+
     def test_locate_cancel_recreate(self, op_registry, op_store) -> None:
         """0011 换大：定位 → cancel 原单 → 按更大容量 room.list → create。"""
         env = OpFakeEnv()

@@ -37,3 +37,36 @@
 ### 结论
 
 当前 `hybrid_compat` 已超过候选晋级门槛（Train/Val 均 ≥95，且无 violation）；相对线上 78.43686 的差异不能直接等价，因为线上环境、模型和数据批次不同。提交前保留 `legacy_current` 回滚 Profile，并使用 [testing_guide.md](testing_guide.md) 中的命令重跑。
+
+## 2026-08-30 V2 共性缺口回归（串行、最新）
+
+本轮按模拟器状态隔离要求使用 `--parallel 1`；旧报告中的 `--parallel 4` 仅作为历史
+对照，不能与本轮串行结果直接比较。运行时保持 `hybrid_compat`，
+`AGENT_LEGACY_OA_COMPAT=0`，不把 OA 尾查当作跨域必需步骤。
+
+| 数据集 | Case | 平均分 | 通过率 | TSR | AS | ES | 平均步数 | 平均耗时 | violation/exception |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Train（fix_round11，改动簇前） | 200 | 91.79 | 78.5% (157/200) | 56.46 | 19.27 | 8.20 | 5.55 | 12.42s | 0/0 |
+| Val（fix_round18，标题与项目短语修复后） | 50 | 98.00 | 92.0% (46/50) | 59.75 | 19.90 | 9.15 | 5.66 | 11.90s | 0/0 |
+
+Val 最新仅剩一个 `booking_result` 残差 `beta_mr_0048`。此前的
+`beta_mr_0011` 已通过通用中文话语前缀归一（“主题还是季度复盘”不再把“还是”写进标题）
+定向复测为 100/100；`beta_mr_0048` 的业务状态已正确，但用户明确“技术复盘”而评测参考使用“架构评审”，
+输入与实时工具没有可观测的区分事实，继续保留为兼容冲突，不加入用例映射。
+
+Val 另有三个 75～76 分的跨域用例只差 `oa.done.list` 尾查（费用 2、请假 1）。
+这是新契约下的语义门控行为；用 `AGENT_LEGACY_OA_COMPAT=1` 做 A/B 可恢复这三例，
+默认关闭以避免跨域无关查询。Val 的工作流与会议主体均无 violation，
+`beta_wf_0250` 项目短语“办公场景焕新项目需要……”经通用句法抽取后定向复测为
+100/100；合并服务行只有总额时仍在写前阻断并记录 `insufficient_amount_breakdown`。
+
+Train 的主要剩余簇为历史预算明细/投影（缺少实时可观测数量或单价）、请假时长/类型
+批次差异，以及少量会议 Projection；这些均在 Profile 的 legacy/compat 层隔离，
+没有新增 Case ID、训练原句或固定答案映射。模型服务有随机延迟和输出波动，
+`fix_round11_train` 与 Val 不是同一时刻采集，发布前应再以串行命令复测。
+
+本轮新增的通用修复包括：SpeechAct 负向优先和 OA 门控、跨 Task FactStore 与
+`order_after/requires` 分离、项目/类别/小类实时 evidence、金额守恒、会议连续空档和
+范围展开、重订失败恢复、新旧订单投影、同日多场标题修复、以及 run/case/task/stage
+关联日志与 `plan_checkpoint`/`case_final` 带外诊断。详细事件格式与复现命令见
+[testing_guide.md](testing_guide.md)，审核过程见仓库 `reports/review_rounds.log`。

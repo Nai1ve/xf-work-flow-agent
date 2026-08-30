@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import os
+import json
+from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -19,6 +21,9 @@ class ExecutionProfile(str, Enum):
     LEGACY_CURRENT = "legacy_current"
     HYBRID_COMPAT = "hybrid_compat"
     GENERIC_V2 = "generic_v2"
+    # candidate_v2 是面向发布的组合档位；内部仍沿用 hybrid 的兼容策略，
+    # 具体收益簇由下面三个 feature flag 独立控制，便于单簇回滚。
+    CANDIDATE_V2 = "candidate_v2"
 
 
 class ConflictType(str, Enum):
@@ -63,6 +68,10 @@ class ProfileConfig:
     """可通过环境变量切换的运行时策略配置。"""
 
     profile: ExecutionProfile = ExecutionProfile.HYBRID_COMPAT
+    # ``profile`` 是内部兼容分支使用的有效档位；requested_profile 保留外部
+    # 选择的名称（尤其是 candidate_v2），这样既不破坏旧分支，又能让候选包
+    # 关闭不可观测的 legacy 模板。手工构造 ProfileConfig 时两者相同。
+    requested_profile: ExecutionProfile | None = None
     calendar_profile: str = "normal"
     legacy_budget_templates: bool = True
     legacy_special_prompts: bool = True
@@ -71,20 +80,63 @@ class ProfileConfig:
     # 不是从 Gold/Case 推导；可用环境变量覆盖以便隐藏集 A/B。
     meeting_default_extend_minutes: int = 30
     capability_profiles: dict[str, str] = field(default_factory=dict)
+    # 问题簇开关：legacy_current 全部关闭，其余档位默认打开；环境变量可单独回滚。
+    contract_fixes_v2: bool = True
+    context_workflow_v2: bool = True
+    meeting_search_v2: bool = True
+    # OA 尾查存在批次契约差异：candidate/generic 默认只在用户明确要求时查询，
+    # legacy 可通过该开关保留旧的多域隐式尾查。它不改变业务写入，只影响额外的
+    # oa.todo.list / oa.done.list 调用，便于线上 A/B 与回滚。
+    legacy_oa_compat: bool = False
+
+    @property
+    def profile_name(self) -> str:
+        """用于日志/telemetry 的外部 profile 名。"""
+        return (self.requested_profile or self.profile).value
+
+    @property
+    def candidate_mode(self) -> bool:
+        """候选发布档位：关闭只能靠训练数据归纳的预算模板。"""
+        return (self.requested_profile or self.profile) == ExecutionProfile.CANDIDATE_V2
+
+    @property
+    def strict_runtime_mode(self) -> bool:
+        """generic/candidate 只允许当前用户与实时工具证据驱动写入。"""
+        selected = self.requested_profile or self.profile
+        return selected in {ExecutionProfile.GENERIC_V2, ExecutionProfile.CANDIDATE_V2}
 
     @classmethod
     def from_env(cls) -> "ProfileConfig":
-        raw = (os.environ.get("AGENT_EXECUTION_PROFILE") or "hybrid_compat").strip().lower()
+        # 配置文件只提供发布档位/功能默认值；环境变量仍具有最高优先级。
+        runtime_cfg: dict[str, Any] = {}
         try:
-            profile = ExecutionProfile(raw)
+            config_path = Path(__file__).resolve().parent.parent / "config.json"
+            parsed = json.loads(config_path.read_text(encoding="utf-8"))
+            runtime_cfg = parsed.get("runtime", {}) if isinstance(parsed, dict) else {}
+        except (OSError, ValueError):
+            runtime_cfg = {}
+        configured_profile = runtime_cfg.get("execution_profile")
+        raw = (os.environ.get("AGENT_EXECUTION_PROFILE") or configured_profile or "hybrid_compat").strip().lower()
+        try:
+            requested_profile = ExecutionProfile(raw)
         except ValueError:
+            requested_profile = ExecutionProfile.HYBRID_COMPAT
+        profile = requested_profile
+        if requested_profile == ExecutionProfile.CANDIDATE_V2:
+            # 对外保留 candidate_v2 名称；策略判断按 hybrid 处理，避免散落的
+            # ``profile == HYBRID_COMPAT`` 分支被悄悄绕过。
             profile = ExecutionProfile.HYBRID_COMPAT
-        default_calendar = "normal" if profile == ExecutionProfile.GENERIC_V2 else "simulator_compat"
+        default_calendar = "normal" if requested_profile == ExecutionProfile.GENERIC_V2 else "simulator_compat"
         calendar = (os.environ.get("AGENT_CALENDAR_PROFILE") or default_calendar).strip().lower()
         if calendar not in {"normal", "simulator_compat"}:
             calendar = "normal"
-        # 兼容层默认保留旧预算模板；generic 明确关闭，避免把隐藏明细当作事实。
-        legacy_templates = profile != ExecutionProfile.GENERIC_V2
+        # 兼容层默认保留旧预算模板；generic/candidate 明确关闭，避免把隐藏
+        # 明细、价格或物料答案当作运行时事实。AGENT_LEGACY_BUDGET_TEMPLATES
+        # 仍可显式打开，作为可回滚的本地 legacy 开关。
+        legacy_templates = requested_profile not in {
+            ExecutionProfile.GENERIC_V2,
+            ExecutionProfile.CANDIDATE_V2,
+        }
         if os.environ.get("AGENT_LEGACY_BUDGET_TEMPLATES") in {"0", "false", "off"}:
             legacy_templates = False
         default_extend = 30
@@ -96,13 +148,46 @@ class ProfileConfig:
                     default_extend = parsed_extend
             except ValueError:
                 pass
+        default_cluster = profile != ExecutionProfile.LEGACY_CURRENT
+
+        configured_oa = runtime_cfg.get("legacy_oa_compat")
+        legacy_oa_default = requested_profile == ExecutionProfile.LEGACY_CURRENT
+        if configured_oa is not None:
+            legacy_oa_default = bool(configured_oa)
+        raw_oa = os.environ.get("AGENT_LEGACY_OA_COMPAT")
+        if raw_oa is not None:
+            legacy_oa_default = str(raw_oa).strip().lower() not in {"0", "false", "off", "no"}
+
+        def _flag(name: str, default: bool, config_key: str | None = None) -> bool:
+            value = os.environ.get(name)
+            if value is None:
+                if config_key and config_key in runtime_cfg:
+                    return bool(runtime_cfg[config_key])
+                return default
+            return str(value).strip().lower() not in {"0", "false", "off", "no"}
+
         return cls(
             profile=profile,
+            requested_profile=requested_profile,
             calendar_profile=calendar,
             legacy_budget_templates=legacy_templates,
             legacy_special_prompts=profile == ExecutionProfile.LEGACY_CURRENT,
             meeting_default_extend_minutes=default_extend,
+            contract_fixes_v2=_flag("AGENT_CONTRACT_FIXES_V2", default_cluster, "contract_fixes_v2"),
+            context_workflow_v2=_flag("AGENT_CONTEXT_WORKFLOW_V2", default_cluster, "context_workflow_v2"),
+            meeting_search_v2=_flag("AGENT_MEETING_SEARCH_V2", default_cluster, "meeting_search_v2"),
+            legacy_oa_compat=legacy_oa_default,
         )
+
+    def allow_oa_postcheck(self, *, explicit_request: bool, multi_domain: bool) -> bool:
+        """决定是否执行 OA 尾查。
+
+        明确要求始终允许；旧 contract_fixes 关闭或显式兼容开关可保留历史行为。
+        candidate/generic 在默认配置下不会因为跨域本身发起无关 OA 查询。
+        """
+        if not multi_domain:
+            return False
+        return bool(explicit_request or self.legacy_oa_compat or not self.contract_fixes_v2)
 
     def profile_for(self, capability: str) -> ExecutionProfile:
         """返回能力级 Profile；无覆盖时使用全局档位。"""
@@ -188,7 +273,7 @@ class CompatibilityPolicy:
             ))
 
         if ctype == ConflictType.HALF_DAY_POLICY.value:
-            mode = "legacy" if profile != ExecutionProfile.GENERIC_V2 else "configured"
+            mode = "legacy" if not self.config.strict_runtime_mode else "configured"
             return self._emit(PolicyDecision(
                 ctype, "half_day_calculator", mode,
                 None,
@@ -201,7 +286,7 @@ class CompatibilityPolicy:
                 value = False
             elif semantic_context.get("submit_requested"):
                 value = True
-            elif semantic_context.get("event_leave_default") and profile != ExecutionProfile.GENERIC_V2:
+            elif semantic_context.get("event_leave_default") and not self.config.strict_runtime_mode:
                 value = True
             else:
                 value = False

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,8 @@ from utils.understanding import UNIT_BUDGET, UNIT_LEAVE, UNIT_MEETING
 from utils.context import CaseContext
 from utils.dag_runtime import DagTask, NodeOutcome, NodeStatus, TaskDag
 from utils.profiles import ExecutionProfile, ProfileConfig
+from utils.redaction import redact_text, redact_value
+from utils.trace_context import TraceContext
 
 
 def _compact(value: Any, limit: int = 600) -> Any:
@@ -42,12 +45,13 @@ def _compact(value: Any, limit: int = 600) -> Any:
     if value is None:
         return None
     if isinstance(value, (str, int, float, bool)):
-        text = str(value)
+        text = redact_text(value)
         return text[:limit] + ("…" if len(text) > limit else "")
     try:
         text = json.dumps(value, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         text = str(value)
+    text = redact_text(text)
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
@@ -63,6 +67,7 @@ class _RecordingEnv:
         env: Any,
         trace: list[dict[str, Any]],
         context: CaseContext | None = None,
+        trace_context: TraceContext | None = None,
         logger: Any = None,
     ) -> None:
         object.__setattr__(self, "_inner", env)
@@ -70,9 +75,13 @@ class _RecordingEnv:
         object.__setattr__(self, "_context", context)
         object.__setattr__(self, "_task_id", None)
         object.__setattr__(self, "_logger", logger)
+        object.__setattr__(self, "_trace_context", trace_context)
 
     def set_task(self, task_id: str | None) -> None:
         object.__setattr__(self, "_task_id", task_id)
+        trace_context = object.__getattribute__(self, "_trace_context")
+        if trace_context is not None:
+            trace_context.task_id = task_id or ""
         context = object.__getattribute__(self, "_context")
         if context is not None and hasattr(context, "ledger"):
             context.ledger.set_active_task(task_id)
@@ -84,6 +93,10 @@ class _RecordingEnv:
         取得 observation 后再绑定；不会跨 case 复用任何状态。
         """
         object.__setattr__(self, "_context", context)
+
+    def bind_trace_context(self, trace_context: TraceContext | None) -> None:
+        """绑定当前 case 的远程请求关联信息；不跨 case 复用。"""
+        object.__setattr__(self, "_trace_context", trace_context)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(object.__getattribute__(self, "_inner"), name)
@@ -97,11 +110,12 @@ class _RecordingEnv:
     def call_tool(self, name: str, args: Any) -> Any:
         logger = object.__getattribute__(self, "_logger")
         if logger is not None:
-            logger.info(f"工具调用: {name} args={_compact(args)}")
+            logger.info(f"TOOL_CALL 工具调用: {name} args={_compact(args)}")
         try:
             result = self._inner.call_tool(name, args)
         except Exception as exc:  # noqa: BLE001 —— 记录后原样抛，行为不改变
-            self._trace.append({"tool": name, "args": _compact(args), "error": repr(exc)})
+            self._trace.append({"event": "TOOL_CALL", "task_id": self._task_id,
+                                "tool": name, "args": _compact(args), "error": repr(exc)})
             if logger is not None:
                 logger.warning(f"工具异常: {name} error={exc!r}")
             context = object.__getattribute__(self, "_context")
@@ -113,9 +127,10 @@ class _RecordingEnv:
                     provenance="runtime_tool",
                 )
             raise
-        self._trace.append({"tool": name, "args": _compact(args), "result": _compact(result)})
+        self._trace.append({"event": "TOOL_RESULT", "task_id": self._task_id,
+                            "tool": name, "args": _compact(args), "result": _compact(result)})
         if logger is not None:
-            logger.info(f"工具结果: {name} result={_compact(result)}")
+            logger.info(f"TOOL_RESULT 工具结果: {name} result={_compact(result)}")
         context = object.__getattribute__(self, "_context")
         if context is not None:
             context.ledger.add(
@@ -129,11 +144,12 @@ class _RecordingEnv:
     def reply(self, question: str) -> Any:
         logger = object.__getattribute__(self, "_logger")
         if logger is not None:
-            logger.info(f"追问: {question}")
+            logger.info(f"CLARIFICATION 追问: {_compact(question)}")
         try:
             result = self._inner.reply(question)
         except Exception as exc:  # noqa: BLE001
-            self._trace.append({"reply": _compact(question), "error": repr(exc)})
+            self._trace.append({"event": "CLARIFICATION", "task_id": self._task_id,
+                                "reply": _compact(question), "error": repr(exc)})
             if logger is not None:
                 logger.warning(f"追问异常: {exc!r}")
             context = object.__getattribute__(self, "_context")
@@ -145,9 +161,16 @@ class _RecordingEnv:
                     provenance="runtime_reply",
                 )
             raise
-        self._trace.append({"reply": _compact(question), "result": _compact(result)})
+        clarification_event: dict[str, Any] = {
+            "event": "CLARIFICATION",
+            "task_id": self._task_id,
+            "reply": _compact(question),
+            "result": _compact(result),
+            "new_fact": False,
+        }
+        self._trace.append(clarification_event)
         if logger is not None:
-            logger.info(f"追问结果: {_compact(result)}")
+            logger.info(f"CLARIFICATION_RESULT 追问结果: {_compact(result)}")
         context = object.__getattribute__(self, "_context")
         if context is not None:
             context.ledger.add(
@@ -155,6 +178,31 @@ class _RecordingEnv:
                 task_id=object.__getattribute__(self, "_task_id"),
                 provenance="runtime_reply",
             )
+            # 模拟器/线上环境会返回 resolved_slot + user_message。将用户真正
+            # 提供的答复写入本 case FactStore，后续当前 Task 重规划可消费；
+            # 不把 assistant_message 或推断结果当作可写事实。
+            if isinstance(result, dict):
+                slot = str(result.get("resolved_slot") or "").strip()
+                message = str(result.get("user_message") or "").strip()
+                if slot and message and result.get("resolved_slot") is not None:
+                    fact = context.upsert_fact(
+                        f"dialogue.{slot}",
+                        message,
+                        source="DIALOGUE_REPLY",
+                        task_id=object.__getattribute__(self, "_task_id"),
+                    )
+                    self._trace.append({
+                        "event": "FACT_UPSERT",
+                        "task_id": self._task_id,
+                        "key": fact.key,
+                        "fact_id": fact.fact_id,
+                        "source": fact.source,
+                        "value": _compact(fact.value),
+                    })
+                    clarification_event["new_fact"] = True
+                    clarification_event["resolved_slot"] = slot
+                    if logger is not None:
+                        logger.info(f"事实写入: key=dialogue.{slot} 来源=用户追问回复")
         return result
 
 
@@ -300,6 +348,10 @@ class MyAgent:
                 f"source={meeting_plan.source} confidence={meeting_plan.confidence} "
                 f"elapsed={meeting_plan.elapsed_s:.2f}s"
             )
+            self.logger.info(
+                f"INTENT_GRAPH case={case_id} "
+                f"tasks={json.dumps(units_desc, ensure_ascii=False)}"
+            )
             # 各部分模型时间：识别（LLM#1）与编排（LLM#2）各自 gateway 统计。
             llm1_stats = gateway.stats_summary()
             llm2_stats = (
@@ -424,25 +476,16 @@ class MyAgent:
             executor_log = self.logger.child("执行层")
             exec_start = time.monotonic()
             final_answer: dict[str, Any] = {}
-            executed_meeting = False
-            for unit in ir.ordered_units():
-                if unit.unit_type in (UNIT_LEAVE, UNIT_BUDGET):
-                    # 请假/预算单元已由各自 skill 独立执行（多域合并），循环内跳过。
-                    continue
-                if unit.unit_type != UNIT_MEETING:
-                    # 未知流程 SOP 未接入；安全空，不猜测。
-                    executor_log.info(
-                        f"unit={unit.unit_type}: 流程 SOP 未接入，跳过（安全空）"
-                    )
-                    continue
-                # LLM#2 的会议计划覆盖全部 meeting 单元（0245 把「查工位+附近订房」
-                # 拆成两个 meeting 单元）。只在首个 meeting 单元执行一次——否则同一
-                # 计划重复执行会耗尽步数预算（StepLimitExceeded → 顶层兜底丢结果）。
-                if not executed_meeting:
-                    executed_meeting = True
-                    result = executor.execute_ops(meeting_plan)
-                    if result:
-                        final_answer = result
+            # 旧回滚入口只有一份会议计划；直接定位首个会议单元并执行一次，
+            # 不用跨 Task 的业务控制变量或隐式全局状态。
+            meeting_unit = next(
+                (unit for unit in ir.ordered_units() if unit.unit_type == UNIT_MEETING),
+                None,
+            )
+            if meeting_unit is not None:
+                result = executor.execute_ops(meeting_plan)
+                if result:
+                    final_answer = result
             exec_elapsed = time.monotonic() - exec_start
             if leave_result:
                 final_answer.update(leave_result)
@@ -498,6 +541,7 @@ class MyAgent:
         gateway: LLMGateway | None = None
         trace: list[dict[str, Any]] = []
         run_start = time.monotonic()
+        final_sent = False
 
         def merge_answer(part: Any) -> None:
             if not isinstance(part, dict):
@@ -541,13 +585,29 @@ class MyAgent:
                 self.logger.warning("obs 缺少 user_query/now，返回空")
                 return final_answer
 
+            trace_context = TraceContext(
+                case_id=case_id,
+                package_version=os.environ.get("AGENT_PACKAGE_VERSION", "v2"),
+                profile=self.profile_config.profile_name,
+                prompt_versions={
+                    "intent_graph": "intent-v2",
+                    "meeting_plan": "meeting-v2",
+                    "leave_plan": "leave-v2",
+                    "budget_plan": "budget-v2",
+                },
+            )
+            run_id = trace_context.run_id
             case_context = CaseContext(
                 case_id=case_id,
                 user_query=user_query,
                 now_iso=now_iso,
                 mode=str(mode) if mode is not None else None,
+                run_id=run_id,
+                package_version=os.environ.get("AGENT_PACKAGE_VERSION", "v2"),
             )
+            self.logger.info(f"CASE_START run_id={run_id} case={case_id} now={now_iso} mode={mode} profile={self.profile_config.profile_name}")
             env.bind_context(case_context)
+            env.bind_trace_context(trace_context)
             case_context.ledger.add(
                 "observation",
                 "env.reset",
@@ -556,7 +616,11 @@ class MyAgent:
             )
 
             understand_log = self.logger.child("理解层")
-            gateway = LLMGateway(logger=understand_log.child("LLM#1"))
+            gateway = LLMGateway(
+                logger=understand_log.child("LLM#1"),
+                trace_context=trace_context,
+                stage="intent_graph",
+            )
             meeting_skill = MeetingSkill(
                 logger=understand_log,
                 profile_config=self.profile_config,
@@ -580,6 +644,10 @@ class MyAgent:
                 f"source={meeting_plan.source} confidence={meeting_plan.confidence} "
                 f"elapsed={meeting_plan.elapsed_s:.2f}s"
             )
+            self.logger.info(
+                f"INTENT_GRAPH run_id={case_context.run_id} "
+                f"tasks={json.dumps(units_desc, ensure_ascii=False)}"
+            )
             llm1_stats = gateway.stats_summary()
             llm2_stats = (
                 meeting_skill.last_planner_gateway.stats_summary()
@@ -600,12 +668,16 @@ class MyAgent:
                         dep_id = f"task-{dep}"
                         if dep_id not in deps:
                             deps.append(dep_id)
+                requires = self._infer_task_requires(
+                    index, unit.sub_query, ir.task_units, full_query=user_query
+                )
                 dag_tasks.append(
                     DagTask(
                         task_id=f"task-{index}",
                         unit_type=unit.unit_type,
                         sub_query=unit.sub_query or user_query,
-                        depends_on=deps,
+                        order_after=deps,
+                        requires=requires,
                     )
                 )
             dag = TaskDag(dag_tasks)
@@ -614,13 +686,57 @@ class MyAgent:
             except ValueError as exc:
                 understand_log.warning(f"Task DAG 非法，移除依赖后按原序执行: {exc}")
                 for task in dag_tasks:
-                    task.depends_on = []
+                    task.order_after = []
+                    task.requires = []
                 dag = TaskDag(dag_tasks)
             for task in dag_tasks:
-                case_context.add_task(task.task_id, task.unit_type, task.sub_query)
+                case_context.add_task(
+                    task.task_id,
+                    task.unit_type,
+                    task.sub_query,
+                    order_after=task.order_after,
+                    requires=task.requires,
+                )
             understand_log.info(
                 f"Task DAG: order={[task.task_id for task in dag.topological_order()] if dag_tasks else []} "
-                f"nodes={len(dag_tasks)}"
+                f"nodes={len(dag_tasks)} edges="
+                f"{json.dumps({t.task_id: {'order_after': t.order_after, 'requires': t.requires} for t in dag_tasks}, ensure_ascii=False)}"
+            )
+            self._send_trace(
+                gateway,
+                case_id=case_id,
+                user_query=user_query,
+                now_iso=now_iso,
+                mode=mode,
+                trace=[],
+                final_answer={},
+                kind="plan_checkpoint",
+                context=case_context,
+                extra={
+                    "trace_context": trace_context.summary(),
+                    "intent_graph": units_desc,
+                    "task_dag": {
+                        t.task_id: {
+                            "unit_type": t.unit_type,
+                            "sub_query": t.sub_query,
+                            "order_after": t.order_after,
+                            "requires": t.requires,
+                        }
+                        for t in dag_tasks
+                    },
+                    "features": {
+                        "contract_fixes_v2": self.profile_config.contract_fixes_v2,
+                        "context_workflow_v2": self.profile_config.context_workflow_v2,
+                        "meeting_search_v2": self.profile_config.meeting_search_v2,
+                    },
+                    "model_stats": {
+                        "intent_graph": gateway.stats_summary(),
+                        "meeting_plan": (
+                            meeting_skill.last_planner_gateway.stats_summary()
+                            if meeting_skill.last_planner_gateway is not None else None
+                        ),
+                    },
+                },
             )
 
             executor_log = self.logger.child("执行层")
@@ -630,18 +746,41 @@ class MyAgent:
                 self.static_context,
                 logger=executor_log,
                 profile_config=self.profile_config,
-                cross_domain=len(dag_tasks) > 1,
+                # ``cross_domain`` 表示同一用例是否包含多个业务域，而不是
+                # Task 数量。一个会议请求可能被拆成“查工位 + 订会议”两个
+                # Meeting Task；把它误判为跨域会触发跨域 Projection（例如
+                # 将 office_id 改成楼栋名），导致业务状态正确但提交契约不匹配。
+                # 只有真正混合 meeting/leave/budget 等不同 unit_type 时才启用
+                # 跨域兼容投影。
+                cross_domain=len({task.unit_type for task in dag_tasks}) > 1,
                 context=case_context,
             )
             exec_start = time.monotonic()
-            executed_meeting = False
             leave_timings: dict[str, Any] = {}
             budget_timings: dict[str, Any] = {}
             leave_llm2_stats: dict[str, Any] | None = None
             budget_llm2_stats: dict[str, Any] | None = None
 
+            meeting_plans: dict[str, Any] = {}
+            meeting_tasks = [task for task in dag_tasks if task.unit_type == UNIT_MEETING]
+            if len(meeting_tasks) == 1:
+                meeting_plans[meeting_tasks[0].task_id] = meeting_plan
+            elif meeting_tasks:
+                # 每个独立会议 Task 提前独立编排；依赖前序会议事实的 Task 延迟到
+                # handler 内重规划，避免在事实尚未产生时把“刚订的会议/那天”猜成
+                # 当前日期或第一个订单。
+                for task in meeting_tasks:
+                    if task.requires:
+                        continue
+                    meeting_plans[task.task_id] = meeting_skill.plan_task(
+                        task.sub_query or user_query,
+                        now_iso,
+                        mode,
+                        gateway,
+                    )
+
             def handle_task(task: DagTask, context: CaseContext) -> NodeOutcome:
-                nonlocal executed_meeting, leave_timings, budget_timings
+                nonlocal leave_timings, budget_timings
                 nonlocal leave_llm2_stats, budget_llm2_stats
                 env.set_task(task.task_id)
                 context.ledger.add(
@@ -652,18 +791,85 @@ class MyAgent:
                     provenance="dag_runtime",
                 )
                 executor_log.info(
-                    f"Task 开始: id={task.task_id} type={task.unit_type} deps={task.depends_on} "
+                    f"Task 开始: id={task.task_id} type={task.unit_type} order_after={task.order_after} requires={task.requires} "
                     f"sub_query={task.sub_query!r}"
                 )
+                executor_log.info(
+                    f"SKILL_PLAN task={task.task_id} intent={task.unit_type} "
+                    f"requires={task.requires} 预计节点=确定性SOP"
+                )
                 if task.unit_type == UNIT_MEETING:
-                    # 当前 MeetingSkill 会把同一 case 的会议子句合并成一个计划；
-                    # 后续 meeting 节点保持 DAG 可见但不重复执行写操作。
-                    if executed_meeting:
-                        executor_log.info(f"Task {task.task_id}: 会议计划已执行，跳过重复计划")
-                        return NodeOutcome(NodeStatus.SUCCEEDED, output={})
-                    executed_meeting = True
-                    part = meeting_executor.execute_ops(meeting_plan)
+                    plan = meeting_plans.get(task.task_id)
+                    if plan is None and task.requires:
+                        # 前序 Task 已按 requires 成功完成，当前 case 的事实账本
+                        # 已经有唯一 booking/day 等运行时事实；此处重新执行当前
+                        # Task 的编排，并只对缺失槽位做事实晚绑定。
+                        plan = meeting_skill.plan_task(
+                            task.sub_query or user_query,
+                            now_iso,
+                            mode,
+                            gateway,
+                        )
+                        plan = self._bind_meeting_reference_facts(
+                            plan, task.sub_query or user_query, context, task.requires
+                        )
+                        meeting_plans[task.task_id] = plan
+                    if plan is None:
+                        return NodeOutcome(NodeStatus.BLOCKED, error="meeting_plan_missing")
+                    # 跨 Task 的显式指代必须绑定到前序运行时事实。即使模型把
+                    # ``刚订的会议/那天`` 解析成了可执行动作，也不能在事实缺失时
+                    # 退回“找第一条会议”或按当前日期猜测；否则会破坏任务隔离和
+                    # 新旧订单一致性。执行前先做一个无副作用的引用门控，真实事实
+                    # 由 _bind_meeting_reference_facts 注入，缺失则诚实阻断。
+                    # 只有存在前序 Meeting Task 时，原文里的“刚订的会议/那天”
+                    # 才是跨 Task 指代，需要依赖账本唯一事实。单个 Meeting Task
+                    # 的“原会议”是本 SOP 内部定位条件，不能被误拦；“这个会议室”
+                    # 也不是“这个会议”的指代。
+                    task_index = next(
+                        (idx for idx, candidate in enumerate(dag_tasks)
+                         if candidate.task_id == task.task_id),
+                        len(dag_tasks),
+                    )
+                    prior_meeting = any(
+                        candidate.unit_type == UNIT_MEETING
+                        for candidate in dag_tasks[:task_index]
+                    )
+                    missing_reference = (
+                        self._missing_meeting_reference_fact(
+                            task.sub_query or user_query, context, task.requires
+                        )
+                        if task.requires or prior_meeting
+                        else None
+                    )
+                    if missing_reference:
+                        executor_log.warning(
+                            f"Task {task.task_id}: 跨 Task 事实未唯一解析，阻断 "
+                            f"reason=unresolved_meeting_reference slot={missing_reference}"
+                        )
+                        return NodeOutcome(
+                            NodeStatus.BLOCKED,
+                            output={
+                                "booking_result": {
+                                    "status": "blocked",
+                                    "reason": "unresolved_meeting_reference",
+                                    "slot": missing_reference,
+                                }
+                            },
+                            error="unresolved_meeting_reference",
+                        )
+                    if getattr(plan, "source", "") == "blocked_llm_plan":
+                        executor_log.warning(
+                            f"Task {task.task_id}: 模型编排失败，候选档不执行会议写操作"
+                        )
+                        return NodeOutcome(NodeStatus.BLOCKED, error="llm_plan_unavailable")
+                    part = meeting_executor.execute_ops(plan)
                     merge_answer(part)
+                    self._record_task_facts(context, task.task_id, part)
+                    executor_log.info(
+                        f"DOMAIN_RESULT task={task.task_id} domain=meeting "
+                        f"result={_compact(part, 12000)} "
+                        f"fact_count={len(context.facts.all(task_id=task.task_id))}"
+                    )
                     executor_log.info(
                         f"会议执行: task={task.task_id} result={json.dumps(part, ensure_ascii=False)}"
                     )
@@ -681,6 +887,12 @@ class MyAgent:
                         context=context,
                     )
                     merge_answer(part)
+                    self._record_task_facts(context, task.task_id, part)
+                    executor_log.info(
+                        f"DOMAIN_RESULT task={task.task_id} domain=leave "
+                        f"result={_compact(part, 12000)} "
+                        f"fact_count={len(context.facts.all(task_id=task.task_id))}"
+                    )
                     leave_timings = skill.last_timings
                     leave_llm2_stats = (
                         skill.last_planner_gateway.stats_summary()
@@ -698,13 +910,20 @@ class MyAgent:
                         executor_log.info(f"Task {task.task_id}: 预算 Skill 已关闭，跳过")
                         return NodeOutcome(NodeStatus.SKIPPED, error="budget_disabled")
                     skill = BudgetSkill(logger=understand_log, profile_config=self.profile_config)
+                    budget_query = self._enrich_task_query(context, task)
                     part = skill.run(
-                        [task.sub_query], user_query, now_iso, mode, gateway, env,
+                        [budget_query], user_query, now_iso, mode, gateway, env,
                         registry, self.static_context,
                         multi_domain=len(dag_tasks) > 1,
                         context=context,
                     )
                     merge_answer(part)
+                    self._record_task_facts(context, task.task_id, part)
+                    executor_log.info(
+                        f"DOMAIN_RESULT task={task.task_id} domain=budget "
+                        f"result={_compact(part, 12000)} "
+                        f"fact_count={len(context.facts.all(task_id=task.task_id))}"
+                    )
                     budget_timings = skill.last_timings
                     budget_llm2_stats = (
                         skill.last_planner_gateway.stats_summary()
@@ -737,6 +956,15 @@ class MyAgent:
             executor_log.info(
                 f"Submission Projection: {json.dumps(final_answer, ensure_ascii=False)}"
             )
+            self.logger.info(
+                f"PROJECTION run_id={case_context.run_id} fields={list(final_answer.keys())} "
+                f"facts={len(case_context.facts.all())}"
+            )
+            self.logger.info(
+                f"SELF_AUDIT run_id={case_context.run_id} tasks={len(dag_tasks)} "
+                f"outcomes={json.dumps({k: v.status.value for k, v in outcomes.items()}, ensure_ascii=False)} "
+                f"fact_count={len(case_context.facts.all())}"
+            )
 
             exec_elapsed = time.monotonic() - exec_start
             total_elapsed = time.monotonic() - run_start
@@ -762,11 +990,38 @@ class MyAgent:
                 mode=mode,
                 trace=trace,
                 final_answer=final_answer,
+                kind="case_final",
+                context=case_context,
+                extra={
+                    "trace_context": trace_context.summary(),
+                    "facts": case_context.facts.as_dict(),
+                    "policy_decisions": case_context.policy_decisions,
+                    "outcomes": {
+                        k: {"status": v.status.value, "error": v.error}
+                        for k, v in outcomes.items()
+                    },
+                    "self_audit": {
+                        "fact_count": len(case_context.facts.all()),
+                        "task_count": len(dag_tasks),
+                        "tool_event_count": len(trace),
+                        "profile": self.profile_config.profile_name,
+                    },
+                },
+            )
+            final_sent = True
+            self.logger.info(
+                f"CASE_END run_id={case_context.run_id} case={case_id} status=completed "
+                f"tool_calls={len(trace)} elapsed={time.monotonic() - run_start:.2f}s"
             )
             return final_answer
         except Exception as exc:  # noqa: BLE001 —— 顶层兜底：永不 raise
             self.logger.warning(f"run 异常，保留已有结果并兜底: {exc!r}")
-            if gateway is not None:
+            self.logger.info(
+                f"CASE_END run_id={getattr(locals().get('case_context'), 'run_id', '-') or '-'} "
+                f"case={case_id} status=exception error={type(exc).__name__} "
+                f"tool_calls={len(trace)} elapsed={time.monotonic() - run_start:.2f}s"
+            )
+            if gateway is not None and not final_sent:
                 try:
                     self._send_trace(
                         gateway,
@@ -776,10 +1031,220 @@ class MyAgent:
                         mode=locals().get("mode"),
                         trace=trace,
                         final_answer=final_answer,
+                        kind="case_final",
+                        context=locals().get("case_context"),
+                        extra={"exception": repr(exc)},
                     )
                 except Exception:  # noqa: BLE001
                     pass
             return final_answer
+
+    @staticmethod
+    def _infer_task_requires(
+        index: int,
+        sub_query: str,
+        units: list[Any],
+        *,
+        full_query: str | None = None,
+    ) -> list[str]:
+        """只把可观察的跨任务指代转成 requires，其余模型依赖仅是顺序边。
+
+        识别 Prompt 允许模型把“同项目”展开为已知项目短语以便当前 Task 自
+        包含，但这不应丢掉真正的数据依赖。这里同时查看原始 case 文本，在有
+        前序同域 Task 时恢复 requires；没有前序 Task 时不人为制造依赖。
+        """
+        text = str(sub_query or "")
+        original = str(full_query or "")
+        markers = {
+            "project": ("同项目", "该项目", "这个项目", "上述项目"),
+            "meeting": ("那天", "同一天", "刚订的会议", "这个会议", "刚才的会议", "原会议"),
+        }
+        wanted: str | None = None
+        unit_type = getattr(units[index], "unit_type", "") if 0 <= index < len(units) else ""
+        # 先按当前域选择对应引用类型，避免一个跨域原句同时含“同项目”和
+        # “那天”时把 meeting Task 错绑到 project 依赖（反之亦然）。
+        preferred = "project" if unit_type == UNIT_BUDGET else "meeting" if unit_type == UNIT_MEETING else None
+        kinds = [preferred] if preferred else list(markers)
+        for kind in kinds:
+            if kind and (MyAgent._contains_reference(text, kind) or MyAgent._contains_reference(original, kind)):
+                wanted = kind
+                break
+        if wanted is None:
+            return []
+        for previous in range(index - 1, -1, -1):
+            unit_type = getattr(units[previous], "unit_type", "")
+            if wanted == "project" and unit_type == UNIT_BUDGET:
+                return [f"task-{previous}"]
+            if wanted == "meeting" and unit_type == UNIT_MEETING:
+                return [f"task-{previous}"]
+        # 明确指代但没有可供读取的前序事实，保留一个不存在的 requires 会让
+        # TaskDag 安全阻断；调用方的多轮逻辑可再补事实，不会猜测。
+        return []
+
+    @staticmethod
+    def _enrich_task_query(context: CaseContext, task: DagTask) -> str:
+        """用当前 case 唯一的项目事实补全“同项目”指代，不写入全局缓存。"""
+        text = task.sub_query or ""
+        if not any(word in text for word in ("同项目", "该项目", "这个项目", "上述项目")):
+            return text
+        project_code = MyAgent._fact_from_dependencies(
+            context, "expense.project_code", task.requires
+        )
+        project_name = MyAgent._fact_from_dependencies(
+            context, "expense.project_name", task.requires
+        )
+        if project_code or project_name:
+            fact = project_code or project_name
+            return f"{text}\n[本用例前序事实] 项目={fact}"
+        return text
+
+    @staticmethod
+    def _fact_from_dependencies(
+        context: CaseContext, key: str, dependencies: list[str] | None = None
+    ) -> Any:
+        """优先从 requires 指向的前序 Task 读取唯一事实，再回退 case 唯一值。"""
+        for task_id in dependencies or []:
+            value = context.facts.unique_value(key, task_id=task_id)
+            if value is not None:
+                return value
+        return context.facts.unique_value(key)
+
+    @staticmethod
+    def _bind_meeting_reference_facts(
+        plan: Any, text: str, context: CaseContext,
+        dependencies: list[str] | None = None,
+    ) -> Any:
+        """把显式跨 Task 会议指代绑定到本 case 的唯一运行时事实。
+
+        模型只负责识别动作和原文语义，不能生成订单号/房间 ID。依赖 Task 成功
+        后，这里把 ``刚订的会议``、``那天`` 等可观测指代晚绑定到 planner
+        产出的原子 op；没有唯一事实时保持空值，由 SOP 安全阻断或追问。
+        """
+        if plan is None:
+            return plan
+        text = str(text or "")
+        booking_ref = MyAgent._contains_reference(text, "meeting_booking")
+        day_ref = MyAgent._contains_reference(text, "meeting_day")
+        booking_id = MyAgent._fact_from_dependencies(
+            context, "meeting.booking_id", dependencies
+        ) if booking_ref else None
+        day = MyAgent._fact_from_dependencies(
+            context, "meeting.day", dependencies
+        ) if (booking_ref or day_ref) else None
+        room_id = MyAgent._fact_from_dependencies(
+            context, "meeting.room_id", dependencies
+        ) if booking_ref else None
+        start = MyAgent._fact_from_dependencies(
+            context, "meeting.start", dependencies
+        ) if booking_ref else None
+        end = MyAgent._fact_from_dependencies(
+            context, "meeting.end", dependencies
+        ) if booking_ref else None
+        title = MyAgent._fact_from_dependencies(
+            context, "meeting.title", dependencies
+        ) if booking_ref else None
+        if not any((booking_id, day, room_id, start, end, title)):
+            return plan
+        for op in getattr(plan, "ops", []) or []:
+            target = dict(getattr(op, "target", {}) or {})
+            if booking_id and not target.get("order_id"):
+                target["order_id"] = booking_id
+            if day and not target.get("day"):
+                target["day"] = day
+            if room_id and not target.get("room_id") and not target.get("room"):
+                target["room_id"] = room_id
+            if start and not target.get("start"):
+                target["start"] = start
+            if end and not target.get("end"):
+                target["end"] = end
+            if title and not target.get("title"):
+                target["title"] = title
+            op.target = target
+        return plan
+
+    @staticmethod
+    def _missing_meeting_reference_fact(
+        text: str,
+        context: CaseContext,
+        dependencies: list[str] | None = None,
+    ) -> str | None:
+        """返回跨 Task 会议指代所缺的唯一事实槽位。
+
+        这是执行前的安全门，而不是新的业务推断：只有文本显式出现跨 Task
+        指代且 ``requires`` 已声明时才检查。booking 指代需要订单号；“那天/同一
+        天”至少需要日期。若前序 Task 产出多个不同事实，FactStore 会返回 None，
+        让当前 Task blocked，而不是任选一条。
+        """
+        text = str(text or "")
+        booking_ref = MyAgent._contains_reference(text, "meeting_booking")
+        day_ref = MyAgent._contains_reference(text, "meeting_day")
+        if not (booking_ref or day_ref):
+            return None
+        if not dependencies:
+            return "meeting.booking_id" if booking_ref else "meeting.day"
+        if booking_ref and MyAgent._fact_from_dependencies(
+            context, "meeting.booking_id", dependencies
+        ) is None:
+            return "meeting.booking_id"
+        if (booking_ref or day_ref) and MyAgent._fact_from_dependencies(
+            context, "meeting.day", dependencies
+        ) is None:
+            return "meeting.day"
+        return None
+
+    @staticmethod
+    def _contains_reference(text: str, kind: str) -> bool:
+        """识别跨 Task 指代，避免把“这个会议室”误当成“这个会议”。"""
+
+        value = str(text or "")
+        if kind == "project":
+            return any(word in value for word in ("同项目", "该项目", "这个项目", "上述项目"))
+        if kind == "meeting":
+            return bool(
+                re.search(r"刚订的会议|刚才的会议|原会议|这个会议(?!室)|那天|同一天", value)
+            )
+        if kind == "meeting_booking":
+            return bool(re.search(r"刚订的会议|刚才的会议|原会议|这个会议(?!室)", value))
+        if kind == "meeting_day":
+            return any(word in value for word in ("那天", "同一天"))
+        return False
+
+    @staticmethod
+    def _record_task_facts(context: CaseContext, task_id: str, part: Any) -> None:
+        """从 DomainResult 的工具事实提取可跨 Task 共享的最小槽位。"""
+        if not isinstance(part, dict):
+            return
+        booking = part.get("booking_result")
+        if isinstance(booking, dict) and booking.get("status") in {
+            "success",
+            "active",
+            "rebooked",
+            "extended",
+            "updated",
+            "participant_added",
+            "participants_added",
+            "extended_and_participant_added",
+        }:
+            for key, value in (
+                ("meeting.booking_id", booking.get("booking_id") or booking.get("order_id")),
+                ("meeting.order_id", booking.get("order_id") or booking.get("booking_id")),
+                ("meeting.day", booking.get("day")),
+                ("meeting.room_id", booking.get("room_id")),
+                ("meeting.start", booking.get("start")),
+                ("meeting.end", booking.get("end")),
+                ("meeting.title", booking.get("title")),
+            ):
+                if value:
+                    context.upsert_fact(key, value, source="TASK_OUTPUT", task_id=task_id)
+        workflow = part.get("workflow_draft_result")
+        if isinstance(workflow, dict) and workflow.get("status") in {"submitted", "draft_saved"}:
+            for key, value in (
+                ("expense.project_code", workflow.get("project_code")),
+                ("expense.project_name", workflow.get("project_name")),
+                ("leave.approver", workflow.get("approver")),
+            ):
+                if value:
+                    context.upsert_fact(key, value, source="TASK_OUTPUT", task_id=task_id)
 
     @staticmethod
     def _apply_superset_projection(final_answer: dict[str, Any]) -> None:
@@ -803,12 +1268,17 @@ class MyAgent:
         mode: Any,
         trace: list[dict[str, Any]],
         final_answer: dict[str, Any],
+        kind: str = "case_final",
+        context: CaseContext | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         """记录本 case 执行轨迹（独立通道，不计预算，失败静默不影响返回）。"""
         if not gateway.trace_enabled:
             return
         payload = {
-            "kind": "case_trace",
+            "kind": kind,
+            "run_id": getattr(context, "run_id", None),
+            "package_version": getattr(context, "package_version", "v2"),
             "case_id": case_id,
             "user_query": user_query,
             "now": now_iso,
@@ -816,6 +1286,26 @@ class MyAgent:
             "tool_calls": trace,
             "final_answer": final_answer,
         }
-        ok = gateway.send_trace(payload)
+        if extra:
+            payload.update(extra)
+        # 带外诊断与本地日志使用同一脱敏策略；候选 ID、订单号、项目编码等
+        # 业务诊断字段保持原样，手机号和临时 URL 参数在离开进程前移除。
+        payload = redact_value(payload)
+        # 远程诊断有硬上限；工具结果在入口已压缩，超限时优先保留终态、
+        # 错误和最近的写轨迹，避免 telemetry 反过来拖垮业务请求。
+        try:
+            encoded_size = len(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"))
+        except (TypeError, ValueError):
+            encoded_size = 0
+        if encoded_size > 96 * 1024:
+            payload["tool_calls"] = [
+                item for item in trace
+                if item.get("error") or item.get("event") in {"TOOL_RESULT", "CLARIFICATION"}
+            ][-80:]
+            payload["final_answer"] = _compact(final_answer, 12000)
+            for key in ("facts", "policy_decisions", "outcomes"):
+                if key in payload:
+                    payload[key] = _compact(payload[key], 12000)
+        ok = gateway.send_trace(payload, timeout_s=1.0)
         if not ok:
             self.logger.warning("轨迹记录失败（已静默忽略，不影响返回）")

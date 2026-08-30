@@ -36,6 +36,7 @@ from utils.logger import ConsoleLogger
 from utils.static_context import StaticContextStore
 from utils.tool_contract import EffectiveToolRegistry
 from utils.profiles import ExecutionProfile, ProfileConfig
+from utils.speech_act import explicit_oa_request, parse_speech_act
 
 # 预算 plan 单次网络调用超时（秒）。
 _BUDGET_PLAN_TIMEOUT_S = 15.0
@@ -397,12 +398,12 @@ class BudgetPlanner:
         # --- ① 项目请求（search_term / code_hint）---
         project_card = (
             _BUDGET_PROJECT_CARD_GENERIC
-            if self.profile_config.profile == ExecutionProfile.GENERIC_V2
+            if self.profile_config.strict_runtime_mode
             else _BUDGET_PROJECT_CARD
         )
         material_card = (
             _BUDGET_MATERIAL_CARD_GENERIC
-            if self.profile_config.profile == ExecutionProfile.GENERIC_V2
+            if self.profile_config.strict_runtime_mode
             else _BUDGET_MATERIAL_CARD
         )
         project_raw = gateway.structured_call(
@@ -414,13 +415,16 @@ class BudgetPlanner:
         )
         project = project_raw.get("project") or {}
         search_term = str(project.get("search_term") or "").strip()
-        code_hint = str(project.get("code_hint") or "").strip()
+        # 项目编码是可执行的业务 ID，模型不能创造或“猜测”。即使兼容卡片仍
+        # 保留 code_hint 字段以兼容旧服务端 schema，也只采纳用户原文中可验证的
+        # 编码；真正的项目对象仍必须来自本轮 workflow.project_search。
+        code_hint = _regex_project_code(context)
         p_conf = float(project_raw.get("confidence") or 0.0)
         p_accepted = p_conf >= _BUDGET_CONFIDENCE_FLOOR
         if not p_accepted:
             # 项目子调用被拒 → 规则兜底项目槽。
             search_term = rule.search_term or ""
-            code_hint = ""
+            code_hint = _regex_project_code(context)
 
         # --- ② 物料请求（category_hint / detail_rows）---
         mat_raw = gateway.structured_call(
@@ -785,11 +789,54 @@ _SUBMIT_PATTERNS = (
 )
 _DRAFT_PATTERNS = ("草稿", "存一个", "存个", "存成", "存为", "存到", "存下", "保存")
 
+_GENERIC_PROJECT_TERMS = frozenset({
+    "项目", "平台", "费用", "采购", "服务", "申请", "预算", "系统", "中心",
+    "工程", "建设", "研发", "物资", "办公", "品牌",
+})
+
+
+def _is_specific_project_term(value: str) -> bool:
+    """项目搜索词必须包含可区分业务语义，禁止泛词命中后取第一项。"""
+    term = re.sub(r"[\s，。；,;:：]+", "", str(value or ""))
+    term = _strip_generic(term)
+    return bool(term and len(term) >= 2 and term not in _GENERIC_PROJECT_TERMS)
+
 
 def _regex_project_phrase(text: str) -> str:
-    """从文本提取「项目是 X」句式里的项目短语，未命中返回空串。"""
-    m = re.search(r"项目(?:是|为|：|:)?\s*([^，。；,;、\.!！?？\s]{2,20})", text or "")
-    return m.group(1).strip() if m else ""
+    """从文本提取用户明确给出的项目短语，未命中返回空串。
+
+    覆盖两种常见的自然语言结构：``项目是 X`` 与 ``X项目需要/申请``。
+    第二种只取紧邻「项目」前的名词短语，并去掉请求动作前缀；它是通用的
+    句法兜底，不能把“项目/费用/采购”等泛词本身当成搜索词。
+    """
+    text = text or ""
+    # 「项目是/为 X」：保留原有优先级和终止标点。
+    m = re.search(
+        r"项目(?:是|为|：|:)\s*([^，。；,;、\.\s]{2,30})",
+        text,
+    )
+    if m:
+        return m.group(1).strip()
+
+    # 「X项目需要/要/里/中的…」：取最后一个“项目”前的连续名词片段。
+    # 允许数字、英文和中文项目名；不跨空格/标点，避免吞掉后续预算描述。
+    candidates = list(
+        re.finditer(
+            r"([一-龥A-Za-z0-9][一-龥A-Za-z0-9·（）()_\-]{1,29})项目"
+            r"(?=(?:的|里|中|需要|要|有|包含|下|内|，|,|。|；|;|$))",
+            text,
+        )
+    )
+    if not candidates:
+        return ""
+    candidate = candidates[-1].group(1).strip()
+    # 句首动作词可能与项目名相连（“帮我申请办公空间升级项目”），只保留
+    # 动作词后的名词片段；这些词不是项目事实，也不进入搜索。
+    candidate = re.split(
+        r"(?:帮我|请帮我|请|需要|要|给我|提交|申请|采购|购买|买|存个|存一个|存下|提一个|提一批|提一项|做一笔|做一项|一笔|一项|一批)",
+        candidate,
+    )[-1].strip("的里中 ")
+    return candidate if _is_specific_project_term(candidate) else ""
 
 
 def _regex_project_code(text: str) -> str:
@@ -1057,6 +1104,18 @@ class BudgetExecutor:
                 {"workflow_id": workflow_id, "schema": schema, "name": "费用类物资"}
             )
 
+        speech = parse_speech_act(text)
+        self._log_info(
+            "POLICY_DECISION speech_act: "
+            f"domain=budget profile={self._profile_config.profile_name} "
+            f"selected={speech.selected} explicit_submit={speech.explicit_submit} "
+            f"explicit_draft={speech.explicit_draft} forbid_submit={speech.forbid_submit} "
+            f"forbid_draft={speech.forbid_draft} conflict={speech.conflict}"
+        )
+        if speech.conflict:
+            self._log_warning("提交语气互相冲突，写入前阻断")
+            return self._blocked("conflicting_submit_intent")
+
         # 3) 多轮澄清（仅 multi_turn）：按 query 缺槽逐项 __reply__，采纳答复。
         clarified: dict[str, Any] = {}
         if mode == "multi_turn":
@@ -1069,6 +1128,13 @@ class BudgetExecutor:
         #     任一行无 canonical 且无 subclass_hint → 记录失败，走完项目/大类
         #     工具路径后在下文 6.5 block（gold blocked 的 must_satisfy 要求
         #     调用过 29028，如 wf_0255/wf_0257/zh_0008——否则 TSR-10 + ES=0）。
+        # 在 canonicalize 之前保存原始物料名上的金额证据。LLM 可能把“视频”归一
+        # 为“视频制作”、把“发布会”归一为“活动、展会、发布会”；如果此时只用
+        # canonical 名回看原文，会丢掉用户逐行给出的单价，旧的兼容模板就可能
+        # 覆盖真实金额。显式行金额是当前 query 的事实，任何 legacy 记忆都不能
+        # 覆盖它。
+        explicit_line_amounts = _has_explicit_line_amounts(text, draft.rows)
+        _apply_explicit_line_amounts(draft, text)
         canon_failed = not self._canonicalize_rows(draft)
 
         # 3.5b) 垃圾行/空行金额记忆补全（用户定案 2026-08-17）：行归一失败
@@ -1099,7 +1165,11 @@ class BudgetExecutor:
         # （有预算无物料）+ 草稿意图 + _BUDGET_MEMORY 命中 → 用记忆模板确定性
         # 重建。golden 重建后行已规范（canon ok）时**不**进入本块——否则 _memory_rebuild
         # 内部会多一次 project_search，wf_0242 白白多一步 ES 掉分。
-        if self._profile_config.legacy_budget_templates and (canon_failed or not draft.rows):
+        if (
+            self._profile_config.legacy_budget_templates
+            and (canon_failed or not draft.rows)
+            and not explicit_line_amounts
+        ):
             rebuilt = self._memory_rebuild(draft, text, clarified)
             if rebuilt is not None:
                 project = rebuilt["project"]
@@ -1138,7 +1208,7 @@ class BudgetExecutor:
                 if save_result.get("error"):
                     return self._blocked(f"save_failed: {save_result['error']}")
                 todo_result = None
-                if multi_domain:
+                if self._oa_postcheck_allowed(text, submit, multi_domain):
                     if submit:
                         self._call_tool(self.OA_DONE_LIST, {"keyword": "费用"})
                     else:
@@ -1174,6 +1244,23 @@ class BudgetExecutor:
         material_category_label = category["label"]
 
         # 5) 项目解析：code → 短名 → 别名/发现回退 → 消歧（>1 → blocked）。
+        if any(word in text for word in ("同项目", "该项目", "这个项目", "上述项目")):
+            # 跨 Task 指代只能消费本用例内唯一的前序事实；没有事实时不以
+            # “项目/平台”等泛词搜索，更不从标题猜项目。
+            fact_code = None
+            fact_name = None
+            if self._context is not None and hasattr(self._context, "facts"):
+                fact_code = self._context.facts.unique_value("expense.project_code")
+                fact_name = self._context.facts.unique_value("expense.project_name")
+            if fact_code:
+                draft.code_hint = str(fact_code)
+                text = f"{text} 项目编码 {fact_code}"
+            elif fact_name:
+                draft.search_term = str(fact_name)
+                text = f"{text} 项目是 {fact_name}"
+            else:
+                self._log_warning("跨 Task 项目指代无唯一前序事实，阻断而不猜测")
+                return self._blocked("unresolved_project_reference")
         project = self._resolve_project(
             draft, text, clarified, material_category_label
         )
@@ -1185,7 +1272,12 @@ class BudgetExecutor:
         #      或给了单行无金额）→ 记忆 (wbs,大类,档) 命中且行与记忆不符 → 用
         #      记忆模板重建。复用上文 3.5b 的确定性保存路径；project 已解析传入，
         #      不再重复 project_search（_memory_rebuild 门控 4 好行不覆盖）。
-        if self._profile_config.legacy_budget_templates and draft.rows and not canon_failed:
+        if (
+            self._profile_config.legacy_budget_templates
+            and draft.rows
+            and not canon_failed
+            and not explicit_line_amounts
+        ):
             rebuilt = self._memory_rebuild(draft, text, clarified, project=project)
             if rebuilt is not None:
                 total_amount = f"{rebuilt['total']:.2f}"
@@ -1223,7 +1315,7 @@ class BudgetExecutor:
                 if save_result.get("error"):
                     return self._blocked(f"save_failed: {save_result['error']}")
                 todo_result = None
-                if multi_domain:
+                if self._oa_postcheck_allowed(text, submit, multi_domain):
                     if submit:
                         self._call_tool(self.OA_DONE_LIST, {"keyword": "费用"})
                     else:
@@ -1292,6 +1384,18 @@ class BudgetExecutor:
         if subclasses is None:
             return self._dual_blocked("ambiguous_material_subclass")
 
+        # 兼容档也不允许把一个合并的多服务物料行按模型猜测比例写入。
+        # 项目、大类、小类查询已经完成，保留 blocked 用例所需的工具轨迹；
+        # 写前阻断避免 workflow.save 产生无法解释的明细。
+        if self._profile_config.contract_fixes_v2 and _ambiguous_total_breakdown(
+            draft,
+            text,
+            explicit_line_amounts,
+            self._explicit_total(text, clarified),
+        ):
+            self._log_warning("金额明细无法从用户事实唯一拆分，写入前阻断")
+            return self._blocked("insufficient_amount_breakdown")
+
         # 8) 金额：qty × unit_price → budget_amount，total = Σ；无法拆分 → blocked。
         amounts = self._resolve_amounts(draft, text, clarified)
         if "error_reason" in amounts:
@@ -1308,6 +1412,16 @@ class BudgetExecutor:
                 "unit_price": amounts["rows"][i]["unit_price"],
                 "budget_amount": amounts["rows"][i]["budget_amount"],
             })
+        # candidate/generic 写入前只接受本轮搜索返回的业务编码；模型输出和
+        # 静态模板不能直接成为 workflow.save 的 ID 证据。
+        if self._profile_config.strict_runtime_mode and not self._save_evidence_ok(
+            project, material_category, subclasses
+        ):
+            self._log_warning("写入预检失败：项目/大类/小类缺少本轮工具 evidence")
+            return self._blocked("runtime_candidate_evidence_missing")
+        if not self._amount_payload_ok(detail_rows, total_amount):
+            self._log_warning("写入预检失败：金额未守恒")
+            return self._blocked("amount_total_mismatch")
         submit = self._submit_verdict(text)
         save_result = self._call_tool(
             self.WORKFLOW_SAVE,
@@ -1332,7 +1446,7 @@ class BudgetExecutor:
         # 10) 多域 oa 验证：draft→todo.list（query 显式"待办"→费用类物资）、
         #    submit→done.list(keyword=费用)。
         todo_result: dict[str, Any] | None = None
-        if multi_domain:
+        if self._oa_postcheck_allowed(text, submit, multi_domain):
             if submit:
                 self._call_tool(self.OA_DONE_LIST, {"keyword": "费用"})
             else:
@@ -1358,6 +1472,68 @@ class BudgetExecutor:
         if todo_result is not None:
             out["todo_result"] = todo_result
         return out
+
+    def _oa_postcheck_allowed(
+        self, text: str, submit: bool, multi_domain: bool
+    ) -> bool:
+        """记录并执行一次 OA 尾查门控。
+
+        OA 只是提交后的可选验证，不是费用保存 SOP 的必要节点。把门控集中到
+        这里，确保记忆重建、部分明细重建和正常保存三条路径使用同一策略，并
+        在普通中文日志中留下可审计的 policy decision。
+        """
+        explicit = explicit_oa_request(text, "done" if submit else "todo")
+        allowed = self._profile_config.allow_oa_postcheck(
+            explicit_request=explicit,
+            multi_domain=multi_domain,
+        )
+        self._log_info(
+            "POLICY_DECISION OA尾查: "
+            f"domain=budget submit={submit} multi_domain={multi_domain} "
+            f"explicit={explicit} legacy_compat={self._profile_config.legacy_oa_compat} "
+            f"action={'allow' if allowed else 'skip'}"
+        )
+        return allowed
+
+    def _save_evidence_ok(
+        self,
+        project: dict[str, Any],
+        category_code: str,
+        subclass_codes: list[str],
+    ) -> bool:
+        """检查选中的业务编码是否确实由本轮搜索工具返回。"""
+        project_ok = False
+        category_ok = False
+        subclass_seen: set[str] = set()
+        for name, args, result in self._history:
+            if name == self.WORKFLOW_PROJECT_SEARCH:
+                for item in result.get("projects") or []:
+                    if (
+                        item.get("project_code") == project.get("project_code")
+                        and item.get("wbs_code") == project.get("wbs_code")
+                    ):
+                        project_ok = True
+            elif name == self.WORKFLOW_BROWSER_SEARCH:
+                for option in result.get("options") or []:
+                    code = str(option.get("code") or "")
+                    if args.get("field_id") == 29023 and code == str(category_code):
+                        category_ok = True
+                    if args.get("field_id") == 29028 and code:
+                        subclass_seen.add(code)
+        return project_ok and category_ok and set(map(str, subclass_codes)).issubset(subclass_seen)
+
+    @staticmethod
+    def _amount_payload_ok(rows: list[dict[str, Any]], total: str) -> bool:
+        """保存前金额守恒校验，防止四舍五入或模板污染。"""
+        try:
+            line_total = round(sum(float(row["budget_amount"]) for row in rows), 2)
+            return abs(line_total - float(total)) <= 0.01 and all(
+                abs(round(float(row["quantity"]) * float(row["unit_price"]), 2)
+                    - float(row["budget_amount"])) <= 0.01
+                for row in rows
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
 
     # ------------------------------------------------------ SOP 步骤 --
     def _current_user(self) -> dict[str, Any] | None:
@@ -1548,7 +1724,13 @@ class BudgetExecutor:
         if not search_term:
             search_term = phrase
         # 搜索词记忆（用户定案 2026-08-19）：query 含高置信项目词 → 兜底补搜该词。
-        golden_term = _project_search_golden_for(text)
+        # 训练集推导的搜索词只属于可回滚的 legacy 档；candidate/generic 必须
+        # 依据当前用户语义和本轮工具候选构造搜索词，不能把词表当作事实。
+        golden_term = (
+            _project_search_golden_for(text)
+            if self._profile_config.legacy_budget_templates
+            else ""
+        )
         if golden_term and golden_term in _PROJECT_TERM_GOLDEN_MATERIAL_GATED:
             # 物料门控：具体物料行存在才归一为短名；批次泛词（一批设备→rows 空）
             # 保留 query 字面全名（wf_0253 gold 要求 终端兼容性专项测试）。
@@ -1556,6 +1738,10 @@ class BudgetExecutor:
                 golden_term = ""
         if golden_term:
             search_term = golden_term
+
+        if self._profile_config.context_workflow_v2 and search_term and not _is_specific_project_term(search_term):
+            self._log_warning(f"项目搜索词过于宽泛，拒绝搜索: {search_term!r}")
+            search_term = ""
 
         searched_terms: set[str] = set()
         result_by_term: dict[str, list[dict[str, Any]]] = {}
@@ -1597,7 +1783,11 @@ class BudgetExecutor:
                 self._log_project_resolved(refined, picked)
                 return picked
 
-        # 4) 单项目发现回退（zh_0010/0008 无项目信号）。
+        # 4) 单项目发现回退（legacy 兼容）。V2 不允许用“项目/平台”等泛词
+        # 命中一项作为默认项目；没有区分性短语就追问/阻断。
+        if self._profile_config.context_workflow_v2:
+            self._log_warning("缺少区分性项目搜索词，V2 禁止泛词发现回退")
+            return {"error_reason": "ambiguous_project"}
         for core in _DISCOVERY_CORE:
             rows = _project_search_once(core, "发现回退")
             if len(rows) == 1:
@@ -1682,8 +1872,9 @@ class BudgetExecutor:
         ):
             return self._project_dict(base_p)
 
-        # 5) 泛化后缀归一：剥后缀后同 base → 当作同一项目取首个。
-        if _same_generic_base(projects):
+        # 5) 泛化后缀归一：旧兼容档把同 base 视作同一项目。候选档不再
+        # 依赖训练集归纳的“取首个”，同 base 但 code 不同仍需追问/阻断。
+        if not self._profile_config.strict_runtime_mode and _same_generic_base(projects):
             return self._project_dict(projects[0])
 
         # 6) 真歧义 → blocked。
@@ -1742,6 +1933,13 @@ class BudgetExecutor:
         if not scored or scored[0][1] <= 0:
             return None
         if len(scored) >= 2 and scored[0][1] == scored[1][1]:
+            return None
+        self._log_info(
+            "CANDIDATE_SET 大类="
+            f"candidates={[(o.get('code'), o.get('label'), s) for o, s in scored[:8]]}"
+        )
+        if self._profile_config.strict_runtime_mode and scored[0][1] < 80:
+            self._log_warning("候选档大类没有足够的语义重合，阻断而不猜测")
             return None
         best = scored[0][0]
         return {
@@ -1908,15 +2106,36 @@ class BudgetExecutor:
             signals.append(_MATERIAL_SUBCLASS_MAP.get(material) or "")
             signals.append(row.subclass_hint)
             signals.append(material)
-            best_code, best_score = None, 0
+            scored: list[tuple[dict[str, Any], int]] = []
             for opt in options:
                 label = opt.get("label") or ""
-                score = max(_overlap_score(sig, label) for sig in signals if sig)
-                if score > best_score:
-                    best_score, best_code = score, opt.get("code")
-                elif score == best_score and score > 0 and opt.get("code") != best_code:
-                    best_code = None  # 平局 → 不唯一
-            if best_code is None or best_score <= 0:
+                # candidate 档禁止用两个泛词的少量字符重合来制造唯一候选；
+                # 仍保留旧档的宽松 overlap 规则，便于单簇回滚。
+                if self._profile_config.strict_runtime_mode:
+                    norm_sig = [re.sub(r"[\s、，,;；/（）()]+", "", str(sig)) for sig in signals if sig]
+                    norm_label = re.sub(r"[\s、，,;；/（）()]+", "", str(label))
+                    score = max(
+                        (100 if s == norm_label else 80 if s and (s in norm_label or norm_label in s) else 0)
+                        for s in norm_sig
+                    ) if norm_sig else 0
+                else:
+                    usable = [sig for sig in signals if sig]
+                    score = max((_overlap_score(sig, label) for sig in usable), default=0)
+                scored.append((opt, score))
+            scored.sort(key=lambda item: item[1], reverse=True)
+            best_score = scored[0][1] if scored else 0
+            tied = [item for item in scored if item[1] == best_score and best_score > 0]
+            best_code = tied[0][0].get("code") if len(tied) == 1 else None
+            self._log_info(
+                "CANDIDATE_SET 小类="
+                f"row={i} name={material!r} candidates="
+                f"{[(o.get('code'), o.get('label'), s) for o, s in scored[:8]]} "
+                f"selected={best_code or '-'} reason="
+                f"{'唯一高分' if best_code else '无唯一合法候选'}"
+            )
+            if best_code is None or best_score <= 0 or (
+                self._profile_config.strict_runtime_mode and best_score < 80
+            ):
                 return None
             codes.append(str(best_code))
         return codes
@@ -1971,39 +2190,107 @@ class BudgetExecutor:
         total_explicit = self._explicit_total(text, clarified)
 
         out_rows: list[dict[str, Any]] = []
+        explicit_line_amounts: list[bool] = []
+        missing_unit_rows: list[int] = []
         for i, row in enumerate(rows):
             qty = _to_qty(row.quantity)
             if qty is None:
                 qty = _regex_qty_for_material(text, row.material_name) or 1
-            unit = _to_amount(row.unit_price)
-            if unit is None:
-                unit = _regex_unit_for_material(text, row.material_name)
+            # 原文中按物料绑定的数量/单价优先于模型的猜测；这也是写前
+            # evidence 的最小可解释来源。模型传入的 unit_price 只有在原文
+            # 没有该行金额时才作为候选，不能覆盖用户明确数字。
+            explicit_unit = _regex_unit_for_material(text, row.material_name)
+            unit = explicit_unit if explicit_unit is not None else _to_amount(row.unit_price)
+            explicit_line_amounts.append(explicit_unit is not None)
+            if (
+                self._profile_config.strict_runtime_mode
+                and total_explicit is None
+                and explicit_unit is None
+            ):
+                return {"error_reason": "amount_unresolved"}
             # 显式总额 + 单行 → 总额÷数量（覆盖 LLM 猜测单价，使行金额 = 总额）。
             if total_explicit is not None and len(rows) == 1 and qty:
-                unit = total_explicit / qty
+                if explicit_unit is not None and abs(qty * explicit_unit - total_explicit) > 0.01:
+                    return {"error_reason": "amount_total_mismatch"}
+                unit = explicit_unit if explicit_unit is not None else total_explicit / qty
             if unit is None:
                 if len(rows) > 1:
-                    return {"error_reason": "insufficient_amount_breakdown"}
-                unit = 1.0
+                    # 有显式总额时允许先保留缺价行，稍后按总额减去
+                    # 已知行分配；若完全没有可分配依据则仍阻断。
+                    if total_explicit is None:
+                        return {"error_reason": "insufficient_amount_breakdown"}
+                    missing_unit_rows.append(i)
+                    unit = 0.0
+                if self._profile_config.strict_runtime_mode and total_explicit is None:
+                    return {"error_reason": "amount_unresolved"}
+                if len(rows) == 1:
+                    unit = 1.0
             budget = round(qty * unit, 2)
             out_rows.append({
                 "quantity": str(qty),
                 "unit_price": f"{unit:.2f}",
                 "budget_amount": f"{budget:.2f}",
             })
+        # 候选/通用档不把模型猜出的单价当作用户事实：多条明细只有总额时，
+        # 分配比例不可观测，必须追问或阻断；兼容档仍保留历史比例缩放以便回滚。
+        if (
+            self._profile_config.strict_runtime_mode
+            and total_explicit is not None
+            and len(out_rows) > 1
+            and not all(explicit_line_amounts)
+        ):
+            return {"error_reason": "insufficient_amount_breakdown"}
         # total：显式总额优先；多行按 LLM 相对比例缩放使 Σ=总额。
         if total_explicit is not None:
             total = total_explicit
             if len(out_rows) > 1:
+                if missing_unit_rows:
+                    if len(missing_unit_rows) == len(out_rows):
+                        return {"error_reason": "insufficient_amount_breakdown"}
+                    known_total = round(sum(
+                        float(r["budget_amount"])
+                        for idx, r in enumerate(out_rows)
+                        if idx not in missing_unit_rows
+                    ), 2)
+                    remaining = round(total_explicit - known_total, 2)
+                    if remaining < -0.01:
+                        return {"error_reason": "amount_total_mismatch"}
+                    qty_total = sum(float(out_rows[idx]["quantity"]) for idx in missing_unit_rows)
+                    if qty_total <= 0:
+                        return {"error_reason": "insufficient_amount_breakdown"}
+                    for idx in missing_unit_rows:
+                        qty = float(out_rows[idx]["quantity"])
+                        budget = round(remaining * qty / qty_total, 2)
+                        out_rows[idx]["unit_price"] = f"{(budget / qty):.2f}"
+                        out_rows[idx]["budget_amount"] = f"{budget:.2f}"
                 s = sum(float(r["budget_amount"]) for r in out_rows)
-                if s > 0:
+                # 每一行都有原文金额时，金额是用户事实，必须守恒；不再
+                # 静默缩放导致 submission 与用户逐行金额不一致。
+                if all(explicit_line_amounts):
+                    if abs(s - total_explicit) > 0.01:
+                        return {"error_reason": "amount_total_mismatch"}
+                elif s > 0:
                     scale = total_explicit / s
                     for r in out_rows:
                         r["budget_amount"] = (
                             f"{round(float(r['budget_amount']) * scale, 2):.2f}"
                         )
+                    # 四舍五入可能让总和差 0.01，余数只落到一个本来
+                    # 没有原文金额的行，避免制造用户明确金额的改写。
+                    rounded_sum = round(sum(float(r["budget_amount"]) for r in out_rows), 2)
+                    delta = round(total_explicit - rounded_sum, 2)
+                    if abs(delta) > 0 and not all(explicit_line_amounts):
+                        for idx in range(len(out_rows) - 1, -1, -1):
+                            if not explicit_line_amounts[idx]:
+                                adjusted = round(float(out_rows[idx]["budget_amount"]) + delta, 2)
+                                if adjusted < 0:
+                                    return {"error_reason": "amount_total_mismatch"}
+                                out_rows[idx]["budget_amount"] = f"{adjusted:.2f}"
+                                break
         else:
             total = round(sum(float(r["budget_amount"]) for r in out_rows), 2)
+        if abs(round(sum(float(r["budget_amount"]) for r in out_rows), 2) - total) > 0.01:
+            return {"error_reason": "amount_total_mismatch"}
         return {"rows": out_rows, "total": f"{total:.2f}"}
 
     def _memory_rebuild(
@@ -2057,20 +2344,43 @@ class BudgetExecutor:
         if total is None or total not in tiers:
             return None
         mem_rows = tiers[total]
-        # 门控 4：LLM 行与记忆档一致 → 不重建（正常流程即可，避免覆盖好行）。
+        # 门控 4：LLM 行与记忆档一致且金额已由用户原文给出 → 不重建，
+        # 正常流程保留逐行事实。若只有物料名而没有任何可观测金额，legacy
+        # 才允许用旧模板补全；candidate/generic 根本不会进入本函数。
         if draft.rows and _rows_match_memory(draft.rows, mem_rows):
-            return None
-        return {"project": project, "wzlb": wzlb, "total": total, "rows": mem_rows}
+            has_explicit_total = self._explicit_total(text, clarified) is not None
+            has_explicit_lines = all(
+                _regex_unit_for_material(text, row.material_name) is not None
+                for row in draft.rows
+            )
+            if has_explicit_total or has_explicit_lines:
+                return None
+        # 兼容档仍保持用户明细顺序；模板本身只提供可回滚的历史候选，
+        # 不能因为其存储顺序改变 Submission 行顺序。
+        ordered_rows = list(mem_rows)
+        if draft.rows:
+            reordered: list[dict[str, Any]] = []
+            remaining = list(mem_rows)
+            for draft_row in draft.rows:
+                name = draft_row.material_name or ""
+                match_idx = next(
+                    (idx for idx, mem_row in enumerate(remaining)
+                     if name == mem_row.get("material_name")
+                     or name in str(mem_row.get("material_name") or "")
+                     or str(mem_row.get("material_name") or "") in name),
+                    None,
+                )
+                if match_idx is not None:
+                    reordered.append(remaining.pop(match_idx))
+            ordered_rows = reordered + remaining if reordered else ordered_rows
+        return {"project": project, "wzlb": wzlb, "total": total, "rows": ordered_rows}
 
     def _submit_verdict(self, text: str) -> bool:
-        """提交/存草稿语义（公司约定动词形态，确定性业务规则）：存草稿优先。
-
-        存草稿用短语（存一个/存个/草稿…）判定——裸「存」会误命中「对象存储」。
-        """
-        t = text or ""
-        if any(w in t for w in _DRAFT_PATTERNS):
-            return False
-        return any(w in t for w in _SUBMIT_PATTERNS)
+        """提交/存草稿语义统一解析；冲突时返回安全的 False，由 execute 阻断。"""
+        speech = parse_speech_act(text)
+        if self._log is not None:
+            self._log.info(f"语气决策: {speech.as_dict()}")
+        return speech.submit
 
     # ------------------------------------------------------------ 工具 --
     def _call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -2085,6 +2395,8 @@ class BudgetExecutor:
                 self._log_warning(f"调用前校验拦截 {name}: {error}")
             return {"error": f"validate_failed: {name}"}
 
+        if self._registry.is_write(name):
+            self._log_info(f"WRITE_PREFLIGHT tool={name} schema=通过 权限=通过 args={args}")
         result = self._env.call_tool(name, args)
         self._history.append((name, args, result))
         if self._context is not None and hasattr(self._context, "ledger"):
@@ -2096,6 +2408,8 @@ class BudgetExecutor:
             )
         if result.get("error"):
             self._log_warning(f"{name} 返回 error: {result['error']}")
+        elif self._registry.is_write(name):
+            self._log_info(f"WRITE_COMMIT tool={name} result={result}")
         return result
 
     def _blocked(self, reason: str) -> dict[str, Any]:
@@ -2162,29 +2476,142 @@ def _refine_search_terms(search_term: str, text: str) -> list[str]:
 
 
 def _regex_qty_for_material(text: str, material: str) -> int | None:
-    """query 里物料前的数量（"2台显示器"→2）；未命中 None。"""
-    idx = text.find(material)
-    if idx <= 0:
+    """query 里物料附近的数量（"2台显示器"/"显示器2台"→2）。"""
+    if not material:
         return None
-    m = re.search(r"([0-9]+)\s*(?:台|个|套|条|支|项|册|批|场)\s*$", text[:idx])
-    return int(m.group(1)) if m else None
+    text = text or ""
+    candidates = [material]
+    bare = re.sub(r"（[^（）]*）|\([^()]*\)", "", material).strip()
+    if bare and bare not in candidates:
+        candidates.append(bare)
+    pattern = r"([0-9]+)\s*(?:台|个|套|条|支|项|册|批|场|件|张|份)"
+    for candidate in candidates:
+        idx = text.find(candidate)
+        if idx < 0:
+            continue
+        before = text[max(0, idx - 24):idx]
+        after = text[idx + len(candidate):idx + len(candidate) + 24]
+        m = re.search(pattern + r"\s*$", before)
+        if m:
+            return int(m.group(1))
+        m = re.match(r"\s*" + pattern, after)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 def _regex_unit_for_material(text: str, material: str) -> float | None:
     """query 里物料相关单价（"每台1500元"→1500、"视频制作3万元"→30000）。"""
     if not material:
         return None
-    # 每X 单价（material 之后或整体）。
-    idx = text.find(material)
-    window = text[max(0, idx - 20): idx + len(material) + 30]
-    m = re.search(r"每(?:台|个|套|条|支|项|册|批|场)?\s*([0-9]+(?:\.[0-9]+)?)\s*万?(?:元|块)?", window)
-    if m:
-        return _to_amount(m.group(1) + ("万" if "万" in m.group(0) else ""))
-    # 单行金额（"X N万/N元"，material 后紧跟金额）。
-    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*万?(?:元)?", text[idx + len(material): idx + len(material) + 12])
-    if m:
-        return _to_amount(m.group(0))
+    text = text or ""
+    # 每X 单价（material 之后或整体）。优先检查物料后的短片段：多明细句中，
+    # 物料前方可能紧邻上一行的金额（例如“视频 1.5 万，发布会 4 万”），
+    # 先看后缀可以避免把上一行的 1.5 万误绑定到“发布会”。
+    candidates = [material]
+    bare = re.sub(r"（[^（）]*）|\([^()]*\)", "", material).strip()
+    if bare and bare not in candidates:
+        candidates.append(bare)
+    for candidate in candidates:
+        idx = text.find(candidate)
+        if idx < 0:
+            continue
+        # 单行金额（"X N万/N元"，material 后紧跟金额）。要求金额单位，
+        # 避免把“视频制作1个”中的数量误认成单价；允许“1个1.5万”及
+        # “2条每条1.5万”这种物料后置写法。
+        after = text[idx + len(candidate): idx + len(candidate) + 48]
+        m = re.match(
+            r"\s*(?:[0-9]+\s*(?:台|个|套|条|支|项|册|批|场|件|张|份))?\s*"
+            r"[，,、；;：:]?\s*"
+            r"(?:每(?:台|个|套|条|支|项|册|批|场|件|张|份)?\s*)?"
+            r"([0-9]+(?:\.[0-9]+)?)\s*(万|元|块)",
+            after,
+        )
+        if m:
+            return _to_amount(m.group(1) + m.group(2))
+        # 金额在物料前（“每台1500元的显示器”）或同一标点片段内时，
+        # 只回看当前片段，不能跨越上一行的中文逗号/分号。
+        start = max(
+            text.rfind("，", max(0, idx - 64), idx),
+            text.rfind(",", max(0, idx - 64), idx),
+            text.rfind("；", max(0, idx - 64), idx),
+            text.rfind(";", max(0, idx - 64), idx),
+            text.rfind("。", max(0, idx - 64), idx),
+            text.rfind("：", max(0, idx - 64), idx),
+            text.rfind(":", max(0, idx - 64), idx),
+        )
+        before = text[start + 1:idx]
+        m = re.search(
+            r"(?:每(?:台|个|套|条|支|项|册|批|场|件|张|份)?\s*)?"
+            r"([0-9]+(?:\.[0-9]+)?)\s*(万|元|块)\s*(?:的)?\s*$",
+            before,
+        )
+        if m:
+            return _to_amount(m.group(1) + m.group(2))
     return None
+
+
+def _has_explicit_line_amounts(text: str, rows: list[BudgetRow]) -> bool:
+    """判断每条 LLM 明细是否能在原文中找到带单位的单价。
+
+    这是 legacy 记忆模板的保护门，不是金额推断：只有原文对每一行都给出可
+    绑定的 ``万/元/块`` 单价时才返回 True。这样“视频 2 条每条 1.5 万，发布会
+    1 场 4 万”不会被无观测的历史模板改写，而只有泛化预算仍可使用兼容记忆。
+    """
+    if not rows:
+        return False
+    return all(
+        _regex_unit_for_material(text, str(row.material_name or "").strip()) is not None
+        for row in rows
+    )
+
+
+# 一个模型合并行包含两个可独立计价的服务概念、而用户只给总额时，
+# 不能把模型猜出的单价静默写入 workflow。这里仅识别可观测的服务词，
+# 不使用 case id、gold 或固定答案；实体物料（如“易拉宝与展架”）不命中。
+_COMPOUND_SERVICE_MARKERS = (
+    "短片", "视频", "设计", "发布会", "会场", "服务", "咨询", "检测", "云", "数据",
+)
+_COMPOUND_CONNECTORS = ("和", "与", "及", "、", "以及")
+
+
+def _ambiguous_total_breakdown(
+    draft: BudgetDraft,
+    text: str,
+    explicit_line_amounts: bool,
+    total_explicit: float | None,
+) -> bool:
+    """判断合并服务行是否缺少可观测的金额拆分依据。
+
+    ``workflow.save`` 的金额必须能回溯到用户事实。兼容档仍保留历史模板，
+    但当本轮只有一个“短片与专题设计”之类的合并服务行和一个总额时，
+    任何数量/单价比例都是不可观测的，应在写入前阻断。实体物料的复合名称
+    不含服务标记，因此不会被此安全门误伤。
+    """
+    if explicit_line_amounts or total_explicit is None or len(draft.rows) != 1:
+        return False
+    name = str(draft.rows[0].material_name or "").strip()
+    if not name or not any(connector in name for connector in _COMPOUND_CONNECTORS):
+        return False
+    hits = {marker for marker in _COMPOUND_SERVICE_MARKERS if marker in name}
+    # 仅检查合并后的物料名；项目名中的“联合路演项目”等宽泛词不能触发。
+    return len(hits) >= 2
+
+
+def _apply_explicit_line_amounts(draft: BudgetDraft, text: str) -> None:
+    """把原文逐行金额/数量写回 draft，覆盖模型猜测但不创造新行。
+
+    物料名仍由模型抽取并由 canonicalize 归一；仅当同名原文存在明确证据时覆盖
+    quantity/unit_price，后续金额守恒与写前证据检查继续由执行器负责。
+    """
+    for row in draft.rows:
+        name = str(row.material_name or "").strip()
+        qty = _regex_qty_for_material(text, name)
+        unit = _regex_unit_for_material(text, name)
+        if qty is not None:
+            row.quantity = str(qty)
+        if unit is not None:
+            row.unit_price = f"{unit:.2f}"
 
 
 def _material_to_category_signal(rows: list[BudgetRow]) -> str:
@@ -2289,11 +2716,29 @@ class BudgetSkill:
         if gateway is not None and gateway.available:
             from utils.llm_gateway import LLMGateway
 
-            planner_gateway = LLMGateway(
-                logger=getattr(self.logger, "child", lambda *_: None)("LLM#2")
-            )
+            planner_logger = getattr(self.logger, "child", lambda *_: None)("LLM#2")
+            try:
+                planner_gateway = LLMGateway(
+                    logger=planner_logger,
+                    trace_context=getattr(gateway, "trace_context", None),
+                    stage="budget_plan",
+                )
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    raise
+                planner_gateway = LLMGateway(logger=planner_logger)
         self.last_planner_gateway = planner_gateway
         draft = self.planner.plan(sub_context, now_iso, mode, planner_gateway)
+        if self.profile_config.strict_runtime_mode and draft.source != "llm":
+            self.last_timings = {
+                "orchestrate_s": round(draft.elapsed_s, 3),
+                "exec_s": 0.0,
+                "skill_total_s": round(time.monotonic() - start, 3),
+            }
+            return {"workflow_draft_result": {
+                "status": "blocked",
+                "reason": "llm_plan_unavailable",
+            }}
 
         # 执行层：确定性流程 SOP（multi_turn 时执行器内部先做多轮澄清）。
         executor = BudgetExecutor(

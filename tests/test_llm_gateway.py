@@ -19,6 +19,7 @@ from utils.llm_gateway import (
     _rejects_json_object,
     _schema_errors,
 )
+from utils.trace_context import TraceContext
 
 # 显式测试配置（非真实密钥）。
 CFG = {
@@ -162,3 +163,19 @@ class TestJsonObjectAdaptation:
         exc.response_text = '{"error":"json_object"}'
         assert _rejects_json_object(exc) is True
         assert _rejects_json_object(ConnectionError()) is False
+
+
+def test_trace_headers_are_forwarded_without_auth() -> None:
+    seen = {}
+
+    class Capture:
+        def chat(self, messages, **kwargs):
+            seen.update(kwargs.get("request_headers") or {})
+            return json.dumps({"task_units": []})
+
+    ctx = TraceContext(case_id="case-1", profile="hybrid_compat")
+    gateway = LLMGateway(config=CFG, backend=Capture(), trace_context=ctx, stage="intent_graph")
+    assert gateway.structured_call("card", {}, SCHEMA, 1.0, None) == {"task_units": []}
+    assert seen["X-Agent-Run-Id"] == ctx.run_id
+    assert seen["X-Agent-Case-Id"] == "case-1"
+    assert "Authorization" not in seen

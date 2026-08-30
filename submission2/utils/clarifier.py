@@ -68,10 +68,21 @@ def clarify_slots(
     if not (hasattr(env, "reply") and callable(getattr(env, "reply"))):
         return {}
     out: dict[str, Any] = {}
+    asked: set[str] = set()
     for spec in specs:
+        # 一个 Task 内每个槽位最多问一次；如果环境返回没有命中的槽位或
+        # 空答复，本轮只记录失败并继续其余独立槽位，不在同一轮自旋。
+        if spec.key in asked:
+            continue
         if not spec.missing(text, out):
             continue
+        asked.add(spec.key)
         r = env.reply(spec.question)
+        if not isinstance(r, dict):
+            continue
         if r.get("resolved_slot") in spec.match_keys():
-            out.update(spec.parse(r.get("user_message") or "", out))
+            message = str(r.get("user_message") or "")
+            parsed = spec.parse(message, out)
+            if parsed:
+                out.update(parsed)
     return out
