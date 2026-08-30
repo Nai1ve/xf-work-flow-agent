@@ -359,6 +359,29 @@ class LLMGateway:
         if self.logger is not None:
             getattr(self.logger, level, lambda _m: None)(message)
 
+    @staticmethod
+    def _audit_text(value: Any, limit: int | None = None) -> str:
+        """把提示词/模型输出压成单行，便于控制台和普通 .log 人工检索。
+
+        默认保留 4000 个字符，足够人工复盘结构化 Prompt 和模型输出；长跑时
+        可用 ``AGENT_LOG_MAX_CHARS`` 调小，避免控制台被单个调用刷屏。日志只接收
+        Prompt/payload/result，不接收认证配置。
+        """
+        if limit is None:
+            try:
+                limit = max(256, int(os.getenv("AGENT_LOG_MAX_CHARS", "4000")))
+            except (TypeError, ValueError):
+                limit = 4000
+        try:
+            if isinstance(value, str):
+                text = value
+            else:
+                text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+        text = " ".join(text.replace("\r", " ").replace("\n", " ").split())
+        return text[:limit] + ("…" if len(text) > limit else "")
+
     # ------------------------------------------------------------ 核心入口 --
     def structured_call(
         self,
@@ -391,6 +414,12 @@ class LLMGateway:
             {"role": "system", "content": prompt_card},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ]
+        # 记录完整的调用意图（提示词和 payload，不含 API key）；内容压成单行，
+        # 便于在 agent_runtime.log 中逐调用回放。模型输出在每次尝试后记录。
+        self._log(
+            "info",
+            f"LLM 请求 prompt={self._audit_text(prompt_card)} payload={self._audit_text(payload)}",
+        )
         last_error: str = "未知错误"
         call_start = time.monotonic()
         # 供应商拒绝 json_object 时，重试降级为纯文本 + 宽容解析（进程级记忆）。
@@ -398,7 +427,9 @@ class LLMGateway:
         result: dict[str, Any] = dict(fallback or {})
         succeeded = False
 
-        for attempt in (1, 2, 3):  # 最多三次（长跑瞬态 API 失败定案：2→3 次提升稳健）
+        # 一次初始请求 + 一次传输重试。多域 case 还要给工具 SOP 留出时间，
+        # 无限重试会把 60s case 上限耗尽；结构化校验失败也只进入这一轮重试。
+        for attempt in (1, 2):
             remaining = self._remaining_s()
             if remaining <= 0:
                 break
@@ -412,6 +443,10 @@ class LLMGateway:
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     require_json_object=use_json_object,
+                )
+                self._log(
+                    "info",
+                    f"LLM 原始输出 attempt={attempt}: {self._audit_text(content)}",
                 )
             except Exception as exc:  # noqa: BLE001 —— 网络/超时/HTTP 错误全部兜底
                 last_error = repr(exc)
@@ -434,6 +469,10 @@ class LLMGateway:
                     else:
                         self._spent_s += time.monotonic() - attempt_start
                         self._log("info", f"LLM 识别成功（第 {attempt} 次）: 耗时 {time.monotonic() - attempt_start:.2f}s")
+                        self._log(
+                            "info",
+                            f"LLM 结构化结果 attempt={attempt}: {self._audit_text(parsed)}",
+                        )
                         result = parsed
                         succeeded = True
                         break

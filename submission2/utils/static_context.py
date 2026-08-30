@@ -29,6 +29,7 @@ SCHEMA_VERSION = "static-context-v1"
 _MANIFEST_FILE = "manifest.json"
 _TOOLS_INDEX_FILE = "tools.index.json"
 _MEETINGROOMS_INDEX_FILE = "meetingrooms.index.json"
+_WORKFLOWS_INDEX_FILE = "workflows.index.json"
 
 
 class StaticContextStore:
@@ -66,6 +67,7 @@ class StaticContextStore:
         self._by_office_id: dict[str, str] = {}
         self._by_building: dict[str, list[str]] = {}
         self._by_campus: dict[str, list[str]] = {}
+        self._workflows: dict[str, Any] = {}
         self._load()
 
     # ------------------------------------------------------------------ 加载 --
@@ -92,9 +94,12 @@ class StaticContextStore:
         self._by_office_id = rooms_index.get("by_office_id") or {}
         self._by_building = rooms_index.get("by_building") or {}
         self._by_campus = rooms_index.get("by_campus") or {}
+        # workflow 索引是 V2 新增的可选资源；老的最小静态 fixture 没有该文件时
+        # 不应在每个 case 输出 warning，也不能影响工具/会议室索引加载。
+        self._workflows = self._load_optional_json(_WORKFLOWS_INDEX_FILE)
         self._log_info(
             f"静态上下文已加载: tools={len(self._tools.get('by_name') or {})} "
-            f"write_tools={len(self._write_tools)} rooms={len(self._rooms)} dir={self.base_dir}"
+                f"write_tools={len(self._write_tools)} rooms={len(self._rooms)} dir={self.base_dir}"
         )
 
     def _load_json(self, filename: str) -> dict[str, Any]:
@@ -106,6 +111,13 @@ class StaticContextStore:
         except (OSError, ValueError):
             self._log_warning(f"静态上下文索引读取失败，跳过: {path}")
             return {}
+
+    def _load_optional_json(self, filename: str) -> dict[str, Any]:
+        """读取可选索引；文件不存在时静默返回空对象。"""
+        path = self.base_dir / filename
+        if not path.exists():
+            return {}
+        return self._load_json(filename)
 
     def _log_info(self, message: str) -> None:
         if self._log is not None:
@@ -139,6 +151,21 @@ class StaticContextStore:
     def is_write(self, name: str) -> bool:
         """name 是否属于写类工具（执行层写操作门禁的先验）。"""
         return name in self._write_tools
+
+    # ------------------------------------------------------------- 流程边界 --
+
+    def workflow_catalog(self) -> list[dict[str, Any]]:
+        """返回静态流程目录；实际可用流程以运行时工具返回为准。"""
+        return list(self._workflows.get("catalog") or [])
+
+    def workflow_schema(self, workflow_id: str | int) -> dict[str, Any] | None:
+        """返回静态 schema 先验（不含 sample_draft 等答案值）。"""
+        value = (self._workflows.get("schemas") or {}).get(str(workflow_id))
+        return value if isinstance(value, dict) else None
+
+    def workflow_options(self, key: str) -> list[dict[str, Any]]:
+        """返回静态 browser 候选；写入前必须用运行时 browser_search 复核。"""
+        return list((self._workflows.get("browser_options") or {}).get(key) or [])
 
     # -------------------------------------------------------------- 会议室 --
 

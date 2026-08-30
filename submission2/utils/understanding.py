@@ -488,34 +488,50 @@ class IntentRecognizer:
 
     @staticmethod
     def _parse_units(raw_units: Any) -> list[TaskUnit]:
-        """把 LLM 原始输出归一为 TaskUnit 列表（非法项丢弃、依赖下标钳制）。"""
+        """把 LLM 原始输出归一为 TaskUnit 列表。
+
+        依赖先按模型原始下标读取，再映射到“合法单元”下标。这样模型偶尔输出
+        一个非法 unit_type 时，不会让后续合法任务错误地依赖自己或依赖另一个
+        不相关任务；最终 DAG 仍会做环检测。
+        """
         if not isinstance(raw_units, list):
             return []
         units: list[TaskUnit] = []
-        n = len(raw_units)
-        for raw in raw_units:
+        raw_index_for_unit: list[int] = []
+        for raw_index, raw in enumerate(raw_units):
             if not isinstance(raw, dict):
                 continue
             unit_type = str(raw.get("unit_type") or "")
             if unit_type not in UNIT_TYPES:
                 continue
-            depends = raw.get("depends_on")
-            if not isinstance(depends, list):
-                depends = []
-            else:
-                depends = [
-                    int(i) for i in depends if isinstance(i, int) or (isinstance(i, str) and i.isdigit())
-                ]
-                # 依赖下标越界 → 丢弃该依赖（不因此丢弃整个单元）。
-                depends = [i for i in depends if 0 <= i < n]
             sub_query = raw.get("sub_query")
             units.append(
                 TaskUnit(
                     unit_type=unit_type,
-                    depends_on=depends,
+                    depends_on=[],
                     sub_query=str(sub_query) if isinstance(sub_query, str) else "",
                 )
             )
+            raw_index_for_unit.append(raw_index)
+
+        raw_to_valid = {raw_index: valid_index for valid_index, raw_index in enumerate(raw_index_for_unit)}
+        for valid_index, raw_index in enumerate(raw_index_for_unit):
+            raw = raw_units[raw_index]
+            depends = raw.get("depends_on") if isinstance(raw, dict) else []
+            if not isinstance(depends, list):
+                depends = []
+            mapped: list[int] = []
+            for value in depends:
+                if isinstance(value, bool):
+                    continue
+                try:
+                    raw_dep = int(value)
+                except (TypeError, ValueError):
+                    continue
+                dep = raw_to_valid.get(raw_dep)
+                if dep is not None and dep != valid_index and dep not in mapped:
+                    mapped.append(dep)
+            units[valid_index].depends_on = mapped
         return units
 
     def _fallback_units(self, user_query: str) -> list[TaskUnit]:

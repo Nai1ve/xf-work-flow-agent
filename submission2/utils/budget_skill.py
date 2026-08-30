@@ -35,6 +35,7 @@ from typing import Any
 from utils.logger import ConsoleLogger
 from utils.static_context import StaticContextStore
 from utils.tool_contract import EffectiveToolRegistry
+from utils.profiles import ExecutionProfile, ProfileConfig
 
 # 预算 plan 单次网络调用超时（秒）。
 _BUDGET_PLAN_TIMEOUT_S = 15.0
@@ -262,6 +263,17 @@ sub_query=先帮我存一个外包数据服务草稿，项目是交付运营产�
 输出：{"category_hint":"品牌广告服务","detail_rows":[{"material_name":"视频制作","subclass_hint":"视频制作","quantity":"2","unit_price":"1.5万"}],"confidence":0.9}
 只输出一个 JSON 对象。"""
 
+# generic_v2 的无样本短 Prompt；兼容档仍使用冻结的现有卡片。
+_BUDGET_PROJECT_CARD_GENERIC = """你是企业费用流程的项目语义解析器。只根据 sub_query 提取 project.search_term 和 project.code_hint。
+search_term 只能是用户原文中的项目语义短语，不能把泛化词单独当项目，也不能创造项目名称；有明确项目编码时填 code_hint。
+不要输出 workflow_id、project_code、wbs_code 或任何工具结果中的 ID；候选项目由程序通过运行时工具校验。
+输出 {"project":{"search_term":"","code_hint":""},"confidence":0.0}，只输出 JSON。"""
+
+_BUDGET_MATERIAL_CARD_GENERIC = """你是企业费用流程的物料语义解析器。只根据 sub_query 提取 category_hint 和 detail_rows。
+category_hint 只保留用户明确的大类语义；detail_rows 只保留用户明确点名且能提取数量/单价的具体物料。
+“一批设备/物资”等宽泛表达不生成虚构明细；不要输出任何字段 ID、枚举值、项目 ID 或工具结果。
+输出 {"category_hint":"","detail_rows":[],"confidence":0.0}，只输出 JSON。"""
+
 
 @dataclass
 class BudgetRow:
@@ -303,13 +315,18 @@ class BudgetPlanner:
     这里输出项目短名 + 大类词 + 明细行（不做公司码表/金额算术）。
     """
 
-    def __init__(self, logger: Any = None) -> None:
+    def __init__(
+        self,
+        logger: Any = None,
+        profile_config: ProfileConfig | None = None,
+    ) -> None:
         """初始化。
 
         Args:
             logger: 可选的 ConsoleLogger（审计用），None 时不输出。
         """
         self.logger = logger
+        self.profile_config = profile_config or ProfileConfig.from_env()
         self.last_draft: BudgetDraft | None = None
 
     def plan(
@@ -378,8 +395,18 @@ class BudgetPlanner:
         rule = self._rule_plan(context)
 
         # --- ① 项目请求（search_term / code_hint）---
+        project_card = (
+            _BUDGET_PROJECT_CARD_GENERIC
+            if self.profile_config.profile == ExecutionProfile.GENERIC_V2
+            else _BUDGET_PROJECT_CARD
+        )
+        material_card = (
+            _BUDGET_MATERIAL_CARD_GENERIC
+            if self.profile_config.profile == ExecutionProfile.GENERIC_V2
+            else _BUDGET_MATERIAL_CARD
+        )
         project_raw = gateway.structured_call(
-            _BUDGET_PROJECT_CARD,
+            project_card,
             payload,
             _BUDGET_PROJECT_SCHEMA,
             timeout_s=_BUDGET_PLAN_TIMEOUT_S,
@@ -397,7 +424,7 @@ class BudgetPlanner:
 
         # --- ② 物料请求（category_hint / detail_rows）---
         mat_raw = gateway.structured_call(
-            _BUDGET_MATERIAL_CARD,
+            material_card,
             payload,
             _BUDGET_MATERIAL_SCHEMA,
             timeout_s=_BUDGET_PLAN_TIMEOUT_S,
@@ -965,6 +992,8 @@ class BudgetExecutor:
         registry: EffectiveToolRegistry,
         static_context: StaticContextStore,
         logger: ConsoleLogger | None = None,
+        profile_config: ProfileConfig | None = None,
+        context: Any = None,
     ) -> None:
         """初始化。
 
@@ -978,6 +1007,8 @@ class BudgetExecutor:
         self._registry = registry
         self._static = static_context
         self._log = logger
+        self._profile_config = profile_config or ProfileConfig.from_env()
+        self._context = context
         self._history: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
 
     # ------------------------------------------------------------ 入口 --
@@ -1021,6 +1052,10 @@ class BudgetExecutor:
         schema = self._workflow_schema(workflow_id)
         if schema is None:
             return self._blocked("schema_unavailable")
+        if self._context is not None and hasattr(self._context, "schema_registry"):
+            self._context.schema_registry.ingest(
+                {"workflow_id": workflow_id, "schema": schema, "name": "费用类物资"}
+            )
 
         # 3) 多轮澄清（仅 multi_turn）：按 query 缺槽逐项 __reply__，采纳答复。
         clarified: dict[str, Any] = {}
@@ -1046,7 +1081,7 @@ class BudgetExecutor:
         # （golden 词在 train+val 只出现在对应 gold-save case，已扫描唯一；
         # 行对但金额错 wf_0233/0060 的 gold 单价/数量是固定模板、query 只给总量，
         # 也走模板覆盖，而非依赖 canon_failed 才触发。）
-        golden = _budget_golden_for(text)
+        golden = _budget_golden_for(text) if self._profile_config.legacy_budget_templates else None
         if golden:
             draft.rows = [
                 BudgetRow(
@@ -1064,7 +1099,7 @@ class BudgetExecutor:
         # （有预算无物料）+ 草稿意图 + _BUDGET_MEMORY 命中 → 用记忆模板确定性
         # 重建。golden 重建后行已规范（canon ok）时**不**进入本块——否则 _memory_rebuild
         # 内部会多一次 project_search，wf_0242 白白多一步 ES 掉分。
-        if canon_failed or not draft.rows:
+        if self._profile_config.legacy_budget_templates and (canon_failed or not draft.rows):
             rebuilt = self._memory_rebuild(draft, text, clarified)
             if rebuilt is not None:
                 project = rebuilt["project"]
@@ -1150,7 +1185,7 @@ class BudgetExecutor:
         #      或给了单行无金额）→ 记忆 (wbs,大类,档) 命中且行与记忆不符 → 用
         #      记忆模板重建。复用上文 3.5b 的确定性保存路径；project 已解析传入，
         #      不再重复 project_search（_memory_rebuild 门控 4 好行不覆盖）。
-        if draft.rows and not canon_failed:
+        if self._profile_config.legacy_budget_templates and draft.rows and not canon_failed:
             rebuilt = self._memory_rebuild(draft, text, clarified, project=project)
             if rebuilt is not None:
                 total_amount = f"{rebuilt['total']:.2f}"
@@ -1448,8 +1483,12 @@ class BudgetExecutor:
         4. >1 结果 → 多阶段消歧（LCS → 物料/大类语义 → 前缀 base → 泛化后缀同 base）。
         """
         # 垃圾行记忆补全已确定的项目（execute 开头清空，取用即清）→ 不再重复 project_search。
-        if self._memory_project is not None:
-            p = self._memory_project
+        # 允许单独调用解析器（单元测试/诊断路径）时没有经过 execute 初始化；
+        # 正式流程仍在 execute 中清空并设置该字段。不能因为诊断入口缺属性而
+        # 让整个 case 顶层兜底。
+        memory_project = getattr(self, "_memory_project", None)
+        if memory_project is not None:
+            p = memory_project
             self._memory_project = None
             return p
 
@@ -2048,6 +2087,13 @@ class BudgetExecutor:
 
         result = self._env.call_tool(name, args)
         self._history.append((name, args, result))
+        if self._context is not None and hasattr(self._context, "ledger"):
+            self._context.ledger.add(
+                "tool_result",
+                name,
+                {"args": args, "result": result},
+                provenance="runtime_tool",
+            )
         if result.get("error"):
             self._log_warning(f"{name} 返回 error: {result['error']}")
         return result
@@ -2187,14 +2233,19 @@ class BudgetSkill:
       供入口层多域合并。
     """
 
-    def __init__(self, logger: Any = None) -> None:
+    def __init__(
+        self,
+        logger: Any = None,
+        profile_config: ProfileConfig | None = None,
+    ) -> None:
         """初始化。
 
         Args:
             logger: 可选的 ConsoleLogger。
         """
         self.logger = logger
-        self.planner = BudgetPlanner(logger=logger)
+        self.profile_config = profile_config or ProfileConfig.from_env()
+        self.planner = BudgetPlanner(logger=logger, profile_config=self.profile_config)
         self.last_timings: dict[str, Any] = {}
         self.last_planner_gateway: Any = None
 
@@ -2209,6 +2260,7 @@ class BudgetSkill:
         registry: EffectiveToolRegistry,
         static_context: StaticContextStore,
         multi_domain: bool = False,
+        context: Any = None,
     ) -> dict[str, Any]:
         """执行预算域：编排（LLM#2）→ 执行（确定性 SOP）。
 
@@ -2228,7 +2280,7 @@ class BudgetSkill:
             {"workflow_draft_result": {...}}；永不返回 None。
         """
         start = time.monotonic()
-        context = "\n".join(
+        sub_context = "\n".join(
             [s for s in budget_subs if (s or "").strip()]
         ).strip() or user_query
 
@@ -2241,13 +2293,20 @@ class BudgetSkill:
                 logger=getattr(self.logger, "child", lambda *_: None)("LLM#2")
             )
         self.last_planner_gateway = planner_gateway
-        draft = self.planner.plan(context, now_iso, mode, planner_gateway)
+        draft = self.planner.plan(sub_context, now_iso, mode, planner_gateway)
 
         # 执行层：确定性流程 SOP（multi_turn 时执行器内部先做多轮澄清）。
-        executor = BudgetExecutor(env, registry, static_context, logger=self.logger)
+        executor = BudgetExecutor(
+            env,
+            registry,
+            static_context,
+            logger=self.logger,
+            profile_config=self.profile_config,
+            context=context,
+        )
         result = executor.execute(
             draft,
-            context,
+            sub_context,
             user_query,
             now_iso,
             mode=mode,

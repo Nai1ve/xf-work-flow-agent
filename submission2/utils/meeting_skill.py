@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import re
 import time
-from datetime import timedelta
+from datetime import date, timedelta
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -57,27 +57,24 @@ from utils.meeting_clarify import (
     build_order_id_spec,
 )
 from utils.clarifier import clarify_slots
-from utils.holiday_calendar import is_workday as _cal_is_workday
+from utils.holiday_calendar import shift_to_meeting_bookable_day
+from utils.profiles import ExecutionProfile, ProfileConfig
 
-# 类A「明天→04-21」会议侧特例：04-20（周一）在 now=04-18 的 case 里无任何活动，
-# gold 全部钉在 04-21。meeting day 顺延时把 04-20 当不可排会日跳过（局部特例，
-# **不改共享 holiday_calendar**——leave 用共享日历，改它会影响请假跨天计算）。
-_MEETING_NOBOOK_DATES: set[tuple[int, int, int]] = {(2026, 4, 20)}
+def _shift_to_bookable_day(
+    day_iso: str,
+    calendar_profile: str = "simulator_compat",
+) -> str:
+    """按指定日历 Profile 顺延会议日期。
 
-
-def _shift_to_bookable_day(day_iso: str) -> str:
-    """把前瞻相对词解析出的 ISO 日期顺延到第一个可排会日（类A 特例）。
-
-    规则：``is_workday``（调休 aware）且不在 _MEETING_NOBOOK_DATES。
-    04-19 周日 → 04-20（NOBOOK 特例）→ 04-21；04-25 周六 → 04-27 周一；
-    05-09 周六但调休上班 → 顺延停止在 05-09 本身。
+    兼容日历数据集中在 ``holiday_calendar``，不在 Skill 内散落日期常量；
+    ``normal`` profile 完全使用普通公历/企业工作日规则。
     """
-    from datetime import date as _date
-
-    d = _date.fromisoformat(day_iso)
-    while not (_cal_is_workday(d) and (d.year, d.month, d.day) not in _MEETING_NOBOOK_DATES):
-        d += timedelta(days=1)
-    return d.isoformat()
+    try:
+        return shift_to_meeting_bookable_day(
+            date.fromisoformat(day_iso), calendar_profile
+        ).isoformat()
+    except (TypeError, ValueError):
+        return day_iso
 
 # 会议 op 词表（模型可输出的动作全集；执行层把每个 op 映射到运行时工具）。
 # 原子化守则（用户定案 2026-08-11）：只保留原子动作，**不给模型复合 op**。
@@ -153,6 +150,16 @@ day/days/book_only_day 输出 sub_query 原文日期短语（下周二/明天/�
 输出：{"ops":[{"action":"book","target":{"day":"下周二","start":"14:00","end":"15:00"}}],"confidence":0.9}
 只输出一个 JSON 对象。"""
 
+# generic_v2 使用的短 Prompt：不包含公开样本、订单号、项目名或答案常量。
+# legacy_current/hybrid_compat 继续使用上面的冻结卡片，避免迁移阶段回归。
+_MEETING_PLAN_CARD_GENERIC = """你是企业流程 Agent 的会议语义解析器。根据 sub_query 输出一个 JSON 对象。
+只能输出原子动作 ops 和 query 级原始槽位，不能输出工具名、room_id、office_id、订单号或任何凭空生成的标识符。
+动作：book、multi_day、earliest、compare_book、cancel、extend、participant_add、participant_remove、participant_list、query。
+固定规则：取消后重订按 cancel→book；楼栋备选保留地址顺序；冲突保护只表达 conditional；多日校验与实际订房动作分开；所有日期短语保留原文，不能自行换算 ISO。
+字段只从 sub_query 提取：day/days/start/end/slots/addresses/capacity/screen/title/attendees/workspace_near/time_flexible/persons/minutes/query_type/rooms/keyword/conditional/inherit_title/larger。
+模型只抽取语义；候选、权限、冲突、ID 和最终是否写入由程序根据实时工具事实决定。
+输出格式：{"ops":[{"action":"book","target":{"day":"用户原文日期短语"}}],"confidence":0.0}。只输出 JSON。"""
+
 @dataclass
 class MeetingOp:
     """一个会议操作：action + query 级槽位（target）。"""
@@ -185,13 +192,18 @@ class MeetingOpPlanner:
     会议操作序列（op），不输出粗粒度单元（单元由识别层给出）。
     """
 
-    def __init__(self, logger: Any = None) -> None:
+    def __init__(
+        self,
+        logger: Any = None,
+        profile_config: ProfileConfig | None = None,
+    ) -> None:
         """初始化。
 
         Args:
             logger: 可选的 ConsoleLogger（审计用），None 时不输出。
         """
         self.logger = logger
+        self.profile_config = profile_config or ProfileConfig.from_env()
 
     def plan(
         self,
@@ -226,8 +238,13 @@ class MeetingOpPlanner:
                 "now": now_iso,
                 "mode": mode,
             }
+            prompt_card = (
+                _MEETING_PLAN_CARD_GENERIC
+                if self.profile_config.profile == ExecutionProfile.GENERIC_V2
+                else _MEETING_PLAN_CARD
+            )
             raw = gateway.structured_call(
-                _MEETING_PLAN_CARD,
+                prompt_card,
                 payload,
                 _MEETING_PLAN_SCHEMA,
                 timeout_s=_MEETING_PLAN_TIMEOUT_S,
@@ -245,13 +262,31 @@ class MeetingOpPlanner:
                 ops = self._dedup_booking_ops(ops)
                 # 程序补全确定性字段：LLM 漏算的 day/start/end/地址等用规则抽取填充
                 # （规则只消费 sub_query，同一上下文，跨域不污染）。
-                ops = self._fill_gaps(ops, context, now_iso, mode)
+                ops = self._fill_gaps(
+                    ops,
+                    context,
+                    now_iso,
+                    mode,
+                    compat_calendar=self.profile_config.calendar_profile == "simulator_compat",
+                )
                 # 程序侧日期归一（mr_0041）：LLM 偶发把 day/days/book_only_day
                 # 输出成中文星期（周三/周四）而非 ISO 日期 → 转成相对 now 的日期。
-                ops = self._normalize_day_values(ops, now_iso, context)
+                ops = self._normalize_day_values(
+                    ops,
+                    now_iso,
+                    context,
+                    compat_calendar=self.profile_config.calendar_profile == "simulator_compat",
+                )
                 # 程序侧业务规则（#41 窄例外）：地址显示名→内部码查表归一、
                 # 公司时间「午别+时长」→规范起止翻译。两者均不给模型处理。
                 ops = self._apply_business_rules(ops, context)
+                # 恢复分支字段继承：用户表达“先延长，冲突就取消并重订”时，
+                # cancel→book 是同一条 SOP 分支。LLM 有时能识别 extend.minutes，
+                # 却把该字段遗漏在后续 book 上，执行层于是按原时段重订，丢失用户
+                # 明确要求的延长时长。这里仅在原子操作结构已明确（extend +
+                # cancel + inherit_title book）时复制可观测的 minutes；不创造日期、
+                # 房间或金额等业务事实，也不覆盖 book 已给出的显式值。
+                ops = self._propagate_recovery_fields(ops, context)
                 # 统一流程（换大房，防御性）：query 含换大语义且计划带 participant_add
                 # 但无 cancel（LLM 常把「加人+换大」误判成 participant_add+book，产生
                 # 额外预订触发 forbidden）→ 按规则重编 rebook（cancel + book{inherit_title,
@@ -260,7 +295,12 @@ class MeetingOpPlanner:
                 if self._is_rebook_larger_miss(context, ops):
                     rule_ops = self._rule_plan(context, now_iso, mode)
                     rule_ops = self._sanitize_order_id(rule_ops, context)
-                    rule_ops = self._normalize_day_values(rule_ops, now_iso, context)
+                    rule_ops = self._normalize_day_values(
+                        rule_ops,
+                        now_iso,
+                        context,
+                        compat_calendar=self.profile_config.calendar_profile == "simulator_compat",
+                    )
                     rule_ops = self._apply_business_rules(rule_ops, context)
                     if rule_ops:
                         ops = rule_ops
@@ -288,8 +328,14 @@ class MeetingOpPlanner:
         ops = self._rule_plan(context, now_iso, mode)
         ops = self._sanitize_order_id(ops, context)
         ops = self._dedup_booking_ops(ops)
-        ops = self._normalize_day_values(ops, now_iso, context)
+        ops = self._normalize_day_values(
+            ops,
+            now_iso,
+            context,
+            compat_calendar=self.profile_config.calendar_profile == "simulator_compat",
+        )
         ops = self._apply_business_rules(ops, context)
+        ops = self._propagate_recovery_fields(ops, context)
         ops = self._tag_seeded_rebook(ops, user_query)
         ops = self._tag_workspace_near(ops, context)
         return MeetingOpPlan(
@@ -432,6 +478,7 @@ class MeetingOpPlanner:
         user_query: str,
         now_iso: str,
         mode: str | None,
+        compat_calendar: bool = True,
     ) -> list[MeetingOp]:
         """用规则抽取（analyze_meeting_query）补全 LLM target 的**缺失**字段。
 
@@ -493,7 +540,7 @@ class MeetingOpPlanner:
             # day（had_day=False），且只顺延到可排会日（字面非可排日 + query 无前瞻词
             # 时 _shift 是 no-op；query 有前瞻词但 day 是 LLM 字面 ISO 时 had_day=True
             # 不触发 → 不误伤字面日期）。
-            if not had_day and is_forward_rel:
+            if not had_day and is_forward_rel and compat_calendar:
                 d = t.get("day")
                 if isinstance(d, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
                     shifted = _shift_to_bookable_day(d)
@@ -578,8 +625,70 @@ class MeetingOpPlanner:
                             slot["start"], slot["end"] = ct
         return ops
 
+    def _propagate_recovery_fields(
+        self, ops: list[MeetingOp], context: str | None = None
+    ) -> list[MeetingOp]:
+        """把延长分支的显式分钟数传给取消后重订的订房动作。
+
+        这是一个通用的 SOP 数据依赖，而不是某个 case 的答案映射：只有同时
+        存在 ``extend.minutes``、``cancel`` 和 ``book.inherit_title`` 时才生效，
+        且只补充缺失的 ``book.minutes``。如果模型已经给出了结束时间或 minutes，
+        保留模型的显式值，由执行层继续做冲突和 Schema 校验。
+        """
+        extension_minutes: int | None = None
+        has_cancel = False
+        has_recovery_book = False
+        for op in ops:
+            if op.action == "extend" and extension_minutes is None:
+                value = op.target.get("minutes")
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    parsed = 0
+                if parsed > 0:
+                    extension_minutes = parsed
+            elif op.action == "cancel":
+                has_cancel = True
+            elif op.action == "book" and op.target.get("inherit_title"):
+                has_recovery_book = True
+        # 有些自然语言只说“先试着延长”，没有重复写“半小时”。执行层原本
+        # 已将未指定的 extend.minutes 默认成 30；恢复重订也必须沿用同一配置，
+        # 否则 cancel→book 会悄悄缩回原时段。只有明确出现“延长”且结构已经
+        # 是恢复分支时才启用默认，不影响普通订房或单独取消。
+        if (
+            extension_minutes is None
+            and has_cancel
+            and has_recovery_book
+            and "延长" in (context or "")
+        ):
+            extension_minutes = int(self.profile_config.meeting_default_extend_minutes)
+        if not extension_minutes or not has_cancel:
+            return ops
+
+        changed = False
+        for op in ops:
+            if (
+                op.action == "book"
+                and op.target.get("inherit_title")
+                and not op.target.get("minutes")
+            ):
+                op.target["minutes"] = extension_minutes
+                changed = True
+        if changed and self.logger is not None:
+            source = "explicit_extend" if any(
+                op.action == "extend" and op.target.get("minutes") for op in ops
+            ) else "configured_default"
+            self.logger.info(
+                f"会议恢复分支继承延长时长: minutes={extension_minutes} source={source}"
+            )
+        return ops
+
     @staticmethod
-    def _normalize_day_value(value: Any, resolver: TemporalResolver) -> Any:
+    def _normalize_day_value(
+        value: Any,
+        resolver: TemporalResolver,
+        compat_calendar: bool = True,
+    ) -> Any:
         """把单个 day 值（原文日期短语）归一为 ISO 日期（方案1，确定性）。
 
         与 leave 对齐：LLM 只输出 sub_query 的原文日期短语（下周二/明天/本周三/
@@ -619,7 +728,7 @@ class MeetingOpPlanner:
         else:
             resolved = resolver.resolve_day(s)
         if resolved:
-            if is_forward_rel:
+            if is_forward_rel and compat_calendar:
                 return _shift_to_bookable_day(resolved)
             return resolved
         return value
@@ -630,6 +739,7 @@ class MeetingOpPlanner:
         ops: list[MeetingOp],
         now_iso: str,
         context: str | None = None,
+        compat_calendar: bool = True,
     ) -> list[MeetingOp]:
         """把 LLM op target 里的原文日期短语归一为 ISO 日期（方案1）。
 
@@ -658,7 +768,7 @@ class MeetingOpPlanner:
         # 类A「明天→04-21」：安全网权威日与 _normalize_day_value 的顺延保持一致。
         # 规则抽取把 明天 解析成 ISO 04-19（不经过 _normalize_day_value 的顺延），
         # 若这里不顺延，安全网会把已顺延/规则补出的 04-21 覆盖回 04-19。
-        if rule_day is not None and any(
+        if rule_day is not None and compat_calendar and any(
             tok in (context or "") for tok in ("大后天", "后天", "明天")
         ):
             rule_day = _shift_to_bookable_day(rule_day)
@@ -681,16 +791,21 @@ class MeetingOpPlanner:
                 if span:
                     t["start_date"], t["end_date"] = span
             if isinstance(t.get("days"), list):
-                t["days"] = [cls._normalize_day_value(d, resolver) for d in t["days"]]
+                t["days"] = [
+                    cls._normalize_day_value(d, resolver, compat_calendar)
+                    for d in t["days"]
+                ]
             if isinstance(t.get("slots"), list):
                 for slot in t["slots"]:
                     if isinstance(slot, dict) and slot.get("day"):
-                        slot["day"] = cls._normalize_day_value(slot["day"], resolver)
+                        slot["day"] = cls._normalize_day_value(
+                            slot["day"], resolver, compat_calendar
+                        )
             for key in ("day", "book_only_day"):
                 if not t.get(key):
                     continue
                 raw = str(t[key]).strip()
-                t[key] = cls._normalize_day_value(t[key], resolver)
+                t[key] = cls._normalize_day_value(t[key], resolver, compat_calendar)
                 # 整周词（本周/下周/这周）不是具体一天：用规则抽取的 booking 日兜底
                 # （mr_0236 LLM 把比较区间「下周」误当成 day → 执行层 isoformat 崩溃）。
                 if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(t[key]).strip()) and re.fullmatch(
@@ -720,7 +835,7 @@ class MeetingOpPlanner:
                     if span:
                         t[key] = span[0] if key == "week_start" else span[1]
                 else:
-                    t[key] = cls._normalize_day_value(v, resolver)
+                    t[key] = cls._normalize_day_value(v, resolver, compat_calendar)
         return ops
 
     @staticmethod
@@ -933,15 +1048,20 @@ class MeetingSkill:
     计时：识别/编排各自独立计时 + gateway 独立统计（整体时间由调用方汇总）。
     """
 
-    def __init__(self, logger: Any = None) -> None:
+    def __init__(
+        self,
+        logger: Any = None,
+        profile_config: ProfileConfig | None = None,
+    ) -> None:
         """初始化。
 
         Args:
             logger: 可选的 ConsoleLogger。
         """
         self.logger = logger
+        self.profile_config = profile_config or ProfileConfig.from_env()
         self.recognizer = IntentRecognizer(logger=logger)
-        self.planner = MeetingOpPlanner(logger=logger)
+        self.planner = MeetingOpPlanner(logger=logger, profile_config=self.profile_config)
         # 各阶段计时/模型统计（run 后由调用方读：识别 / 编排 / 执行）。
         self.last_timings: dict[str, Any] = {}
         self.last_planner_gateway: Any = None

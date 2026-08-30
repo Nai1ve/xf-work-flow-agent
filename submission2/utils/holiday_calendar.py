@@ -48,6 +48,13 @@ _MAKEUP_WORKDAYS_2026 = {
 # 时长口径总开关（见模块 docstring）。
 DURATION_MODE = "raw"  # "raw" | "workday" | "calendar"
 
+# 评测兼容日历中的会议不可排日期。该集合只属于
+# ``simulator_compat`` profile，不影响请假工作日计算，也不进入 generic 业务规则。
+# 运行时是否采用它由 ProfileConfig.calendar_profile 决定。
+SIMULATOR_COMPAT_NOBOOK_DATES: frozenset[date] = frozenset({
+    date(2026, 4, 20),
+})
+
 _holidays: set[date] | None = None
 _makeup: set[date] | None = None
 
@@ -82,6 +89,35 @@ def is_workday(d: date) -> bool:
     if d in _holidays:
         return False
     return d.weekday() < 5
+
+
+def is_meeting_bookable_day(d: date, profile: str = "normal") -> bool:
+    """判断会议搜索日是否可排会。
+
+    ``normal`` 只按企业工作日/节假日；``simulator_compat`` 额外应用评测环境
+    的兼容日历。兼容日期是 profile 数据，不改变通用公历或 leave duration。
+    """
+    if not is_workday(d):
+        return False
+    if profile == "simulator_compat" and d in SIMULATOR_COMPAT_NOBOOK_DATES:
+        return False
+    return True
+
+
+def next_meeting_bookable_day(day: date, profile: str = "normal") -> date:
+    """返回 day 之后第一个可排会日（不含 day）。"""
+    candidate = day + timedelta(days=1)
+    while not is_meeting_bookable_day(candidate, profile):
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def shift_to_meeting_bookable_day(day: date, profile: str = "normal") -> date:
+    """把日期顺延到当前日或之后第一个可排会日。"""
+    candidate = day
+    while not is_meeting_bookable_day(candidate, profile):
+        candidate += timedelta(days=1)
+    return candidate
 
 
 def count_workdays(a: date, b: date) -> int:

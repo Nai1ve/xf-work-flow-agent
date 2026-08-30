@@ -132,6 +132,10 @@ class ToolContractReconciler:
                 runtime_spec.get("args_schema") or static_spec.get("args_schema") or {}
             ),
             "write": self._static.is_write(name),
+            # risk/cost 是离线编译的调度提示；合法性和实际步数仍由运行时
+            # schema / runner budget 决定，不能用它们替代工具校验。
+            "risk": static_spec.get("risk") or ("high" if self._static.is_write(name) else "low"),
+            "cost": static_spec.get("cost") or (2 if self._static.is_write(name) else 1),
             "contract_source": (
                 "runtime+static" if self._static.is_known_tool(name) else "runtime_unmapped"
             ),
@@ -287,3 +291,10 @@ class EffectiveToolRegistry:
             "disabled": sorted(self._disabled),
             "schema_changed": sorted(self._changed),
         }
+
+
+# V2 对外契约名称；实现仍由 EffectiveToolRegistry 承担，避免两套门禁漂移。
+ToolRegistry = EffectiveToolRegistry
+
+
+__all__ = ["ToolContractReconciler", "EffectiveToolRegistry", "ToolRegistry"]

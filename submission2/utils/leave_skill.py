@@ -37,6 +37,7 @@ from utils.logger import ConsoleLogger
 from utils.static_context import StaticContextStore
 from utils.tool_contract import EffectiveToolRegistry
 from utils.understanding import CONFIDENCE_FLOOR, TemporalResolver
+from utils.profiles import CompatibilityPolicy, ExecutionProfile, ProfileConfig
 
 # 请假 plan 单次网络调用超时（秒），还会被 case 级 LLM 预算二次收窄。
 _LEAVE_PLAN_TIMEOUT_S = 15.0
@@ -103,6 +104,14 @@ schedule 请假时间段数组（必填，≥1 项）。每项：
 输出：{"leave_type_hint":"事假","reason_hint":"有点私事","approver_hint":"王芳","schedule":[{"day_phrase":"下周二","end_day_phrase":"","start_hm":"16:00","end_hm":"18:00","full_day":false}],"confidence":0.9}
 只输出一个 JSON 对象。"""
 
+# generic_v2 的短结构化 Prompt；legacy_current/hybrid_compat 使用冻结卡片，
+# 以便在迁移阶段不改变当前线上行为。
+_LEAVE_DRAFT_CARD_GENERIC = """你是企业流程 Agent 的请假语义解析器。只根据 sub_query 输出 JSON。
+提取原文中的 leave_type_hint、reason_hint、approver_hint、approver_dept 和 schedule；schedule 每项包含 day_phrase、end_day_phrase、start_hm、end_hm、full_day。
+日期和时间保留用户原文语义，不输出绝对日期、用户 ID、workflow ID、原因码或审批人 ID。
+不要自行决定提交、草稿、时长口径或审批人；这些由程序根据 Schema、用户操作语气和实时候选决定。
+缺失字段使用空字符串或空数组，不能编造；只输出符合 schema 的 JSON。"""
+
 
 @dataclass
 class LeaveDraft:
@@ -140,13 +149,18 @@ class LeavePlanner:
     这里输出请假原始槽位（不做公司码表/时间翻译），不输出操作序列。
     """
 
-    def __init__(self, logger: Any = None) -> None:
+    def __init__(
+        self,
+        logger: Any = None,
+        profile_config: ProfileConfig | None = None,
+    ) -> None:
         """初始化。
 
         Args:
             logger: 可选的 ConsoleLogger（审计用），None 时不输出。
         """
         self.logger = logger
+        self.profile_config = profile_config or ProfileConfig.from_env()
         self.last_draft: LeaveDraft | None = None
 
     def plan(
@@ -196,8 +210,13 @@ class LeavePlanner:
             "now": now_iso,
             "mode": mode,
         }
+        prompt_card = (
+            _LEAVE_DRAFT_CARD_GENERIC
+            if self.profile_config.profile == ExecutionProfile.GENERIC_V2
+            else _LEAVE_DRAFT_CARD
+        )
         raw = gateway.structured_call(
-            _LEAVE_DRAFT_CARD,
+            prompt_card,
             payload,
             _LEAVE_DRAFT_SCHEMA,
             timeout_s=_LEAVE_PLAN_TIMEOUT_S,
@@ -523,6 +542,8 @@ class LeaveExecutor:
         registry: EffectiveToolRegistry,
         static_context: StaticContextStore,
         logger: ConsoleLogger | None = None,
+        profile_config: ProfileConfig | None = None,
+        context: Any = None,
     ) -> None:
         """初始化。
 
@@ -536,6 +557,9 @@ class LeaveExecutor:
         self._registry = registry
         self._static = static_context
         self._log = logger
+        self._profile_config = profile_config or ProfileConfig.from_env()
+        self._policy = CompatibilityPolicy(self._profile_config, logger=logger)
+        self._context = context
         self._history: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
 
     # ------------------------------------------------------------ 入口 --
@@ -578,6 +602,10 @@ class LeaveExecutor:
         schema = self._workflow_schema(workflow_id)
         if schema is None:
             return self._blocked("schema_unavailable")
+        if self._context is not None and hasattr(self._context, "schema_registry"):
+            self._context.schema_registry.ingest(
+                {"workflow_id": workflow_id, "schema": schema, "name": "请假"}
+            )
 
         # 多轮澄清（仅 multi_turn，单轮 case 不受影响）：schema 后按 gold 句式
         # 逐项 __reply__，用用户答复补全起止/类型/原因/审批人，再走确定性 SOP。
@@ -653,9 +681,18 @@ class LeaveExecutor:
         explicit_draft = has_draft_word and not no_draft
         explicit_submit = bool(re.search(r"提交", text)) and not negate_submit
         event_leave = bool(re.search(r"婚假|结婚|丧假|丧事|陪产假|产假|生育", text))
-        submit = explicit_submit or (
-            (not explicit_draft) and event_leave and not negate_submit
+        decision = self._policy.decide(
+            "submit_or_draft",
+            semantic_context={
+                "explicit_negative": negate_submit or no_draft,
+                "draft_requested": explicit_draft,
+                "submit_requested": explicit_submit or no_draft,
+                "event_leave_default": event_leave,
+            },
         )
+        if self._context is not None and hasattr(self._context, "record_policy"):
+            self._context.record_policy(decision)
+        submit = bool(decision.selected_value)
 
         # 9) 保存（每周反复 → 多次保存；drafts[-1] 为最后一次）。
         count = 0
@@ -669,7 +706,7 @@ class LeaveExecutor:
                 "leave_type": leave_type,
                 "reason": reason,
                 "approver": approver["user_id"],
-                "duration": duration_for_leave(start_full, end_full, leave_type),
+                "duration": self._duration_for(start_full, end_full, text, leave_type),
             }
             if attachment:
                 data["attachment"] = attachment
@@ -696,7 +733,7 @@ class LeaveExecutor:
             "end_time": last_end,
             "leave_type": leave_type,
             "reason": reason,
-            "duration": duration_for_leave(last_start, last_end, leave_type),
+            "duration": self._duration_for(last_start, last_end, text, leave_type),
             "count": count,
             "approver": approver["user_id"],
         }
@@ -706,6 +743,51 @@ class LeaveExecutor:
         if attachment:
             result["attachment"] = attachment
         return {"workflow_draft_result": result}
+
+    def _duration_for(
+        self,
+        start_full: str,
+        end_full: str,
+        text: str,
+        leave_type: str | None,
+    ) -> float:
+        """按显式用户口径选择时长计算器。
+
+        Hybrid/legacy 保留当前 raw 默认，只有用户明确提出工作日/自然日时才切换；
+        generic 额外接受明确的小时数。这样不再把假种类当作时长口径，也不会把
+        数据集中的批次差异扩散到默认路径。
+        """
+        value = text or ""
+        explicit_workday = bool(re.search(r"排除[^。；，,]*(?:周末|节假|假期)|按工作日|工作日计算", value))
+        explicit_calendar = bool(re.search(r"自然日|连续[^。；，,]{0,8}天", value))
+        explicit_hours = bool(re.search(r"共\s*[一两二三四五六七八九十\d.]+\s*小时", value))
+        mode = "raw"
+        if explicit_workday:
+            mode = "workday"
+        elif explicit_calendar:
+            mode = "calendar"
+        elif explicit_hours and self._profile_config.profile == ExecutionProfile.GENERIC_V2:
+            match = re.search(r"共\s*([一两二三四五六七八九十\d.]+)\s*小时", value)
+            if match:
+                try:
+                    return float(_cn_num(match.group(1)))
+                except (TypeError, ValueError):
+                    pass
+        decision = self._policy.decide(
+            "leave_duration_mode",
+            semantic_context={
+                "explicit_workday_policy": explicit_workday,
+                "explicit_calendar_policy": explicit_calendar,
+                "explicit_hours": explicit_hours and self._profile_config.profile == ExecutionProfile.GENERIC_V2,
+                "leave_type": leave_type,
+            },
+        )
+        if self._context is not None and hasattr(self._context, "record_policy"):
+            self._context.record_policy(decision)
+        selected = mode if mode != "raw" else str(decision.selected_value or "raw")
+        if selected in {"workday", "calendar"}:
+            return duration_for(start_full, end_full, selected)
+        return duration_for(start_full, end_full, "raw")
 
     # ------------------------------------------------------ SOP 步骤 --
     def _current_user(self) -> dict[str, Any] | None:
@@ -1280,6 +1362,13 @@ class LeaveExecutor:
 
         result = self._env.call_tool(name, args)
         self._history.append((name, args, result))
+        if self._context is not None and hasattr(self._context, "ledger"):
+            self._context.ledger.add(
+                "tool_result",
+                name,
+                {"args": args, "result": result},
+                provenance="runtime_tool",
+            )
         if result.get("error"):
             self._log_warning(f"{name} 返回 error: {result['error']}")
         return result
@@ -1402,14 +1491,19 @@ class LeaveSkill:
       booking_result + workflow_draft_result）。
     """
 
-    def __init__(self, logger: Any = None) -> None:
+    def __init__(
+        self,
+        logger: Any = None,
+        profile_config: ProfileConfig | None = None,
+    ) -> None:
         """初始化。
 
         Args:
             logger: 可选的 ConsoleLogger。
         """
         self.logger = logger
-        self.planner = LeavePlanner(logger=logger)
+        self.profile_config = profile_config or ProfileConfig.from_env()
+        self.planner = LeavePlanner(logger=logger, profile_config=self.profile_config)
         self.last_timings: dict[str, Any] = {}
         self.last_planner_gateway: Any = None
 
@@ -1424,6 +1518,7 @@ class LeaveSkill:
         registry: EffectiveToolRegistry,
         static_context: StaticContextStore,
         multi_domain: bool = False,
+        context: Any = None,
     ) -> dict[str, Any]:
         """执行请假域：编排（LLM#2）→ 执行（确定性 SOP）。
 
@@ -1443,7 +1538,7 @@ class LeaveSkill:
             {"workflow_draft_result": {...}}；永不返回 None。
         """
         start = time.monotonic()
-        context = "\n".join(
+        sub_context = "\n".join(
             [s for s in leave_subs if (s or "").strip()]
         ).strip() or user_query
 
@@ -1456,15 +1551,20 @@ class LeaveSkill:
                 logger=getattr(self.logger, "child", lambda *_: None)("LLM#2")
             )
         self.last_planner_gateway = planner_gateway
-        draft = self.planner.plan(context, now_iso, mode, planner_gateway)
+        draft = self.planner.plan(sub_context, now_iso, mode, planner_gateway)
 
         # 执行层：确定性流程 SOP（multi_turn 时执行器内部先做多轮澄清）。
         executor = LeaveExecutor(
-            env, registry, static_context, logger=self.logger
+            env,
+            registry,
+            static_context,
+            logger=self.logger,
+            profile_config=self.profile_config,
+            context=context,
         )
         result = executor.execute(
             draft,
-            context,
+            sub_context,
             user_query,
             now_iso,
             mode=mode,

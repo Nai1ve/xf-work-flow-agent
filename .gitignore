@@ -26,6 +26,8 @@ reports/
 submission*.zip
 submit_*.zip
 submission/submission/
+submission2/dist/
+submission2/*.log
 
 # Local development environment.
 .venv/

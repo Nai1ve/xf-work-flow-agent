@@ -1,0 +1,431 @@
+{
+  "schema_version": "static-context-v1",
+  "counts": {
+    "workflows": 2,
+    "schemas": 2,
+    "option_sets": 4
+  },
+  "catalog": [
+    {
+      "workflow_id": 72247,
+      "name": "001-1 请假申请"
+    },
+    {
+      "workflow_id": 34747,
+      "name": "007-2费用类物资申请（过渡）"
+    }
+  ],
+  "schemas": {
+    "72247": {
+      "required_fields": [
+        "applicant",
+        "applicant_no",
+        "start_time",
+        "end_time",
+        "leave_type",
+        "reason",
+        "approver",
+        "duration"
+      ],
+      "field_descriptions": {
+        "applicant": "申请人 user_id，通过 user.get_info 查当前用户，再用 workflow.search_person 获取 user_id",
+        "applicant_no": "申请人工号，通过 workflow.search_person 返回的 employee_no 填入",
+        "start_time": "请假开始时间，格式 YYYY-MM-DD HH:mm",
+        "end_time": "请假结束时间，格式 YYYY-MM-DD HH:mm",
+        "leave_type": "申请类型，从 leave_type_options 中选取 value",
+        "reason": "申请原因，从 reason_options 中选取 value",
+        "approver": "自选审批人 user_id，通过 workflow.search_person 查询获取",
+        "duration": "请假时长（小时），根据起止时间计算填入"
+      },
+      "field_types": {
+        "applicant": "browser",
+        "applicant_no": "text",
+        "start_time": "datetime",
+        "end_time": "datetime",
+        "leave_type": "select",
+        "reason": "select",
+        "approver": "browser",
+        "duration": "number",
+        "contact_phone": "text",
+        "remark": "textarea",
+        "attachment": "attachment"
+      },
+      "field_aliases": {
+        "applicant": "申请人",
+        "applicant_no": "申请人工号",
+        "start_time": "请假开始日期",
+        "end_time": "请假结束日期",
+        "leave_type": "申请类型",
+        "reason": "申请原因",
+        "approver": "自选审批人",
+        "duration": "时长",
+        "contact_phone": "联系电话",
+        "remark": "备注说明",
+        "attachment": "附件"
+      },
+      "optional_fields": {
+        "contact_phone": "联系电话，选填",
+        "remark": "备注说明，选填",
+        "attachment": "相关附件，选填"
+      },
+      "auto_filled_fields": {
+        "申请人部门": "根据 applicant 自动回填，无需填写",
+        "申请人职位": "根据 applicant 自动回填，无需填写",
+        "申请人工号": "根据 applicant 自动回填，无需填写",
+        "申请日期": "系统自动填入当天日期，无需填写"
+      },
+      "fields": [
+        {
+          "key": "applicant",
+          "type": "browser",
+          "required": true
+        },
+        {
+          "key": "applicant_no",
+          "type": "text",
+          "required": true
+        },
+        {
+          "key": "start_time",
+          "type": "datetime",
+          "required": true
+        },
+        {
+          "key": "end_time",
+          "type": "datetime",
+          "required": true
+        },
+        {
+          "key": "leave_type",
+          "type": "select",
+          "required": true
+        },
+        {
+          "key": "reason",
+          "type": "select",
+          "required": true,
+          "depends_on": [
+            {
+              "key": "leave_type"
+            }
+          ]
+        },
+        {
+          "key": "approver",
+          "type": "browser",
+          "required": true
+        },
+        {
+          "key": "duration",
+          "type": "number",
+          "required": true
+        },
+        {
+          "key": "contact_phone",
+          "type": "text",
+          "required": false
+        },
+        {
+          "key": "remark",
+          "type": "textarea",
+          "required": false
+        },
+        {
+          "key": "attachment",
+          "type": "attachment",
+          "required": false
+        }
+      ],
+      "detail_tables": {}
+    },
+    "34747": {
+      "required_fields": [
+        "applicant",
+        "applicant_no",
+        "project_name",
+        "project_code",
+        "wbs_code",
+        "material_category",
+        "total_amount"
+      ],
+      "field_descriptions": {
+        "applicant": "申请人 user_id",
+        "applicant_no": "申请人工号",
+        "project_name": "项目名称，通过 workflow.project_search 查询",
+        "project_code": "项目编码，通过 workflow.project_search 查询",
+        "wbs_code": "WBS编码，通过 workflow.project_search 查询",
+        "material_category": "物资大类，通过 workflow.browser_search 查询 field_id=29023",
+        "total_amount": "申请总金额"
+      },
+      "field_types": {
+        "applicant": "browser",
+        "applicant_no": "text",
+        "project_name": "text",
+        "project_code": "text",
+        "wbs_code": "text",
+        "material_category": "browser",
+        "total_amount": "number"
+      },
+      "field_aliases": {
+        "applicant": "申请人",
+        "applicant_no": "申请人工号",
+        "project_name": "项目名称",
+        "project_code": "项目编码",
+        "wbs_code": "WBS编码",
+        "material_category": "物资大类",
+        "total_amount": "申请总金额"
+      },
+      "fields": [
+        {
+          "key": "applicant",
+          "type": "browser",
+          "required": true
+        },
+        {
+          "key": "applicant_no",
+          "type": "text",
+          "required": true
+        },
+        {
+          "key": "project_name",
+          "type": "text",
+          "required": true
+        },
+        {
+          "key": "project_code",
+          "type": "text",
+          "required": true
+        },
+        {
+          "key": "wbs_code",
+          "type": "text",
+          "required": true,
+          "depends_on": [
+            {
+              "key": "project_name"
+            },
+            {
+              "key": "project_code"
+            }
+          ]
+        },
+        {
+          "key": "material_category",
+          "type": "browser",
+          "required": true
+        },
+        {
+          "key": "total_amount",
+          "type": "number",
+          "required": true
+        }
+      ],
+      "detail_tables": {
+        "detail_2": {
+          "required_fields": [
+            "material_subclass",
+            "material_name",
+            "quantity",
+            "unit_price",
+            "budget_amount",
+            "expense_type1",
+            "finance_subject2"
+          ],
+          "field_types": {
+            "material_subclass": "browser",
+            "material_name": "text",
+            "quantity": "number",
+            "unit_price": "number",
+            "budget_amount": "number",
+            "expense_type1": "browser",
+            "finance_subject2": "browser"
+          },
+          "fields": [
+            {
+              "key": "material_subclass",
+              "label": "物资小类",
+              "type": "browser",
+              "required": true,
+              "readonly": false,
+              "recommended_input": "lookup",
+              "depends_on": [
+                {
+                  "key": "wbs_code"
+                },
+                {
+                  "key": "material_category"
+                }
+              ],
+              "description": "先确定项目和物资大类，再拉取该大类下全部小类供选择。"
+            },
+            {
+              "key": "material_name",
+              "label": "物资名称",
+              "type": "text",
+              "required": true,
+              "readonly": false,
+              "recommended_input": "fillable"
+            },
+            {
+              "key": "quantity",
+              "label": "数量",
+              "type": "number",
+              "required": true,
+              "readonly": false,
+              "recommended_input": "fillable"
+            },
+            {
+              "key": "unit_price",
+              "label": "预算单价",
+              "type": "number",
+              "required": true,
+              "readonly": false,
+              "recommended_input": "fillable"
+            },
+            {
+              "key": "budget_amount",
+              "label": "预算金额",
+              "type": "number",
+              "required": true,
+              "readonly": false,
+              "recommended_input": "computed",
+              "description": "通常等于 quantity * unit_price。"
+            },
+            {
+              "key": "expense_type1",
+              "label": "费用类型1",
+              "type": "browser",
+              "required": true,
+              "readonly": false,
+              "recommended_input": "lookup"
+            },
+            {
+              "key": "finance_subject2",
+              "label": "财务二级科目",
+              "type": "browser",
+              "required": true,
+              "readonly": false,
+              "recommended_input": "lookup",
+              "depends_on": [
+                {
+                  "key": "expense_type1"
+                }
+              ]
+            }
+          ],
+          "field_descriptions": {
+            "material_subclass": "物资小类，通过 browser_search field_id=29028 查询，依赖 wzlb(物资大类)",
+            "material_name": "物资名称",
+            "quantity": "数量",
+            "unit_price": "预算单价",
+            "budget_amount": "预算金额",
+            "expense_type1": "费用类型1，通过 browser_search field_id=119439 查询",
+            "finance_subject2": "财务二级科目，通过 browser_search field_id=183922 查询，依赖 expense_type1"
+          }
+        }
+      }
+    }
+  },
+  "browser_options": {
+    "72247:leave_type": [
+      {
+        "label": "年休假",
+        "value": "N"
+      },
+      {
+        "label": "事假",
+        "value": "L"
+      },
+      {
+        "label": "病假",
+        "value": "S"
+      },
+      {
+        "label": "婚假",
+        "value": "M"
+      },
+      {
+        "label": "陪产假",
+        "value": "P"
+      },
+      {
+        "label": "父母陪护假",
+        "value": "H"
+      },
+      {
+        "label": "育儿假",
+        "value": "Y"
+      },
+      {
+        "label": "丧假",
+        "value": "F"
+      },
+      {
+        "label": "延时假",
+        "value": "V"
+      },
+      {
+        "label": "收养假",
+        "value": "AL"
+      }
+    ],
+    "72247:reason": [
+      {
+        "label": "本人身体不适",
+        "value": "01"
+      },
+      {
+        "label": "本人生病住院",
+        "value": "02"
+      },
+      {
+        "label": "本人结婚",
+        "value": "03"
+      },
+      {
+        "label": "配偶生产陪护",
+        "value": "04"
+      },
+      {
+        "label": "本人产检",
+        "value": "05"
+      },
+      {
+        "label": "本人怀孕生产",
+        "value": "06"
+      },
+      {
+        "label": "哺乳",
+        "value": "07"
+      },
+      {
+        "label": "家人生病",
+        "value": "08"
+      },
+      {
+        "label": "亲人过世",
+        "value": "09"
+      },
+      {
+        "label": "本人有事",
+        "value": "10"
+      }
+    ],
+    "72247:reason:leave_type=L": [
+      {
+        "label": "本人有事",
+        "value": "10"
+      }
+    ],
+    "72247:reason:leave_type=S": [
+      {
+        "label": "本人身体不适",
+        "value": "01"
+      },
+      {
+        "label": "本人生病住院",
+        "value": "02"
+      }
+    ]
+  }
+}

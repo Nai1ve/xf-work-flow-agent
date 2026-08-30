@@ -3,16 +3,23 @@
   "counts": {
     "tools": 22,
     "write_tools": 7,
-    "rooms": 139
+    "rooms": 139,
+    "workflows": 2,
+    "schemas": 2,
+    "option_sets": 4
   },
   "sources": {
     "tool_specs": {
       "path": "contest/train/tool_specs.json",
-      "sha256": "b34115cf241a3c4592780c5b9c141c814faa8c2da859543c2ff6ae35bf3a3af3"
+      "sha256": "401cde6c1712f96793152a539b266a45591e7abaaedd8f06dcefcb22b5a88204"
     },
     "meetingroom_data": {
       "path": "contest/train/data/meetingroom_data.json",
       "sha256": "c09ac3253904a99f4bb3710791b00736009d9e36babf29364e8c44c32b94a5a7"
+    },
+    "workflow_data": {
+      "path": "contest/train/data/workflow_data.json",
+      "sha256": "4591318396772c152ea59ccb7a17c8e7a534a6a5c3ecbb76ce7c2c1a18ef34a2"
     }
   },
   "split_hash_checks": [
@@ -25,5 +32,5 @@
       "val_missing": false
     }
   ],
-  "generated_at": "2026-08-06 11:59:26"
+  "generated_at": "2026-08-30 09:25:10"
 }

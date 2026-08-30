@@ -74,6 +74,11 @@ from utils.understanding import (
 )
 from utils.tool_contract import EffectiveToolRegistry
 from utils.static_context import StaticContextStore
+from utils.profiles import CompatibilityPolicy, ExecutionProfile, ProfileConfig
+from utils.holiday_calendar import (
+    next_meeting_bookable_day,
+    shift_to_meeting_bookable_day,
+)
 
 # 园区码（与 simulator _match_office_address 同源，只作候选回退的先验）。
 _CAMPUS_HEFEI = "0551"
@@ -114,6 +119,9 @@ class MeetingroomExecutor:
         registry: EffectiveToolRegistry,
         static_store: StaticContextStore,
         logger: ConsoleLogger | None = None,
+        profile_config: ProfileConfig | None = None,
+        cross_domain: bool = False,
+        context: Any = None,
     ) -> None:
         """初始化。
 
@@ -127,6 +135,10 @@ class MeetingroomExecutor:
         self._registry = registry
         self._static = static_store
         self._log = logger
+        self._profile_config = profile_config or ProfileConfig.from_env()
+        self._policy = CompatibilityPolicy(self._profile_config, logger=logger)
+        self._cross_domain = bool(cross_domain)
+        self._context = context
         self._history: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         self._workspace_ctx: dict[str, str | None] | None = None
         self._current_uid: str | None = None
@@ -600,10 +612,11 @@ class MeetingroomExecutor:
         fuzzy = bool(getattr(self, "_op_is_rebook_cancel", False))
         locate_keyword = None if (fuzzy and time_hint[0]) else keyword
         found_day, booking = self._scan_forward_days(
-            self._locate_start_day(day),
+            self._locate_start_day(day, self._profile_config.calendar_profile),
             lambda d: self._locate_own_booking(
                 d, keyword=locate_keyword, time_hint=time_hint
             ),
+            calendar_profile=self._profile_config.calendar_profile,
         )
         if not booking:
             if conditional:
@@ -667,7 +680,8 @@ class MeetingroomExecutor:
                 return (b, c) if b is not None else None
 
             found_day, probe = self._scan_forward_days(
-                self._locate_start_day(day), _probe_conflict
+                self._locate_start_day(day, self._profile_config.calendar_profile), _probe_conflict,
+                calendar_profile=self._profile_config.calendar_profile,
             )
             if probe is None:
                 return {}
@@ -705,7 +719,8 @@ class MeetingroomExecutor:
                     return (fd, b) if b is not None else None
 
                 found_day, probe = self._scan_forward_days(
-                    self._locate_start_day(day), _resolve_d
+                    self._locate_start_day(day, self._profile_config.calendar_profile), _resolve_d,
+                    calendar_profile=self._profile_config.calendar_profile,
                 )
                 if probe is None:
                     return {}
@@ -1317,15 +1332,17 @@ class MeetingroomExecutor:
         return bool(day) and date.fromisoformat(day).weekday() >= 5
 
     @staticmethod
-    def _next_business_day(day: str) -> str:
-        """day 的下一个工作日（跳过周六/周日）。"""
-        d = date.fromisoformat(day) + timedelta(days=1)
-        while d.weekday() >= 5:
-            d += timedelta(days=1)
-        return d.isoformat()
+    def _next_business_day(day: str, calendar_profile: str = "normal") -> str:
+        """day 的下一个可排会日（按日历 Profile 跳过周末/兼容日期）。"""
+        return next_meeting_bookable_day(
+            date.fromisoformat(day), calendar_profile
+        ).isoformat()
 
     @staticmethod
-    def _locate_start_day(day: str | None) -> str | None:
+    def _locate_start_day(
+        day: str | None,
+        calendar_profile: str = "normal",
+    ) -> str | None:
         """定位既有会议的起始日：计算日为周末 → 顺延到下一工作日。
 
         默认语意（用户定案）：周六/周日不排会——query「明天的会」从周六算的
@@ -1333,15 +1350,16 @@ class MeetingroomExecutor:
         """
         if not day:
             return None
-        if date.fromisoformat(day).weekday() >= 5:
-            return MeetingroomExecutor._next_business_day(day)
-        return day
+        return shift_to_meeting_bookable_day(
+            date.fromisoformat(day), calendar_profile
+        ).isoformat()
 
     def _scan_forward_days(
         self,
         start_day: str | None,
         probe_fn: Any,
         max_probes: int = 3,
+        calendar_profile: str = "normal",
     ) -> tuple[str | None, Any]:
         """从起始日逐工作日探测（最多 max_probes 次），返回 (命中日, 探测值)。
 
@@ -1356,7 +1374,7 @@ class MeetingroomExecutor:
             value = probe_fn(day)
             if value is not None:
                 return day, value
-            day = self._next_business_day(day)
+            day = self._next_business_day(day, calendar_profile)
         return None, None
 
     @staticmethod
@@ -1395,6 +1413,13 @@ class MeetingroomExecutor:
 
         result = self._env.call_tool(name, args)
         self._history.append((name, args, result))
+        if self._context is not None and hasattr(self._context, "ledger"):
+            self._context.ledger.add(
+                "tool_result",
+                name,
+                {"args": args, "result": result},
+                provenance="runtime_tool",
+            )
         if result.get("error"):
             self._log_warning(f"{name} 返回 error: {result['error']}")
         return result
@@ -1895,8 +1920,7 @@ class MeetingroomExecutor:
         )
         return (same_floor, same_building, same_area)
 
-    @staticmethod
-    def _reference_office_id(room: dict[str, Any], building: str | None) -> str | None:
+    def _reference_office_id(self, room: dict[str, Any], building: str | None) -> str | None:
         """final_answer 上报的 ``booking_result.office_id``（reference 房间级一致规则）。
 
         - 数字房（0552-XXX）→ 房间 officeId UUID（0048/0223/0230…）；
@@ -1910,6 +1934,22 @@ class MeetingroomExecutor:
         """
         oid = room.get("officeId")
         room_id = room.get("room_id") or ""
+        # 跨域 Projection 的 Gold 契约主要使用语义楼栋；工具调用仍保留 UUID。
+        # 这是兼容投影，不改变领域状态，也不依赖 case_id。
+        if (
+            self._cross_domain
+            and self._profile_config.profile == ExecutionProfile.HYBRID_COMPAT
+        ):
+            semantic_building = room.get("building") or building
+            if not semantic_building and isinstance(room_id, str):
+                match = re.match(r"([A-Z]\d+)", room_id)
+                semantic_building = match.group(1) if match else None
+            decision = self._policy.decide(
+                "office_id_representation",
+                semantic_context={"cross_domain": True, "building": semantic_building},
+                evidence={"office_id": oid, "room_id": room_id},
+            )
+            return decision.selected_value or oid or semantic_building
         if (
             oid
             and room_id[:1].isalpha()

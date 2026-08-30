@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from pathlib import Path
 from typing import TextIO
 
 # 统一控制台格式：时间 + 级别 + 消息（消息自带层前缀，见 ConsoleLogger）。
@@ -36,6 +37,7 @@ _CONSOLE_FORMATTER = logging.Formatter(
 _configure_lock = threading.Lock()
 _root_configured = False
 _console_handlers: list[logging.Handler] = []
+_file_handler: logging.Handler | None = None
 
 
 def configure_console(stream: TextIO | None = None, level: int = logging.INFO) -> None:
@@ -71,6 +73,41 @@ def reset_console() -> None:
             root.removeHandler(handler)
         _console_handlers.clear()
         _root_configured = False
+
+
+def configure_file(path: str | Path, level: int = logging.INFO) -> None:
+    """安装普通 UTF-8 文本日志文件 handler（幂等）。
+
+    文件日志与控制台使用同一行格式，便于人工审阅；不会写 JSONL，也不会把
+    API 配置或 Gold 参考答案写入日志。路径不可创建时静默降级为控制台。
+    """
+    global _file_handler
+    with _configure_lock:
+        if _file_handler is not None:
+            return
+        try:
+            target = Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(target, encoding="utf-8")
+            handler.setLevel(level)
+            handler.setFormatter(_CONSOLE_FORMATTER)
+            logging.getLogger().addHandler(handler)
+            _file_handler = handler
+        except OSError:
+            _file_handler = None
+
+
+def reset_file() -> None:
+    """仅供测试移除文件 handler。"""
+    global _file_handler
+    with _configure_lock:
+        if _file_handler is not None:
+            logging.getLogger().removeHandler(_file_handler)
+            try:
+                _file_handler.close()
+            except Exception:  # noqa: BLE001
+                pass
+            _file_handler = None
 
 
 class ConsoleLogger:
