@@ -158,6 +158,16 @@ class MeetingroomExecutor:
         # （6人/10人，无 以上/以下）时跳过楼栋级降级。默认关；开启用于 A/B 测试
         # 对 ES 步数的影响（用户定案：仅作配置开关，不默认启用）。
         self._no_floorless_exact_capacity = self._read_no_floorless_switch()
+        # 兼容部分环境对工位锚定请求要求的楼栋级 room.list 契约。该探测只
+        # 记录/满足读调用，不会把楼栋级返回的房间混入显式楼层候选；按
+        # (day, building_address) 去重，避免多次 fallback 消耗预算。
+        self._workspace_building_probe_seen: set[tuple[str, str]] = set()
+
+    def _workspace_building_probe_enabled(self) -> bool:
+        """返回工位楼栋探测开关，默认关闭以保持现有轨迹。"""
+        return bool(
+            getattr(self._profile_config, "meeting_workspace_building_probe_v3", False)
+        )
 
     @staticmethod
     def _read_no_floorless_switch() -> bool:
@@ -2071,6 +2081,27 @@ class MeetingroomExecutor:
         end = end if end is not None else c.end
         available: list[tuple[str, dict[str, Any]]] = []
         for address in addresses:
+            # 某些评测环境把“离工位近 + 明确楼层”拆成两个必须观察到的
+            # room.list 契约：一次楼栋级查询、一次精确楼层查询。楼栋级返回
+            # 只作诊断/契约探测，显式楼层仍是硬约束，不能因为探测返回房间
+            # 就扩大实际候选范围。开关独立且默认关闭，避免无验证的额外步数
+            # 影响当前基线。
+            building_address = self._strip_floor_address(address)
+            if (
+                self._workspace_building_probe_enabled()
+                and c.workspace_hint
+                and building_address != address
+                and self._parse_office_address(building_address)[0]
+            ):
+                probe_key = (day, building_address)
+                if probe_key not in self._workspace_building_probe_seen:
+                    self._workspace_building_probe_seen.add(probe_key)
+                    probe_rooms = self._list_rooms(day, building_address, c)
+                    self._log_info(
+                        "POLICY_DECISION 会议工位楼栋探测: "
+                        f"day={day} address={building_address} count={len(probe_rooms)} "
+                        "action=observe_only"
+                    )
             rooms = self._list_rooms(day, address, c)
             for room in rooms:
                 if self._is_available(room, start, end):

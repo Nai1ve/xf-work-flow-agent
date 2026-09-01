@@ -89,3 +89,60 @@ NL2Workflow V2 冲突隔离与 DAG 改造审核记录（普通文本）
 结果：最新串行 Val `fix_round18` 平均 98.00，46/50 通过，TSR=59.75、AS=19.90、ES=9.15，平均 5.66 步、11.90 秒；无 violation、无未捕获异常。剩余 1 个 booking_result（`beta_mr_0048` 为不可观测冲突；`beta_mr_0011` 已定向修复），3 个跨域用例仅缺隐式 `oa.done.list`，开启兼容开关可恢复。Train `fix_round11` 为 91.79，157/200 通过，无 violation/exception；该批与 Val 非同一时刻采集，受模型服务波动影响，发布前须串行复测。
 静态检查：`compileall`、`git diff --check` 通过；普通日志只写 `.log`，Prompt/模型结果经过单行化和脱敏，Header 不含认证；`legacy_current` 与问题簇开关仍可回滚。
 结论：可观测业务规则已迁入 V2；candidate 仍默认不开启。以 `hybrid_compat` 作为诊断/提交候选，保留 `AGENT_LEGACY_OA_COMPAT=1` 的 A/B 选项；不新增 Case ID、Gold 或训练答案映射。
+
+[阶段8/第1轮审核] 项目零命中语义细化
+检查项：费用项目短语抽取、零结果后的有界检索、跨命名项目、升级/改版后缀、候选歧义保护。
+发现问题：V3 细化只取固定末尾字符，容易把“知识助手升级”细化成“升级”；带“项目里的”结构时，通用正则还可能把“帮我提交”动作一起当成项目词；项目全称和用户口语名称完全不重合时没有第二个可解释的检索片段。
+修复：仅在主搜零结果后，从用户原句剥离项目命名/表单泛化后缀；对项目短语之外的物料/服务语义生成候选，按原文出现频次排序且最多执行一次细化查询；所有结果仍必须经过实时 `workflow.project_search` 唯一性和 `_pick_project` 消歧，歧义不取第一候选。新增 `project_search_refinement_v3` 独立开关，默认关闭，可不联动金额和审批人严格门禁。
+验证：新增跨命名项目、升级后缀、歧义阻断和独立开关测试；首轮定向 51 项通过。未改变默认 hybrid/legacy 行为，未引入 Case、Gold 或项目答案表。
+
+[阶段8/第2轮审核] 项目细化回归与安全边界
+检查项：费用 V3/首批会议/请假/语气/开关定向回归，完整套件，compileall，diff 检查。
+结果：定向 51/51 通过；完整套件 397 通过、27 失败。27 项均为已登记旧契约债务：隐式 OA 查询、旧预算模板删除断言、撤回的 rebook/decide 复合接口、旧半天/提交语气断言和根 `submission/` 缺失入口；项目细化相关测试无失败。`compileall` 与 `git diff --check` 通过。
+发布决定：项目细化只作为候选簇 A/B（`AGENT_PROJECT_SEARCH_REFINEMENT_V3=1`）发布，预算严格金额、审批人和完整 runtime v3 仍不默认打开；线上低于当前分数时可单独关闭该开关。下一步应在当前模型服务下对 Train/Val 和线上轨迹做簇级差分，再决定晋级。
+
+[阶段8/补充审核] 项目细化 Prompt 与步数 A/B
+发现问题：项目细化开关首次同时切换物料短 Prompt 后，物料模型会输出非法大类并漏明细（定向 1/2 成功，另一例 32.14 分）。
+修复：将短 Prompt 限定为项目解析；物料解析继续使用带枚举和明细契约的稳定卡片。新增主搜词规范化，仅剥离明确的“项目/升级/改版”等命名后缀，避免可安全归一的场景多发一次工具调用。
+验证：`beta_wf_0059`、`beta_wf_0067` 在 `AGENT_PROJECT_SEARCH_REFINEMENT_V3=1`、legacy 模板关闭时均业务通过，平均 99.50；其中一个项目因原文与运行时命名不重合仍多一次 project_search，ES=9，另一个规范化后 7 步、100 分。上一版错误的 65.57 平均已消除。该差异属于效率成本，不伪装为业务失败。
+结论：项目细化开关可候选 A/B；物料短 Prompt 不晋级；继续以实时候选唯一性作为最终门禁，并保留默认关闭与 rollback。
+
+[阶段9/第1轮审核] 全链路回归与发布边界
+检查项：首批 V3 定向测试、项目细化 A/B、全仓测试、语法检查、差异检查和开关默认值。
+结果：V3/首批定向 52 项通过；项目细化 A/B 两个 Train 用例均业务通过，99.50 平均；全套测试 400 通过、27 失败。失败未集中在本轮新增代码，而是旧测试债务：2 个隐式 OA 断言、旧预算表/历史函数断言、7 个旧 rebook/decide 复合接口断言、旧请假模型/提交/半天口径断言以及 6 个根 `submission/` 缺失入口的 smoke 断言。`compileall` 和 `git diff --check` 通过，未出现未捕获异常或语法错误。
+发布边界：本轮只将项目检索细化加入候选独立开关 `AGENT_PROJECT_SEARCH_REFINEMENT_V3`；默认 hybrid/legacy 行为不变。严格金额、审批人、物料短 Prompt 和完整 `budget_runtime_v3` 继续关闭，避免把已观察到的隐藏批次差异误当业务规则。
+
+[阶段9/第2轮审核] 终审决定
+复核项目：确认零结果只执行一次细化、候选不取第一项、规范化不创造 ID、每个 case 事实隔离、日志不记录密钥、失败不越过写前校验。
+结论：通过。项目细化仅使用用户原文生成检索词，最终项目/编码仍来自本轮 `workflow.project_search`；歧义返回 blocked。物料 Prompt 回退到已验证卡片，避免 65.57 A/B 回归；当前候选收益需在 Train/Val 全量和线上分数确认后再晋级，若下降可单独关闭。
+[阶段10/第1轮审核] 当前模型服务下 Val 全量回归
+检查项：hybrid_compat 默认行为、跨域独立 Task、会议连续空档/重订、费用实时绑定、请假日期与语气、Submission Projection、普通日志和异常边界。
+命令：`AGENT_EXECUTION_PROFILE=hybrid_compat AGENT_LEGACY_OA_COMPAT=0 PYTHONPATH=submission2 .venv/bin/python scripts/run_agent.py --split val --agent submission2/my_agent.py --skip-variants --parallel 1 --timeout 60 --output reports/runs/v3_default_val_20260901.json --log-output reports/runs/v3_default_val_20260901.stdout --summary-output reports/analysis/v3_default_val_20260901_summary.json --analysis-output reports/analysis/v3_default_val_20260901_analysis.md --refresh-tree`
+结果：50 个用例平均 98.05，46/50 通过；TSR=59.75、AS=19.90、ES=9.20、RS=9.20；平均 5.64 步、9.64 秒；无 violation、无未捕获异常。
+低分定位：`beta_zh_0207`、`beta_zh_0227`、`beta_zh_0215` 业务状态和字段均正确，仅缺评测要求的隐式 `oa.done.list`；`beta_mr_0048` 预订状态正确，仅 `booking_result` 因用户标题“技术复盘”和参考标题“架构评审”不一致而失败，运行时没有可观测依据选择后者。
+处理决定：不把隐式 OA 或参考标题写成默认业务规则；继续由 `AGENT_LEGACY_OA_COMPAT=1` 和 legacy projector 独立 A/B。Val 结果支持当前 hybrid 作为候选基线，但不能替代线上隐藏集验证。
+
+[阶段10/第2轮审核] Val 结果复核与发布边界
+复核项：低分用例原始题目、Gold 轨迹、工具结果、DomainResult、Projection、特征开关和日志链路逐项对齐。
+结论：通过。3 个跨域 OA 缺口属于批次契约差异，开启兼容开关可恢复但会增加非必要工具调用；1 个标题冲突不可从用户/工具事实区分，不新增固定标题映射。项目细化仍保持独立开关且默认关闭；严格金额、审批人和物料短 Prompt 不晋级。待完成当前代码版本的 Train 全量复测，再决定 candidate 组合。
+
+[阶段11/第1轮审核] 工位楼栋查询契约与候选消歧
+检查项：工位锚定会议的楼栋/楼层 room.list 契约、显式楼层硬约束、项目多候选消歧、V3 开关隔离。
+发现问题：部分带“离工位近”且明确楼层的用例要求同时观察楼栋级与楼层级 room.list；旧实现只调用精确楼层查询，导致 AS 条件缺失。费用项目“知识助手升级项目”规范化后可能命中多个实时项目，不能按候选顺序盲选。
+修复：新增 `meeting_workspace_building_probe_v3` 独立开关。开启时按 `(day, building)` 去重发起一次只读楼栋级探测，结果只记录证据，不扩大显式楼层候选；默认关闭。项目选择继续执行 code/LCS/物料语义唯一最高分，V3 不启用同 base 取首个，无法唯一时阻断；未增加 Case、Gold 或训练项目表。
+验证：新增工位探测开关/观察隔离/去重测试 3 项；首批 V3、日志、费用、请假、会议定向测试共 58/58 通过；`compileall` 与 `git diff --check` 通过。
+
+[阶段11/第2轮审核] 工位探测 A/B 与全量回归复核
+复核项：Train/Val 代表性工位用例、跨域投影、步数、OA 兼容开关及全仓测试失败分类。
+结果：开启 `AGENT_MEETING_WORKSPACE_BUILDING_PROBE_V3=1` 后，`beta_mr_0016` 由 68.00 提升到 98.00，`beta_zh_0018` 由 73.33 提升到 99.17；同类跨域标题不一致用例仍因不可观测 Projection 冲突失败，探测不改变业务结果。新增探测对显式楼层候选无污染，但每个命中用例增加一次只读步数，ES 需按隐藏集验证。
+当前全量：hybrid 默认 Train 200 平均 92.84、160/200 通过，Val 50 平均 98.05、46/50 通过；无 violation/未捕获异常。全仓 pytest 为 405 passed、27 failed，失败均是登记的旧 OA/旧复合接口/旧模板/根 submission 入口测试债务，V3 定向套件无失败。
+发布决定：不修改 hybrid 默认行为；楼栋探测保留为 `AGENT_MEETING_WORKSPACE_BUILDING_PROBE_V3=1` 的候选簇。OA 兼容开关与探测开关不绑定，因组合回放受模型波动且可能超步数，不默认开启。下一轮以当前线上基线包采集轨迹后，按 AS 收益与 ES 成本决定是否进入 candidate。
+
+[阶段12/第1轮审核] 请假低分簇开关回放
+检查项：请假时长模式、事件/假种默认、提交语气、审批人实时消歧及多轮/跨域隔离。
+结果：开启 `AGENT_LEAVE_RANGE_V3=1`、`AGENT_SPEECH_ACT_V3=1`、`AGENT_APPROVER_RESOLUTION_V3=1` 后回放 8 个 Train 低分用例；唯一明确人选的 `beta_wf_0204` 业务通过（98.75），多候选审批与写前门禁保持安全阻断。`beta_wf_0018/0019/0013/0024/0026`、`beta_mt_0006`、`beta_wf_0205` 仍分别存在假种、时长或原因码的 Gold 差异，工具和用户语义无法区分。
+问题：严格时长/原因策略不能解释同一表面请求的相互冲突 Gold；强行按假种或训练批次映射会引入数据泄漏和真实业务错误。
+
+[阶段12/第2轮审核] 请假策略边界复核
+复核项：默认语气、午别/工作日计算、审批人部门/职位事实、阻断结果 Projection、是否重复写入。
+结论：通过并保留开关隔离。`approver_resolution_v3` 只接受实时人员候选唯一收敛；`speech_act_v3` 只解释用户明确动词；`leave_range_v3` 只在用户明确给出小时/天数/工作日口径时切换，未明确时保留当前 raw 默认。上述 Gold 冲突归入 legacy/batch anomaly，不新增固定答案映射；请假 V3 不进入 hybrid 默认，待线上轨迹证明后再与其他问题簇独立晋级。

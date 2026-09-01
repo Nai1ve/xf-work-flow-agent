@@ -84,6 +84,24 @@ class ProfileConfig:
     contract_fixes_v2: bool = True
     context_workflow_v2: bool = True
     meeting_search_v2: bool = True
+    # V3 收益簇默认关闭，确保 76.79814 线上行为可以原样回放。候选包通过
+    # config.json 或环境变量逐簇开启；不要再次把会议、工作流和预算修复绑成
+    # 一个不可归因的大开关。
+    meeting_reference_v3: bool = False
+    meeting_projection_v3: bool = False
+    # 工位锚定且用户明确楼层时，是否额外发起一次楼栋级 room.list 探测。
+    # 探测只补足环境的楼栋查询契约，不改变楼层硬约束或候选选择；默认关闭，
+    # 便于把额外读调用作为独立收益簇 A/B。
+    meeting_workspace_building_probe_v3: bool = False
+    dag_dependency_v3: bool = False
+    speech_act_v3: bool = False
+    leave_range_v3: bool = False
+    budget_runtime_v3: bool = False
+    project_search_refinement_v3: bool = False
+    workflow_schema_retry_v3: bool = False
+    budget_amount_guard_v3: bool = False
+    approver_resolution_v3: bool = False
+    oa_semantic_gate_v3: bool = False
     # OA 尾查存在批次契约差异：candidate/generic 默认只在用户明确要求时查询，
     # legacy 可通过该开关保留旧的多域隐式尾查。它不改变业务写入，只影响额外的
     # oa.todo.list / oa.done.list 调用，便于线上 A/B 与回滚。
@@ -176,17 +194,81 @@ class ProfileConfig:
             contract_fixes_v2=_flag("AGENT_CONTRACT_FIXES_V2", default_cluster, "contract_fixes_v2"),
             context_workflow_v2=_flag("AGENT_CONTEXT_WORKFLOW_V2", default_cluster, "context_workflow_v2"),
             meeting_search_v2=_flag("AGENT_MEETING_SEARCH_V2", default_cluster, "meeting_search_v2"),
+            meeting_reference_v3=_flag(
+                "AGENT_MEETING_REFERENCE_V3", False, "meeting_reference_v3"
+            ),
+            meeting_projection_v3=_flag(
+                "AGENT_MEETING_PROJECTION_V3", False, "meeting_projection_v3"
+            ),
+            meeting_workspace_building_probe_v3=_flag(
+                "AGENT_MEETING_WORKSPACE_BUILDING_PROBE_V3",
+                False,
+                "meeting_workspace_building_probe_v3",
+            ),
+            dag_dependency_v3=_flag(
+                "AGENT_DAG_DEPENDENCY_V3", False, "dag_dependency_v3"
+            ),
+            speech_act_v3=_flag("AGENT_SPEECH_ACT_V3", False, "speech_act_v3"),
+            leave_range_v3=_flag("AGENT_LEAVE_RANGE_V3", False, "leave_range_v3"),
+            budget_runtime_v3=_flag(
+                "AGENT_BUDGET_RUNTIME_V3", False, "budget_runtime_v3"
+            ),
+            project_search_refinement_v3=_flag(
+                "AGENT_PROJECT_SEARCH_REFINEMENT_V3",
+                False,
+                "project_search_refinement_v3",
+            ),
+            workflow_schema_retry_v3=_flag(
+                "AGENT_WORKFLOW_SCHEMA_RETRY_V3", False, "workflow_schema_retry_v3"
+            ),
+            budget_amount_guard_v3=_flag(
+                "AGENT_BUDGET_AMOUNT_GUARD_V3", False, "budget_amount_guard_v3"
+            ),
+            approver_resolution_v3=_flag(
+                "AGENT_APPROVER_RESOLUTION_V3", False, "approver_resolution_v3"
+            ),
+            oa_semantic_gate_v3=_flag(
+                "AGENT_OA_SEMANTIC_GATE_V3", False, "oa_semantic_gate_v3"
+            ),
             legacy_oa_compat=legacy_oa_default,
         )
+
+    def feature_flags(self) -> dict[str, bool]:
+        """返回当前实际生效的功能开关，供本地日志和远程诊断共用。"""
+        return {
+            "contract_fixes_v2": self.contract_fixes_v2,
+            "context_workflow_v2": self.context_workflow_v2,
+            "meeting_search_v2": self.meeting_search_v2,
+            "meeting_reference_v3": self.meeting_reference_v3,
+            "meeting_projection_v3": self.meeting_projection_v3,
+            "meeting_workspace_building_probe_v3": self.meeting_workspace_building_probe_v3,
+            "dag_dependency_v3": self.dag_dependency_v3,
+            "speech_act_v3": self.speech_act_v3,
+            "leave_range_v3": self.leave_range_v3,
+            "budget_runtime_v3": self.budget_runtime_v3,
+            "project_search_refinement_v3": self.project_search_refinement_v3,
+            "workflow_schema_retry_v3": self.workflow_schema_retry_v3,
+            "budget_amount_guard_v3": self.budget_amount_guard_v3,
+            "approver_resolution_v3": self.approver_resolution_v3,
+            "oa_semantic_gate_v3": self.oa_semantic_gate_v3,
+            "legacy_budget_templates": self.legacy_budget_templates,
+            "legacy_special_prompts": self.legacy_special_prompts,
+            "legacy_oa_compat": self.legacy_oa_compat,
+        }
 
     def allow_oa_postcheck(self, *, explicit_request: bool, multi_domain: bool) -> bool:
         """决定是否执行 OA 尾查。
 
         明确要求始终允许；旧 contract_fixes 关闭或显式兼容开关可保留历史行为。
         candidate/generic 在默认配置下不会因为跨域本身发起无关 OA 查询。
+        ``oa_semantic_gate_v3`` 是独立问题簇开关：开启后，即使其它 contract
+        兼容开关被误开，也必须回到“用户明确要求或显式 legacy 兼容”两条路径，
+        便于线上逐簇 A/B，而不会被 ``contract_fixes_v2`` 的旧默认覆盖。
         """
         if not multi_domain:
             return False
+        if self.oa_semantic_gate_v3:
+            return bool(explicit_request or self.legacy_oa_compat)
         return bool(explicit_request or self.legacy_oa_compat or not self.contract_fixes_v2)
 
     def profile_for(self, capability: str) -> ExecutionProfile:

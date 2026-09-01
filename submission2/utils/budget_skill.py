@@ -27,6 +27,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -49,6 +51,35 @@ _BUDGET_CONFIDENCE_FLOOR = 0.4
 
 # 固定流程 id（预算域唯一流程，catalog(keyword=费用类物资) 定位）。
 _BUDGET_WORKFLOW_ID = 34747
+
+# Runtime-only safety thresholds.  The selector receives option indices rather
+# than business identifiers; the executor is the only component allowed to
+# project an option back to its code.
+_MATERIAL_SELECTOR_CONFIDENCE_FLOOR = 0.70
+_BROWSER_FIELD_DEFAULTS = {"category": 29023, "subclass": 29028}
+_MATERIAL_SELECTOR_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["selections"],
+    "properties": {
+        "selections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["row_index", "candidate_index", "confidence"],
+                "properties": {
+                    "row_index": {"type": "integer", "minimum": 0},
+                    "candidate_index": {"type": "integer", "minimum": 0},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    "additionalProperties": False,
+}
+_MATERIAL_SELECTOR_CARD = """你是费用物资小类候选排序器。只依据每行原始物料语义和本轮候选选项排序。
+输出 selections 数组，每项只能包含 row_index、candidate_index、confidence；不得输出 code、id 或新增选项。
+候选下标从 0 开始；不确定时降低 confidence。只输出 JSON。"""
 
 # --------------------------------------------------------------------------
 # LLM#2 输出契约：{"project", "category_hint", "detail_rows", "confidence"}
@@ -396,14 +427,26 @@ class BudgetPlanner:
         rule = self._rule_plan(context)
 
         # --- ① 项目请求（search_term / code_hint）---
+        project_runtime_v3 = bool(
+            self.profile_config.strict_runtime_mode
+            or self.profile_config.budget_runtime_v3
+            or getattr(self.profile_config, "project_search_refinement_v3", False)
+        )
+        # 物料解析的枚举/明细契约比项目短语更容易受 Prompt 缩减影响。
+        # 项目细化可以独立 A/B，但只有完整 budget/runtime v3 才切换物料
+        # 的无样本短卡，避免把“设计费”等模型近义词当成合法大类。
+        material_runtime_v3 = bool(
+            self.profile_config.strict_runtime_mode
+            or self.profile_config.budget_runtime_v3
+        )
         project_card = (
             _BUDGET_PROJECT_CARD_GENERIC
-            if self.profile_config.strict_runtime_mode
+            if project_runtime_v3
             else _BUDGET_PROJECT_CARD
         )
         material_card = (
             _BUDGET_MATERIAL_CARD_GENERIC
-            if self.profile_config.strict_runtime_mode
+            if material_runtime_v3
             else _BUDGET_MATERIAL_CARD
         )
         project_raw = gateway.structured_call(
@@ -818,6 +861,18 @@ def _regex_project_phrase(text: str) -> str:
     if m:
         return m.group(1).strip()
 
+    # 口语中的“X 那边/方面有一笔…”也明确指向 X。这个分支只取用户原句
+    # 中的短语，后续仍由 specific-term 门禁和实时 project_search 校验，
+    # 不会凭空制造项目别名。
+    m = re.search(
+        r"([一-龥A-Za-z0-9][一-龥A-Za-z0-9·（）()_\-]{1,29})"
+        r"(?:那边|这边|方面|里的|中有|里有|下有)",
+        text,
+    )
+    if m:
+        candidate = m.group(1).strip()
+        return candidate if _is_specific_project_term(candidate) else ""
+
     # 「X项目需要/要/里/中的…」：取最后一个“项目”前的连续名词片段。
     # 允许数字、英文和中文项目名；不跨空格/标点，避免吞掉后续预算描述。
     candidates = list(
@@ -960,6 +1015,23 @@ def _overlap_score(a: str, b: str) -> int:
     return 20 + shared if shared >= 2 else 0
 
 
+def _semantic_option_score(material: str, label: str) -> int:
+    """候选标签的确定性语义回退分（不包含任何业务词表）。
+
+    仅依据归一化文本的最长公共片段与字符重叠；短片段分数故意较低，
+    由 strict runtime 的置信门禁阻断，或交给注入的候选排序器。
+    """
+    a = re.sub(r"[\s、，,;；/（）()]+", "", str(material or ""))
+    b = re.sub(r"[\s、，,;；/（）()]+", "", str(label or ""))
+    if not a or not b:
+        return 0
+    if a == b:
+        return 100
+    common = _longest_common_len(a, b)
+    shared = len(set(a) & set(b))
+    return common * 10 + shared if common >= 2 else 0
+
+
 def _longest_common_len(a: str, b: str) -> int:
     """两字符串的最长公共子串长度（项目消歧用，近似贪心）。"""
     a, b = (a or ""), (b or "")
@@ -1041,6 +1113,8 @@ class BudgetExecutor:
         logger: ConsoleLogger | None = None,
         profile_config: ProfileConfig | None = None,
         context: Any = None,
+        material_selector: Any = None,
+        candidate_selector: Any = None,
     ) -> None:
         """初始化。
 
@@ -1057,6 +1131,67 @@ class BudgetExecutor:
         self._profile_config = profile_config or ProfileConfig.from_env()
         self._context = context
         self._history: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+        # Optional model/helper boundary.  It may return only row/candidate
+        # indices; codes are deliberately not accepted from this callback.
+        supplied_selector = material_selector or candidate_selector
+        self._material_selector = (
+            supplied_selector if self._runtime_v3_enabled() else None
+        )
+        self._workflow_schema_data: dict[str, Any] = {}
+        # 原始物料名上的金额证据；canonicalize_rows 可能会把模型简称改成
+        # 规范名，金额绑定仍须保留原文证据。
+        self._explicit_amount_facts: list[tuple[str, float]] = []
+        self._browser_recovery_attempted: set[str] = set()
+        self._category_field_ids: set[int] = {_BROWSER_FIELD_DEFAULTS["category"]}
+        self._subclass_field_ids: set[int] = {_BROWSER_FIELD_DEFAULTS["subclass"]}
+
+    def _runtime_v3_enabled(self) -> bool:
+        """统一预算 V3 开关：strict profile 或显式 budget_runtime_v3。"""
+        return bool(
+            getattr(self._profile_config, "budget_runtime_v3", False)
+            or self._profile_config.strict_runtime_mode
+        )
+
+    def _project_refinement_enabled(self) -> bool:
+        """项目零命中细化的独立开关。
+
+        该能力只扩展一次用户原文检索，不应强制开启金额守恒或审批人严格
+        门禁；因此允许在 hybrid profile 中单独 A/B，strict/budget v3 仍自动
+        包含它。
+        """
+        return bool(
+            self._runtime_v3_enabled()
+            or getattr(self._profile_config, "project_search_refinement_v3", False)
+        )
+
+    def _schema_retry_enabled(self) -> bool:
+        """workflow.schema 恢复簇是否开启。
+
+        ``budget_runtime_v3``/strict runtime 是旧的组合开关，继续作为兼容
+        别名；hybrid 线上则可以只打开新的 schema 恢复簇。
+        """
+        return bool(
+            self._runtime_v3_enabled()
+            or getattr(self._profile_config, "workflow_schema_retry_v3", False)
+        )
+
+    def _amount_guard_enabled(self) -> bool:
+        """金额事实/守恒门禁是否开启，独立于 Schema 恢复。"""
+        return bool(
+            self._runtime_v3_enabled()
+            or getattr(self._profile_config, "budget_amount_guard_v3", False)
+        )
+
+    def _speech_act(self, text: str) -> Any:
+        """传递 V3 语气开关，同时兼容旧版 parse_speech_act 签名。"""
+        try:
+            return parse_speech_act(
+                text, speech_act_v3=getattr(self._profile_config, "speech_act_v3", False)
+            )
+        except TypeError as exc:
+            if "speech_act_v3" not in str(exc):
+                raise
+            return parse_speech_act(text)
 
     # ------------------------------------------------------------ 入口 --
     def execute(
@@ -1086,6 +1221,12 @@ class BudgetExecutor:
 
         # 垃圾行记忆补全的项目缓存（本 execute 内有效，避免 project_search 重复调用）。
         self._memory_project: dict[str, Any] | None = None
+        # Recovery budget is per execution round (a reused executor must still
+        # get one bounded recovery on the next user turn).
+        self._history.clear()
+        self._browser_recovery_attempted.clear()
+        self._category_field_ids = {_BROWSER_FIELD_DEFAULTS["category"]}
+        self._subclass_field_ids = {_BROWSER_FIELD_DEFAULTS["subclass"]}
 
         # 1) 申请人。
         applicant = self._current_user()
@@ -1099,12 +1240,14 @@ class BudgetExecutor:
         schema = self._workflow_schema(workflow_id)
         if schema is None:
             return self._blocked("schema_unavailable")
+        self._workflow_schema_data = schema
+        self._refresh_field_ids(schema)
         if self._context is not None and hasattr(self._context, "schema_registry"):
             self._context.schema_registry.ingest(
                 {"workflow_id": workflow_id, "schema": schema, "name": "费用类物资"}
             )
 
-        speech = parse_speech_act(text)
+        speech = self._speech_act(text)
         self._log_info(
             "POLICY_DECISION speech_act: "
             f"domain=budget profile={self._profile_config.profile_name} "
@@ -1134,6 +1277,12 @@ class BudgetExecutor:
         # 覆盖真实金额。显式行金额是当前 query 的事实，任何 legacy 记忆都不能
         # 覆盖它。
         explicit_line_amounts = _has_explicit_line_amounts(text, draft.rows)
+        self._explicit_amount_facts = []
+        for raw_row in draft.rows:
+            raw_name = str(raw_row.material_name or "").strip()
+            raw_unit = _regex_unit_for_material(text, raw_name)
+            if raw_name and raw_unit is not None:
+                self._explicit_amount_facts.append((raw_name, raw_unit))
         _apply_explicit_line_amounts(draft, text)
         canon_failed = not self._canonicalize_rows(draft)
 
@@ -1147,7 +1296,13 @@ class BudgetExecutor:
         # （golden 词在 train+val 只出现在对应 gold-save case，已扫描唯一；
         # 行对但金额错 wf_0233/0060 的 gold 单价/数量是固定模板、query 只给总量，
         # 也走模板覆盖，而非依赖 canon_failed 才触发。）
-        golden = _budget_golden_for(text) if self._profile_config.legacy_budget_templates else None
+        golden = (
+            _budget_golden_for(text)
+            if self._profile_config.legacy_budget_templates
+            and not self._runtime_v3_enabled()
+            and not self._amount_guard_enabled()
+            else None
+        )
         if golden:
             draft.rows = [
                 BudgetRow(
@@ -1167,6 +1322,8 @@ class BudgetExecutor:
         # 内部会多一次 project_search，wf_0242 白白多一步 ES 掉分。
         if (
             self._profile_config.legacy_budget_templates
+            and not self._runtime_v3_enabled()
+            and not self._amount_guard_enabled()
             and (canon_failed or not draft.rows)
             and not explicit_line_amounts
         ):
@@ -1274,6 +1431,8 @@ class BudgetExecutor:
         #      不再重复 project_search（_memory_rebuild 门控 4 好行不覆盖）。
         if (
             self._profile_config.legacy_budget_templates
+            and not self._runtime_v3_enabled()
+            and not self._amount_guard_enabled()
             and draft.rows
             and not canon_failed
             and not explicit_line_amounts
@@ -1387,7 +1546,7 @@ class BudgetExecutor:
         # 兼容档也不允许把一个合并的多服务物料行按模型猜测比例写入。
         # 项目、大类、小类查询已经完成，保留 blocked 用例所需的工具轨迹；
         # 写前阻断避免 workflow.save 产生无法解释的明细。
-        if self._profile_config.contract_fixes_v2 and _ambiguous_total_breakdown(
+        if self._amount_guard_enabled() and _ambiguous_total_breakdown(
             draft,
             text,
             explicit_line_amounts,
@@ -1414,12 +1573,15 @@ class BudgetExecutor:
             })
         # candidate/generic 写入前只接受本轮搜索返回的业务编码；模型输出和
         # 静态模板不能直接成为 workflow.save 的 ID 证据。
-        if self._profile_config.strict_runtime_mode and not self._save_evidence_ok(
+        if self._runtime_v3_enabled() and not self._save_evidence_ok(
             project, material_category, subclasses
         ):
             self._log_warning("写入预检失败：项目/大类/小类缺少本轮工具 evidence")
             return self._blocked("runtime_candidate_evidence_missing")
-        if not self._amount_payload_ok(detail_rows, total_amount):
+        if (
+            self._amount_guard_enabled()
+            and not self._amount_payload_ok(detail_rows, total_amount)
+        ):
             self._log_warning("写入预检失败：金额未守恒")
             return self._blocked("amount_total_mismatch")
         submit = self._submit_verdict(text)
@@ -1516,22 +1678,36 @@ class BudgetExecutor:
             elif name == self.WORKFLOW_BROWSER_SEARCH:
                 for option in result.get("options") or []:
                     code = str(option.get("code") or "")
-                    if args.get("field_id") == 29023 and code == str(category_code):
+                    if args.get("field_id") in self._category_field_ids and code == str(category_code):
                         category_ok = True
-                    if args.get("field_id") == 29028 and code:
+                    if args.get("field_id") in self._subclass_field_ids and code:
                         subclass_seen.add(code)
         return project_ok and category_ok and set(map(str, subclass_codes)).issubset(subclass_seen)
 
     @staticmethod
     def _amount_payload_ok(rows: list[dict[str, Any]], total: str) -> bool:
-        """保存前金额守恒校验，防止四舍五入或模板污染。"""
+        """保存前金额证据的数值/守恒校验，防止占位和模板污染。"""
         try:
-            line_total = round(sum(float(row["budget_amount"]) for row in rows), 2)
-            return abs(line_total - float(total)) <= 0.01 and all(
-                abs(round(float(row["quantity"]) * float(row["unit_price"]), 2)
-                    - float(row["budget_amount"])) <= 0.01
-                for row in rows
-            )
+            total_value = float(total)
+            if not rows or not math.isfinite(total_value) or total_value <= 0:
+                return False
+            values = []
+            for row in rows:
+                quantity = float(row["quantity"])
+                unit_price = float(row["unit_price"])
+                budget_amount = float(row["budget_amount"])
+                if (
+                    not all(math.isfinite(value) for value in (quantity, unit_price, budget_amount))
+                    or quantity <= 0
+                    or unit_price <= 0
+                    or budget_amount <= 0
+                ):
+                    return False
+                values.append(budget_amount)
+                if abs(round(quantity * unit_price, 2) - budget_amount) > 0.01:
+                    return False
+            line_total = round(sum(values), 2)
+            return abs(line_total - total_value) <= 0.01
         except (KeyError, TypeError, ValueError):
             return False
 
@@ -1563,6 +1739,251 @@ class BudgetExecutor:
         if result.get("error"):
             return None
         return result.get("schema") or {}
+
+    @staticmethod
+    def _schema_field_id(schema: dict[str, Any], role: str) -> int | None:
+        """按运行时 schema 的字段描述/依赖找 category 或 subclass id。
+
+        不假设 schema 的具体包装层（``fields``、``form_fields``、嵌套
+        ``properties`` 均可），也不把静态索引中的 id 当作恢复证据。
+        """
+        needles = {
+            "category": ("material_category", "wzlb", "物资大类", "费用大类", "大类"),
+            "subclass": ("material_subclass", "wzlx", "物资小类", "具体小类", "子类", "小类"),
+        }[role]
+
+        def walk(value: Any):
+            if isinstance(value, dict):
+                yield value
+                for child in value.values():
+                    yield from walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from walk(child)
+
+        candidates: list[tuple[int, int]] = []
+        for item in walk(schema):
+            raw_id = item.get("field_id", item.get("fieldId", item.get("id")))
+            text = " ".join(
+                f"{key} {value or ''}" for key, value in item.items()
+            ) if item else ""
+            # Some workflow.schema implementations expose the field role in
+            # ``field_descriptions`` and leave the numeric id embedded in the
+            # description (``... field_id=901``), rather than as a sibling key.
+            if raw_id is None:
+                # ``field_descriptions`` is a mapping of role -> description;
+                # score each entry independently so category text cannot make
+                # the subclass description inherit the first numeric id.
+                mapped_entries = []
+                for key, value in item.items():
+                    if isinstance(value, (dict, list)):
+                        continue
+                    entry_text = f"{key} {value or ''}"
+                    entry_match = re.search(
+                        r"field[_ ]?id\s*[=:：]\s*(\d+)", entry_text, re.I
+                    )
+                    if entry_match:
+                        mapped_entries.append((entry_text, entry_match.group(1)))
+                if mapped_entries:
+                    for entry_text, entry_id in mapped_entries:
+                        entry_lower = entry_text.lower()
+                        entry_score = sum(
+                            3 if len(needle) > 3 else 1
+                            for needle in needles if needle.lower() in entry_lower
+                        )
+                        if role == "subclass" and any(
+                            x in entry_lower for x in ("wzlb", "material_category", "大类")
+                        ):
+                            entry_score += 1
+                        if entry_score:
+                            candidates.append((entry_score, int(entry_id)))
+                    continue
+                # Do not parse an id from the string representation of a
+                # nested container; its first child would otherwise win over
+                # the role-specific child visited below.
+                if any(isinstance(value, (dict, list)) for value in item.values()):
+                    continue
+                id_match = re.search(r"field[_ ]?id\s*[=:：]\s*(\d+)", text, re.I)
+                raw_id = id_match.group(1) if id_match else None
+            try:
+                field_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if field_id <= 0:
+                continue
+            text = " ".join(
+                [text]
+                + [str(item.get(key) or "") for key in (
+                    "name", "label", "title", "description", "field_name",
+                    "key", "code", "depends_on", "dependency",
+                )]
+            ).lower()
+            score = 0
+            for needle in needles:
+                if needle.lower() in text:
+                    score += 3 if len(needle) > 3 else 1
+            # A subclass field commonly declares dependency on the category
+            # field; descriptions remain the primary signal, dependency is a
+            # useful tie-breaker only.
+            if role == "subclass" and any(x in text for x in ("wzlb", "material_category", "大类")):
+                score += 1
+            if score:
+                candidates.append((score, field_id))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        return candidates[0][1]
+
+    def _refresh_field_ids(self, schema: dict[str, Any]) -> None:
+        """更新本轮 schema 推导的字段角色，保留安全默认值作兼容。"""
+        category_id = self._schema_field_id(schema, "category")
+        subclass_id = self._schema_field_id(schema, "subclass")
+        if category_id is not None:
+            self._category_field_ids.add(category_id)
+        if subclass_id is not None:
+            self._subclass_field_ids.add(subclass_id)
+        self._log_info(
+            "SCHEMA_FIELD_ROLES "
+            f"category={category_id or '-'} subclass={subclass_id or '-'}"
+        )
+
+    def _schema_subclass_required(self) -> bool:
+        """按实时 workflow.schema 判断明细小类是否为必填字段。
+
+        旧 schema（或恢复簇关闭）保持原来的严格行为。新 schema 若明确声明
+        detail_2/material_subclass 非必填，则不因为没有小类候选而制造一个首选
+        项；若有明细行但小类解析失败，也允许以空小类继续保存，让后端按 schema
+        处理。这里只改变“是否必填”，不放宽项目、大类或金额门禁。
+        """
+        if not self._schema_retry_enabled():
+            return True
+        schema = self._workflow_schema_data or {}
+
+        def _required_value(value: Any) -> bool | None:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                if value.strip().lower() in {"true", "required", "必填", "yes"}:
+                    return True
+                if value.strip().lower() in {"false", "optional", "非必填", "no"}:
+                    return False
+            return None
+
+        def _walk(value: Any):
+            if isinstance(value, dict):
+                yield value
+                for child in value.values():
+                    yield from _walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from _walk(child)
+
+        # 常见 schema 形态：detail_tables.detail_2.required_fields。直接读取
+        # 它可以区分 ``[]``（明确无必填小类）和缺少 detail table（未知）。
+        detail_tables = schema.get("detail_tables")
+        if isinstance(detail_tables, dict):
+            detail = detail_tables.get("detail_2", detail_tables.get("detail2"))
+            if isinstance(detail, dict) and isinstance(
+                detail.get("required_fields"), (list, tuple, set)
+            ):
+                required = {str(key).lower() for key in detail["required_fields"]}
+                return any(
+                    key in required
+                    for key in ("material_subclass", "wzlx", "material_sub_class")
+                )
+
+        saw_explicit = False
+        for item in _walk(schema):
+            required_fields = item.get("required_fields")
+            if isinstance(required_fields, (list, tuple, set)):
+                keys = {str(key).lower() for key in required_fields}
+                if any(key in keys for key in ("material_subclass", "wzlx", "material_sub_class")):
+                    return True
+                # A detail table with an explicit required_fields list that does
+                # not contain subclass is an authoritative optional declaration.
+                if any(key in item for key in ("detail_2", "detail2", "details", "fields", "columns")):
+                    saw_explicit = True
+            for key, value2 in item.items():
+                key_lower = str(key).lower()
+                if key_lower in {"material_subclass", "wzlx", "subclass"}:
+                    required = _required_value(value2)
+                    if required is not None:
+                        saw_explicit = True
+                        if required:
+                            return True
+                        continue
+                if key_lower in {"required", "is_required", "required_field"}:
+                    # Only treat this as a subclass declaration when the same
+                    # field object carries a subclass role/name.
+                    role_text = " ".join(
+                        str(item.get(k) or "")
+                        for k in ("name", "label", "title", "key", "field_name", "code")
+                    ).lower()
+                    if any(token in role_text for token in ("material_subclass", "wzlx", "小类", "子类")):
+                        required = _required_value(value2)
+                        if required is not None:
+                            saw_explicit = True
+                            if required:
+                                return True
+        # A top-level required_fields list is also authoritative when it names
+        # the field; absent subclass there means optional in compact schemas.
+        top_required = schema.get("required_fields")
+        if isinstance(top_required, (list, tuple, set)):
+            keys = {str(key).lower() for key in top_required}
+            if any(key in keys for key in ("material_subclass", "wzlx", "material_sub_class")):
+                return True
+            saw_explicit = True
+        return not saw_explicit
+
+    @staticmethod
+    def _is_browser_options_error(result: dict[str, Any]) -> bool:
+        """判断是否属于可通过刷新 workflow.schema 恢复的错误。"""
+        if not isinstance(result, dict):
+            return False
+        error = " ".join(
+            str(result.get(key) or "")
+            for key in ("error", "error_code", "code", "message")
+        ).lower().replace("_", " ")
+        if not error:
+            return False
+        return any(
+            marker in error
+            for marker in (
+                "browser options not found", "options not found", "option not found",
+                "field not found", "unknown field", "invalid field", "field id",
+                "schema not found", "schema mismatch", "schema changed",
+                "invalid schema", "schema error", "workflow schema",
+                "dependency mismatch", "invalid dependency",
+            )
+        )
+
+    def _browser_search(
+        self,
+        role: str,
+        args: dict[str, Any],
+        workflow_id: int,
+    ) -> dict[str, Any]:
+        """搜索 browser options，并对字段错误做一次 schema 恢复重试。"""
+        result = self._call_tool(self.WORKFLOW_BROWSER_SEARCH, args)
+        if not self._schema_retry_enabled():
+            return result
+        if not self._is_browser_options_error(result) or role in self._browser_recovery_attempted:
+            return result
+        self._browser_recovery_attempted.add(role)
+        self._log_warning(f"browser_search {role} 字段错误，刷新 workflow.schema 后仅重试一次")
+        schema = self._workflow_schema(workflow_id)
+        if schema is None:
+            return result
+        self._workflow_schema_data = schema
+        self._refresh_field_ids(schema)
+        field_id = self._schema_field_id(schema, role)
+        if field_id is None:
+            self._log_warning(f"schema 未解析出 {role} field_id，放弃恢复")
+            return result
+        retry_args = dict(args)
+        retry_args["field_id"] = field_id
+        self._log_info(f"browser_search {role} 恢复重试 field_id={field_id}")
+        return self._call_tool(self.WORKFLOW_BROWSER_SEARCH, retry_args)
 
     # -------------------------------------------------- 多轮澄清 --
     def _clarify_slots(self, context: str) -> dict[str, Any]:
@@ -1711,7 +2132,11 @@ class BudgetExecutor:
 
         # 2) 搜索短名：澄清答复短语 → 别名映射优先，其次 planner.search_term。
         phrase = clarified.get("project_phrase") or ""
-        mapped = _PROJECT_ALIAS_MAP.get(phrase) if phrase else ""
+        mapped = (
+            _PROJECT_ALIAS_MAP.get(phrase)
+            if phrase and not self._runtime_v3_enabled()
+            else ""
+        )
         if mapped:
             search_term = mapped
         else:
@@ -1720,7 +2145,11 @@ class BudgetExecutor:
         if not search_term:
             q_phrase = _regex_project_phrase(text)
             if q_phrase:
-                search_term = _PROJECT_ALIAS_MAP.get(q_phrase) or q_phrase
+                search_term = (
+                    _PROJECT_ALIAS_MAP.get(q_phrase) or q_phrase
+                    if not self._runtime_v3_enabled()
+                    else q_phrase
+                )
         if not search_term:
             search_term = phrase
         # 搜索词记忆（用户定案 2026-08-19）：query 含高置信项目词 → 兜底补搜该词。
@@ -1729,6 +2158,7 @@ class BudgetExecutor:
         golden_term = (
             _project_search_golden_for(text)
             if self._profile_config.legacy_budget_templates
+            and not self._runtime_v3_enabled()
             else ""
         )
         if golden_term and golden_term in _PROJECT_TERM_GOLDEN_MATERIAL_GATED:
@@ -1742,6 +2172,14 @@ class BudgetExecutor:
         if self._profile_config.context_workflow_v2 and search_term and not _is_specific_project_term(search_term):
             self._log_warning(f"项目搜索词过于宽泛，拒绝搜索: {search_term!r}")
             search_term = ""
+
+        if search_term and self._project_refinement_enabled():
+            normalized_term = _normalize_project_search_term(search_term)
+            if normalized_term and normalized_term != search_term:
+                self._log_info(
+                    f"[项目搜索] 主搜词规范化: {search_term!r} → {normalized_term!r}"
+                )
+                search_term = normalized_term
 
         searched_terms: set[str] = set()
         result_by_term: dict[str, list[dict[str, Any]]] = {}
@@ -1774,7 +2212,9 @@ class BudgetExecutor:
             return picked
 
         # 3) 细化：去通用后缀再搜（search_term 是别名/完整名时兜底）。
-        for refined in _refine_search_terms(search_term, text):
+        for refined in _refine_search_terms(
+            search_term, text, runtime_v3=self._project_refinement_enabled()
+        ):
             rows = _project_search_once(refined, "细化")
             if rows:
                 picked = self._pick_project(
@@ -1874,7 +2314,7 @@ class BudgetExecutor:
 
         # 5) 泛化后缀归一：旧兼容档把同 base 视作同一项目。候选档不再
         # 依赖训练集归纳的“取首个”，同 base 但 code 不同仍需追问/阻断。
-        if not self._profile_config.strict_runtime_mode and _same_generic_base(projects):
+        if not self._runtime_v3_enabled() and _same_generic_base(projects):
             return self._project_dict(projects[0])
 
         # 6) 真歧义 → blocked。
@@ -1897,9 +2337,14 @@ class BudgetExecutor:
         clarified: dict[str, Any],
     ) -> dict[str, str] | None:
         """browser_search(29023) → 大类选项 → 语义匹配 → {code, label}；无唯一 → None。"""
-        result = self._call_tool(
-            self.WORKFLOW_BROWSER_SEARCH,
-            {"workflow_id": _BUDGET_WORKFLOW_ID, "field_id": 29023},
+        field_id = (
+            self._schema_field_id(self._workflow_schema_data, "category")
+            if self._schema_retry_enabled() else None
+        ) or 29023
+        result = self._browser_search(
+            "category",
+            {"workflow_id": _BUDGET_WORKFLOW_ID, "field_id": field_id},
+            _BUDGET_WORKFLOW_ID,
         )
         options = result.get("options") or []
         if not options:
@@ -1938,7 +2383,7 @@ class BudgetExecutor:
             "CANDIDATE_SET 大类="
             f"candidates={[(o.get('code'), o.get('label'), s) for o, s in scored[:8]]}"
         )
-        if self._profile_config.strict_runtime_mode and scored[0][1] < 80:
+        if self._runtime_v3_enabled() and scored[0][1] < 80:
             self._log_warning("候选档大类没有足够的语义重合，阻断而不猜测")
             return None
         best = scored[0][0]
@@ -1953,16 +2398,21 @@ class BudgetExecutor:
         material_category: str,
     ) -> list[dict[str, Any]] | None:
         """browser_search(29028, dep={wbscode,wzlb}) → 小类选项（供匹配/单选项兜底）。"""
-        result = self._call_tool(
-            self.WORKFLOW_BROWSER_SEARCH,
+        field_id = (
+            self._schema_field_id(self._workflow_schema_data, "subclass")
+            if self._schema_retry_enabled() else None
+        ) or 29028
+        result = self._browser_search(
+            "subclass",
             {
                 "workflow_id": _BUDGET_WORKFLOW_ID,
-                "field_id": 29028,
+                "field_id": field_id,
                 "dep": {
                     "wbscode": project.get("wbs_code") or "",
                     "wzlb": material_category,
                 },
             },
+            _BUDGET_WORKFLOW_ID,
         )
         if result.get("error"):
             return None
@@ -1983,6 +2433,76 @@ class BudgetExecutor:
             return []
         label = str(options[0].get("label") or "").strip()
         return [label] if label else []
+
+    def _invoke_material_selector(
+        self,
+        unresolved: list[tuple[int, BudgetRow]],
+        options: list[dict[str, Any]],
+    ) -> dict[int, tuple[int, float]]:
+        """调用一次可注入的候选排序器，并只接受 row/candidate index。
+
+        支持批量 selector(rows, options) 以及便于单测的 selector(row,
+        options) 形态。任何 code/id 输出都会被丢弃；实际 code 始终从
+        ``options[candidate_index]`` 读取。
+        """
+        selector = self._material_selector
+        if selector is None or not unresolved:
+            return {}
+        rows_payload = [
+            {"row_index": idx, "material_name": row.material_name,
+             "subclass_hint": row.subclass_hint}
+            for idx, row in unresolved
+        ]
+        options_payload = [
+            {"candidate_index": idx, "label": str(option.get("label") or "")}
+            for idx, option in enumerate(options)
+        ]
+        try:
+            raw = selector(rows_payload, options_payload)
+        except TypeError:
+            # A compact row-wise helper remains injectable without requiring a
+            # gateway/executor adapter.
+            raw = [selector(row, options_payload) for row in rows_payload]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError):
+                return {}
+        if isinstance(raw, dict) and "row_index" in raw:
+            raw = [raw]
+        if isinstance(raw, dict):
+            raw = [dict(value, row_index=key) if isinstance(value, dict) else {}
+                   for key, value in raw.items()]
+        if not isinstance(raw, list):
+            return {}
+        selected: dict[int, tuple[int, float]] = {}
+        valid_rows = {idx for idx, _row in unresolved}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            # Explicitly reject identifier-shaped responses.  This keeps the
+            # model boundary honest even when a backend returns extra fields.
+            if any(key in item for key in ("code", "candidate_code", "id")):
+                continue
+            try:
+                row_idx = int(item.get("row_index"))
+                candidate_idx = int(item.get("candidate_index", item.get("index")))
+                confidence = float(item.get("confidence"))
+            except (TypeError, ValueError):
+                continue
+            if row_idx not in valid_rows or not 0 <= candidate_idx < len(options):
+                continue
+            if confidence < _MATERIAL_SELECTOR_CONFIDENCE_FLOOR:
+                self._log_warning(
+                    f"候选排序低置信 row={row_idx} confidence={confidence:.3f}，阻断"
+                )
+                continue
+            selected[row_idx] = (candidate_idx, confidence)
+        self._log_info(
+            "CANDIDATE_SELECTOR "
+            f"rows={[idx for idx, _ in unresolved]} selected={selected}"
+        )
+        return selected
 
     def _canonicalize_rows(self, draft: BudgetDraft) -> bool:
         """把 LLM 噪声物料行归一为 _MATERIAL_SUBCLASS_MAP 的 canonical 名（用户定案）。
@@ -2046,7 +2566,7 @@ class BudgetExecutor:
             m = (row.material_name or "").strip()
             if not cs:
                 # 无 canonical：有 subclass_hint 则保留原行交给小类匹配，否则 block。
-                if (row.subclass_hint or "").strip():
+                if (row.subclass_hint or "").strip() or self._material_selector is not None:
                     picked.append((row, None))
                 else:
                     return False
@@ -2088,15 +2608,23 @@ class BudgetExecutor:
         任一行 0 命中/不唯一 → None（blocked 双键）——否则 save 会跑偏。
         单行时澄清答复的小类词可作强信号。
         """
+        subclass_required = self._schema_subclass_required()
+        # Schema 明确声明小类非必填时，空明细可以合法落盘；不要为了满足
+        # 旧流程而拿 29028 首个选项冒充用户事实。
+        if not draft.rows and not subclass_required:
+            return []
         options = self._subclass_options(project, material_category)
         if not options:
+            if not subclass_required:
+                return [""] * len(draft.rows)
             return None
         if not draft.rows:
             # 无物料行且澄清也未给出具体小类（有预算无物料，wf_0070 等）→
             # 小类不唯一，blocked(ambiguous_material_subclass)（gold forbidden save）。
             return None
 
-        codes: list[str] = []
+        unresolved: list[tuple[int, BudgetRow]] = []
+        deterministic: dict[int, str] = {}
         for i, row in enumerate(draft.rows):
             material = row.material_name or ""
             # 信号：澄清答复小类词（单行）→ 物料 → 确定性映射 → planner 小类提示。
@@ -2111,11 +2639,12 @@ class BudgetExecutor:
                 label = opt.get("label") or ""
                 # candidate 档禁止用两个泛词的少量字符重合来制造唯一候选；
                 # 仍保留旧档的宽松 overlap 规则，便于单簇回滚。
-                if self._profile_config.strict_runtime_mode:
+                if self._runtime_v3_enabled():
                     norm_sig = [re.sub(r"[\s、，,;；/（）()]+", "", str(sig)) for sig in signals if sig]
                     norm_label = re.sub(r"[\s、，,;；/（）()]+", "", str(label))
                     score = max(
-                        (100 if s == norm_label else 80 if s and (s in norm_label or norm_label in s) else 0)
+                        (100 if s == norm_label else 80 if s and (s in norm_label or norm_label in s)
+                         else _semantic_option_score(s, norm_label))
                         for s in norm_sig
                     ) if norm_sig else 0
                 else:
@@ -2134,11 +2663,29 @@ class BudgetExecutor:
                 f"{'唯一高分' if best_code else '无唯一合法候选'}"
             )
             if best_code is None or best_score <= 0 or (
-                self._profile_config.strict_runtime_mode and best_score < 80
+                self._runtime_v3_enabled() and best_score < 80
             ):
-                return None
-            codes.append(str(best_code))
-        return codes
+                unresolved.append((i, row))
+                continue
+            deterministic[i] = str(best_code)
+
+        selected = self._invoke_material_selector(unresolved, options)
+        for i, _row in unresolved:
+            if i in selected:
+                candidate_idx, confidence = selected[i]
+                option = options[candidate_idx]
+                code = str(option.get("code") or "")
+                if code:
+                    deterministic[i] = code
+                    self._log_info(
+                        f"CANDIDATE_SELECTOR_BIND row={i} candidate_index={candidate_idx} "
+                        f"confidence={confidence:.3f} label={option.get('label')!r}"
+                    )
+        if len(deterministic) != len(draft.rows):
+            if not subclass_required:
+                return [deterministic.get(i, "") for i in range(len(draft.rows))]
+            return None
+        return [deterministic[i] for i in range(len(draft.rows))]
 
     # -------------------------------------------------- 金额 --
     def _budget_known(self, text: str, clarified: dict[str, Any]) -> bool:
@@ -2180,14 +2727,16 @@ class BudgetExecutor:
           gold 任意值，只追 total 条件）；
         无显式总额 → total = Σ(qty×unit)。
         单价缺失：多行仅总额 → blocked(insufficient_amount_breakdown)；
-        单行无任何金额 → 占位 1.00（用户定案——无金额 case 保存结构分，
-        金额条件不追分；见 gold-data-anomalies 待分析）。
+        单行无任何金额 → 兼容档保留 1.00 占位；金额门禁开启时返回
+        ``amount_unresolved``，绝不把占位值写入流程。
         """
         rows = draft.rows
         if not rows:
             return {"error_reason": "amount_unresolved"}
 
         total_explicit = self._explicit_total(text, clarified)
+        if self._amount_guard_enabled() and total_explicit is not None and total_explicit <= 0:
+            return {"error_reason": "amount_unresolved"}
 
         out_rows: list[dict[str, Any]] = []
         explicit_line_amounts: list[bool] = []
@@ -2200,10 +2749,28 @@ class BudgetExecutor:
             # evidence 的最小可解释来源。模型传入的 unit_price 只有在原文
             # 没有该行金额时才作为候选，不能覆盖用户明确数字。
             explicit_unit = _regex_unit_for_material(text, row.material_name)
+            if explicit_unit is None:
+                # canonicalize_rows 可能把原文中的简称（如“视频”）改成
+                # “视频制作”；回看 execute 保存的原始金额证据，不能因规范化
+                # 丢失而误判为模型猜测。
+                for raw_name, raw_unit in getattr(self, "_explicit_amount_facts", []):
+                    if (
+                        raw_name == row.material_name
+                        or raw_name in str(row.material_name or "")
+                        or str(row.material_name or "") in raw_name
+                    ):
+                        explicit_unit = raw_unit
+                        break
             unit = explicit_unit if explicit_unit is not None else _to_amount(row.unit_price)
             explicit_line_amounts.append(explicit_unit is not None)
+            if self._amount_guard_enabled() and explicit_unit is not None and explicit_unit <= 0:
+                return {"error_reason": "amount_unresolved"}
+            # In the candidate/generic runtime a model-provided unit price is
+            # not a user amount fact.  The legacy switch intentionally keeps
+            # its historical placeholder behavior until the main agent flips
+            # the profile-level migration gate.
             if (
-                self._profile_config.strict_runtime_mode
+                self._amount_guard_enabled()
                 and total_explicit is None
                 and explicit_unit is None
             ):
@@ -2221,10 +2788,13 @@ class BudgetExecutor:
                         return {"error_reason": "insufficient_amount_breakdown"}
                     missing_unit_rows.append(i)
                     unit = 0.0
-                if self._profile_config.strict_runtime_mode and total_explicit is None:
+                if self._amount_guard_enabled() and total_explicit is None:
                     return {"error_reason": "amount_unresolved"}
                 if len(rows) == 1:
-                    unit = 1.0
+                    # A single-row total is observable and determines the
+                    # unit price; legacy keeps its historical 1.00 fallback
+                    # only when no total exists.
+                    unit = total_explicit / qty if total_explicit is not None and qty else 1.0
             budget = round(qty * unit, 2)
             out_rows.append({
                 "quantity": str(qty),
@@ -2234,7 +2804,7 @@ class BudgetExecutor:
         # 候选/通用档不把模型猜出的单价当作用户事实：多条明细只有总额时，
         # 分配比例不可观测，必须追问或阻断；兼容档仍保留历史比例缩放以便回滚。
         if (
-            self._profile_config.strict_runtime_mode
+            self._amount_guard_enabled()
             and total_explicit is not None
             and len(out_rows) > 1
             and not all(explicit_line_amounts)
@@ -2377,7 +2947,7 @@ class BudgetExecutor:
 
     def _submit_verdict(self, text: str) -> bool:
         """提交/存草稿语义统一解析；冲突时返回安全的 False，由 execute 阻断。"""
-        speech = parse_speech_act(text)
+        speech = self._speech_act(text)
         if self._log is not None:
             self._log.info(f"语气决策: {speech.as_dict()}")
         return speech.submit
@@ -2450,29 +3020,220 @@ class BudgetExecutor:
         )
 
 
-def _refine_search_terms(search_term: str, text: str) -> list[str]:
-    """搜索细化候选：去通用业务后缀再搜（项目/平台/工程/系统/建设/采购/服务/中心）。"""
-    candidates: list[str] = []
-    phrase = _regex_project_phrase(text) or search_term
-    base = re.sub(
-        r"(?:项目|平台|系统|工程|建设|采购|服务|中心|活动|发布会)$", "", phrase or ""
+def _refine_search_terms(
+    search_term: str, text: str, *, runtime_v3: bool = True
+) -> list[str]:
+    """从原始用户短语产生 bounded refinement（V3 至多一个）。
+
+    refinement 不是别名表：先只去掉项目命名后缀；若短语本身已无后缀，
+    仅取其最后一个有区分度的语义片段（中文分词的保守近似）。最多一个
+    候选使一次零命中后的搜索预算可审计，也避免顺序取到第一项目。
+    """
+    phrase = (_regex_project_phrase(text) or search_term or "").strip()
+    if not phrase:
+        return []
+    if not runtime_v3:
+        # Preserve the compatibility path when the opt-in flag is off.
+        candidates: list[str] = []
+        base = re.sub(
+            r"(?:项目|平台|系统|工程|建设|采购|服务|中心|活动|发布会)$", "", phrase
+        )
+        if base and base != search_term:
+            candidates.append(base)
+        for term in (search_term, phrase):
+            for suffix in ("项目", "工程", "平台", "系统"):
+                if term.endswith(suffix) and term[:-len(suffix)]:
+                    candidates.append(term[:-len(suffix)])
+        return list(dict.fromkeys(candidates))
+    # ``_regex_project_phrase`` 的通用“项目里的/项目方面”分支可能把
+    # 句首动作一并捕获（如“帮我提交区域联合路演项目”）。细化前剥掉
+    # 这些请求前缀，避免把“我提”之类动作片段当成项目检索键。
+    normalized_phrase = re.split(
+        r"(?:帮我|请帮我|请|需要|要|给我|提交|申请|采购|购买|买|存个|存一个|存下|"
+        r"提一个|提一批|提一项|做一笔|做一项|一笔|一项|一批)",
+        phrase,
+    )[-1].strip("的里中 ")
+    compact = re.sub(r"[\s，。；,;:：、]+", "", normalized_phrase)
+    # 仅从用户给出的项目短语剥离命名修饰。这里不维护任何项目别名，
+    # 也不把剥离结果直接当成项目事实；它最多只会触发一次实时检索。
+    # 比旧版只去掉「项目/平台」更完整地覆盖“知识助手升级项目”这类
+    # 口语写法，同时把“品牌市场产品发布会”中的泛化组成部分排除，
+    # 让后面的原文语义片段有机会成为唯一检索键。
+    refine_suffixes = (
+        "发布会", "专项测试", "产品", "升级", "改版", "测试", "活动",
+        "项目", "平台", "系统", "工程", "建设", "采购", "服务", "中心",
+        "应用", "研发", "运维", "费用", "申请", "预算", "物资", "品牌",
+        "市场",
     )
-    if base and base != search_term:
-        candidates.append(base)
-    for term in (search_term, phrase):
-        for suf in ("项目", "工程", "平台", "系统"):
-            if term.endswith(suf):
-                c = term[: -len(suf)]
-                if c:
-                    candidates.append(c)
-    # 去重保序。
-    seen: set[str] = set()
-    out: list[str] = []
-    for c in candidates:
-        if c and c not in seen:
-            seen.add(c)
-            out.append(c)
-    return out
+    base = compact
+    changed = True
+    while changed and base:
+        changed = False
+        for suffix in refine_suffixes:
+            if len(base) > len(suffix) and base.endswith(suffix):
+                base = base[: -len(suffix)]
+                changed = True
+                break
+    if base and base != search_term and _is_specific_project_term(base):
+        return [base]
+
+    # 项目全称和实际项目命名可能完全不同（例如用户只说“品牌市场产品
+    # 发布会”，运行时项目名可能以“定制物资”命名）。这时从项目短语之外
+    # 的原文抽取一个最小、可解释的语义片段。只使用原文中出现的字符，
+    # 过滤动作/金额/组织泛词，并按出现次数优先，避免把任意第一候选当成
+    # 项目。仍然只返回一个片段，调用方负责实时候选唯一性校验。
+    # 只从用户短语切出末端语义块，不加入任何外部词或固定项目名。优先
+    # 较长末端块，再退到两字块；泛词门禁会拒绝“项目/平台”等结果。
+    chunks: list[str] = []
+    # Two-character suffixes are a conservative Chinese semantic-token
+    # approximation (e.g. ``官网传播`` -> ``传播``); trying a three-character
+    # suffix first would often create the non-word ``网传播``.
+    for size in (4, 2, 3):
+        if len(compact) >= size:
+            chunk = compact[-size:]
+            if _is_specific_project_term(chunk):
+                chunks.append(chunk)
+    # 去重并只保留一个 refinement；若它就是主搜词则视为无 refinement。
+    for candidate in chunks:
+        # “品牌市场产品发布会”之类短语的末端块完全由命名修饰组成，
+        # 先跳过它们，避免浪费唯一的细化机会；含有真实语义字符的旧路径
+        # （例如“官网传播”→“传播”）保持不变。
+        if candidate != search_term and not _project_modifier_only(candidate):
+            return [candidate]
+
+    semantic = _bounded_semantic_fragments(text, compact)
+    for candidate in semantic:
+        if candidate != search_term and _is_specific_project_term(candidate):
+            return [candidate]
+    return []
+
+
+_PROJECT_REFINE_MODIFIERS = frozenset({
+    "项目", "平台", "系统", "工程", "建设", "采购", "服务", "中心", "应用",
+    "研发", "运维", "升级", "改版", "专项", "测试", "活动", "产品", "品牌",
+    "市场", "发布会", "费用", "申请", "预算", "物资",
+})
+
+_PROJECT_PRIMARY_SUFFIXES = (
+    # 只收录几乎没有业务区分度的命名后缀；“服务/活动/产品”等词可能
+    # 是真实项目语义，保留在原始词中交给实时候选消歧。
+    "升级", "改版", "项目", "平台", "系统", "工程", "建设", "采购",
+    "应用", "研发", "运维",
+)
+
+
+def _normalize_project_search_term(value: str) -> str:
+    """规范化 V3 主搜词，只删除明确的项目命名后缀。
+
+    该函数不做别名替换、不读取项目表，也不改变用户事实；它仅避免把
+    “知识助手升级项目”作为一次必然零命中的完整字符串发送给工具。若
+    剥离后变成泛词，则保留原始搜索词，交给后续有界细化/候选消歧。
+    """
+    term = re.sub(r"[\s，。；,;:：、]+", "", str(value or ""))
+    if not term:
+        return ""
+    normalized = term
+    changed = True
+    while changed and normalized:
+        changed = False
+        for suffix in _PROJECT_PRIMARY_SUFFIXES:
+            if len(normalized) > len(suffix) and normalized.endswith(suffix):
+                candidate = normalized[: -len(suffix)]
+                if _is_specific_project_term(candidate):
+                    normalized = candidate
+                    changed = True
+                break
+    return normalized or term
+
+
+def _project_modifier_only(value: str) -> bool:
+    """判断一个细化片段是否完全由项目命名/表单泛化修饰构成。"""
+    value = str(value or "")
+    if not value:
+        return True
+    # 末端切片可能从多字修饰词中间开始（“品发布会”“布会”），
+    # 只要片段是修饰词的一部分或包含完整修饰词，也视为不可用。
+    if any(value in modifier or modifier in value for modifier in _PROJECT_REFINE_MODIFIERS):
+        return True
+    remaining = value
+    for modifier in sorted(_PROJECT_REFINE_MODIFIERS, key=len, reverse=True):
+        remaining = remaining.replace(modifier, "")
+    return len(remaining) <= 1
+
+
+_PROJECT_REFINE_STOP_FRAGMENTS = frozenset({
+    "帮我", "请帮我", "请", "需要", "我要", "我想", "想要", "提交", "直接",
+    "存个", "存一个", "草稿", "申请", "费用", "预算", "总预算", "总额", "金额",
+    "一批", "一项", "一套", "一些", "一个", "一笔", "物资", "采购", "项目",
+    "平台", "系统", "工程", "建设", "服务", "中心", "品牌", "市场", "产品",
+    "发布会", "活动", "升级", "改版", "专项", "测试", "元", "万元",
+})
+
+
+def _bounded_semantic_fragments(text: str, project_phrase: str) -> list[str]:
+    """从项目短语之外的用户原文生成有界检索片段。
+
+    这是一个语言层的候选生成器，不读取静态项目表，也不依据 case/gold
+    选择项目。它只在明确项目短语主搜失败后使用，返回按可观测文本频次
+    排序的片段；真正的项目是否成立仍由 ``workflow.project_search`` 和
+    ``_pick_project`` 决定。
+    """
+    raw = str(text or "")
+    if not raw:
+        return []
+    compact_phrase = re.sub(r"\s+", "", str(project_phrase or ""))
+    outside = raw
+    if compact_phrase:
+        # 只移除首个项目短语，避免把同一项目短语本身再拆成细化词。
+        outside = outside.replace(compact_phrase, " ", 1)
+
+    # 动作、金额和流程泛词不提供项目身份。先作为边界删除，再做片段
+    # 统计，保证“帮我提交……”不会生成跨词的伪候选。
+    stop_words = sorted(_PROJECT_REFINE_STOP_FRAGMENTS, key=len, reverse=True)
+    if stop_words:
+        outside = re.sub("|".join(re.escape(word) for word in stop_words), " ", outside)
+
+    # 捕获项目短语后的物料/服务名；动作词和量词只是边界，不进入候选。
+    runs: list[str] = []
+    for match in re.finditer(
+        r"(?:买|购置|采购|做|需要|要|物料|一批|一项|一套|一些|一笔)"
+        r"\s*([一-龥A-Za-z][一-龥A-Za-z·（）()_\-]{1,15})",
+        outside,
+    ):
+        runs.append(match.group(1))
+    if not runs:
+        runs = re.findall(r"[一-龥A-Za-z][一-龥A-Za-z·（）()_\-]{1,15}", outside)
+
+    candidates: dict[str, tuple[int, int, int]] = {}
+    for run in runs:
+        normalized = run.strip("的里中，。；,;、:：")
+        if not normalized:
+            continue
+        # 去除量词/泛化尾词后再切片；完整短语也保留，供唯一项目名直接命中。
+        normalized = re.sub(r"^(?:一批|一项|一套|一些|一个|一笔)", "", normalized)
+        normalized = re.sub(r"(?:费用|申请|草稿|预算|总额|金额)$", "", normalized)
+        if len(normalized) < 2:
+            continue
+        pieces = [normalized]
+        if len(normalized) > 2:
+            # 业务短语常由“核心词+类别尾词”组成；短前缀可命中实际项目名，
+            # 但最终仍需实时候选唯一，不能单凭该前缀写入流程。
+            pieces.extend(normalized[i:i + 2] for i in range(len(normalized) - 1))
+        for piece in pieces:
+            piece = piece.strip()
+            if len(piece) < 2 or piece in _PROJECT_REFINE_STOP_FRAGMENTS:
+                continue
+            if not _is_specific_project_term(piece):
+                continue
+            occurrences = raw.count(piece)
+            # 捕获到的 run 是比全文随机片段更强的可观测信号；同频时偏向
+            # 较短的核心片段，避免“定制促品”这种物料全称阻塞项目检索。
+            score = (occurrences, 1, -len(piece))
+            current = candidates.get(piece)
+            if current is None or score > current:
+                candidates[piece] = score
+
+    return [item[0] for item in sorted(candidates.items(), key=lambda item: item[1], reverse=True)]
 
 
 def _regex_qty_for_material(text: str, material: str) -> int | None:
@@ -2522,6 +3283,7 @@ def _regex_unit_for_material(text: str, material: str) -> float | None:
         after = text[idx + len(candidate): idx + len(candidate) + 48]
         m = re.match(
             r"\s*(?:[0-9]+\s*(?:台|个|套|条|支|项|册|批|场|件|张|份))?\s*"
+            r"(?:费用|服务|采购)?\s*"
             r"[，,、；;：:]?\s*"
             r"(?:每(?:台|个|套|条|支|项|册|批|场|件|张|份)?\s*)?"
             r"([0-9]+(?:\.[0-9]+)?)\s*(万|元|块)",
@@ -2676,6 +3438,27 @@ class BudgetSkill:
         self.last_timings: dict[str, Any] = {}
         self.last_planner_gateway: Any = None
 
+    @staticmethod
+    def _build_material_selector(gateway: Any) -> Any:
+        """用同一个 planner gateway 构建一次最小候选索引排序闭包。"""
+        def select(rows: list[dict[str, Any]], options: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            try:
+                raw = gateway.structured_call(
+                    _MATERIAL_SELECTOR_CARD,
+                    {"rows": rows, "options": options},
+                    _MATERIAL_SELECTOR_SCHEMA,
+                    timeout_s=_BUDGET_PLAN_TIMEOUT_S,
+                    fallback={"selections": []},
+                )
+            except Exception as exc:
+                # A selector is an optional refinement. Gateway/runtime errors
+                # must degrade to deterministic matching, never abort the SOP.
+                return []
+            if not isinstance(raw, dict):
+                return []
+            return raw.get("selections") or []
+        return select
+
     def run(
         self,
         budget_subs: list[str],
@@ -2688,6 +3471,7 @@ class BudgetSkill:
         static_context: StaticContextStore,
         multi_domain: bool = False,
         context: Any = None,
+        material_selector: Any = None,
     ) -> dict[str, Any]:
         """执行预算域：编排（LLM#2）→ 执行（确定性 SOP）。
 
@@ -2702,6 +3486,8 @@ class BudgetSkill:
             static_context: 静态上下文（透传给执行器）。
             multi_domain: 是否多域合并（budget + meeting/leave）；决定保存后是否
                 做 oa 验证（仅多域 case）。
+            material_selector: 可选的小类候选索引排序器；输出只允许
+                row_index/candidate_index/confidence。
 
         Returns:
             {"workflow_draft_result": {...}}；永不返回 None。
@@ -2729,7 +3515,10 @@ class BudgetSkill:
                 planner_gateway = LLMGateway(logger=planner_logger)
         self.last_planner_gateway = planner_gateway
         draft = self.planner.plan(sub_context, now_iso, mode, planner_gateway)
-        if self.profile_config.strict_runtime_mode and draft.source != "llm":
+        if (
+            (self.profile_config.strict_runtime_mode or self.profile_config.budget_runtime_v3)
+            and draft.source != "llm"
+        ):
             self.last_timings = {
                 "orchestrate_s": round(draft.elapsed_s, 3),
                 "exec_s": 0.0,
@@ -2741,6 +3530,17 @@ class BudgetSkill:
             }}
 
         # 执行层：确定性流程 SOP（multi_turn 时执行器内部先做多轮澄清）。
+        selector = material_selector
+        if (
+            selector is None
+            and (
+                self.profile_config.budget_runtime_v3
+                or self.profile_config.strict_runtime_mode
+            )
+            and planner_gateway is not None
+            and getattr(planner_gateway, "available", False)
+        ):
+            selector = self._build_material_selector(planner_gateway)
         executor = BudgetExecutor(
             env,
             registry,
@@ -2748,6 +3548,7 @@ class BudgetSkill:
             logger=self.logger,
             profile_config=self.profile_config,
             context=context,
+            material_selector=selector,
         )
         result = executor.execute(
             draft,
@@ -2779,6 +3580,7 @@ __all__ = [
     "_to_amount",
     "_to_qty",
     "_overlap_score",
+    "_semantic_option_score",
     "_longest_common_len",
     "_regex_project_phrase",
     "_regex_project_code",

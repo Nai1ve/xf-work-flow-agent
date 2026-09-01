@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from utils.holiday_calendar import duration_for, duration_for_leave
+from utils.holiday_calendar import duration_for, duration_for_leave, is_workday
 from utils.logger import ConsoleLogger
 from utils.static_context import StaticContextStore
 from utils.tool_contract import EffectiveToolRegistry
@@ -299,11 +299,33 @@ _DELETE_OLD_HINTS = (
     "重新提交",
 )
 
+# 「改成」只有在确实指向历史申请时才是替换；同一句内的口头纠正（「哦不对，
+# 改成……」）不应为了一个动词查询 OA。删除/重新提交则本身已明确要求处理旧件。
+_HISTORY_ANCHOR_RE = re.compile(
+    r"之前|此前|先前|昨天|上次|已经|已提交|旧申请|原申请|历史申请|草稿记录|"
+    r"已保存|存过|请过|提交过"
+)
+_REPLACE_ACTION_RE = re.compile(r"改成|改请|换请|修改|重新请|改假|重请")
+_EXPLICIT_REPLACE_RE = re.compile(r"删掉|重新提交")
+
 # 中文数字（裸时长用）。
 _CN_DIGITS = {
     "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
     "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
 }
+
+
+def _should_delete_old(text: str) -> bool:
+    """判断请假请求是否需要查询并删除历史申请。
+
+    替换动作（改成/换请/修改等）必须带历史锚点；「删掉」和「重新提交」是
+    明确的旧件处理指令，可单独触发。这样「哦不对，改成 3-6 点」只在本地
+    纠正当前句，不会产生无关的 ``oa.*`` 读取。
+    """
+    value = str(text or "")
+    return bool(_EXPLICIT_REPLACE_RE.search(value)) or bool(
+        _HISTORY_ANCHOR_RE.search(value) and _REPLACE_ACTION_RE.search(value)
+    )
 
 
 def _regex_leave_type(sub_query: str) -> str:
@@ -384,6 +406,22 @@ def _split_surname_title(hint: str) -> tuple[str, str]:
     return hint, ""
 
 
+def _title_hint_from_query(text: str, hint: str) -> str:
+    """从用户原句中提取紧邻审批人姓名的职位词（不维护姓名映射）。"""
+    name, inline_title = _split_surname_title(hint)
+    if inline_title or not name:
+        return inline_title
+    value = str(text or "")
+    for title in _TITLE_WORDS:
+        if re.search(
+            rf"{re.escape(title)}\s*(?:的\s*)?{re.escape(name)}"
+            rf"|{re.escape(name)}\s*(?:的\s*)?{re.escape(title)}",
+            value,
+        ):
+            return title
+    return ""
+
+
 def _dept_keyword(dept: str) -> str:
     """部门词 → title 过滤关键词（测试部门/测试部 → 测试；去 部门/部/中心/组/处 后缀）。
 
@@ -395,6 +433,95 @@ def _dept_keyword(dept: str) -> str:
         if dept.endswith(suf) and len(dept) > len(suf):
             return dept[: -len(suf)]
     return dept
+
+
+def _record_text(record: dict[str, Any], *keys: str) -> str:
+    """读取人员工具返回的文本字段，兼容扁平字段和轻量对象字段。
+
+    ``workflow.search_person`` 的运行时返回并不固定只使用一个字段名：不同
+    环境可能返回 ``department``、``dept_name`` 或 ``org_name``，而职位也可能
+    用 ``title`` 或 ``position`` 表示。这里仅消费工具证据，不维护人员映射表。
+    """
+    for key in keys:
+        value = record.get(key)
+        if isinstance(value, dict):
+            for nested_key in ("name", "label", "title", "value"):
+                nested = value.get(nested_key)
+                if nested:
+                    return str(nested).strip()
+        elif value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _record_department(record: dict[str, Any]) -> str:
+    """返回人员/申请人的部门文本（仅来自实时 user/search_person 结果）。"""
+    return _record_text(
+        record,
+        "department",
+        "department_name",
+        "dept",
+        "dept_name",
+        "org_name",
+        "organization",
+        "organization_name",
+        "所属部门",
+    )
+
+
+def _record_title(record: dict[str, Any]) -> str:
+    """返回人员职位文本（仅来自实时 search_person 结果）。"""
+    return _record_text(record, "title", "position", "job_title", "职位", "职务")
+
+
+def _department_matches(candidate: dict[str, Any], department: str) -> bool:
+    """判断候选是否与申请人部门一致。
+
+    优先比较候选自身的部门字段；旧版模拟环境只有 ``title``，其职位包含
+    部门前缀（例如「研发经理」），因此在候选没有部门字段时才兼容该表示。
+    """
+    department_key = _dept_keyword(department)
+    if not department_key:
+        return False
+    candidate_department = _record_department(candidate)
+    if candidate_department:
+        candidate_key = _dept_keyword(candidate_department)
+        return bool(
+            candidate_key
+            and (
+                candidate_key == department_key
+                or candidate_key in department_key
+                or department_key in candidate_key
+            )
+        )
+    candidate_title = _record_title(candidate)
+    return department_key in candidate_title if candidate_title else False
+
+
+def _filter_approver_candidates(
+    people: list[dict[str, Any]],
+    *,
+    applicant: dict[str, Any] | None = None,
+    approver_dept: str = "",
+    title_hint: str = "",
+) -> list[dict[str, Any]]:
+    """用实时部门/职位证据缩小候选集，不能在并列时自行排序或盲选。"""
+    narrowed = list(people)
+
+    # 用户明确给出的审批人部门优先级最高；其次才使用申请人的实时部门。
+    department = approver_dept or _record_department(applicant or {})
+    if department:
+        by_department = [p for p in narrowed if _department_matches(p, department)]
+        # 有部门证据却没有命中时不能忽略该约束，否则可能把另一部门的同名
+        # 人员误绑定。返回空列表由调用方转成安全阻断。
+        narrowed = by_department
+
+    if title_hint:
+        by_title = [p for p in narrowed if title_hint in _record_title(p)]
+        # 职位是用户/运行时候选提供的额外约束；没有命中就不继续猜测。
+        narrowed = by_title
+
+    return narrowed
 
 
 def _strip_name_honorific(name: str) -> str:
@@ -529,6 +656,54 @@ def _has_day_word(text: str) -> bool:
     return bool(text and _DAY_WORD_RE.search(text))
 
 
+_LEAVE_DAY_COUNT_RE = re.compile(
+    r"(?:从\s*)?"
+    r"(今天|明天|后天|下周[一二三四五六日天]|本周[一二三四五六日天]|"
+    r"周[一二三四五六日天]|"
+    r"这周[一二三四五六日天]|下(?:个)?月\s*\d{1,2}\s*[日号]|"
+    r"\d{1,2}\s*月\s*\d{1,2}\s*[日号])"
+    r"\s*(?:开始|起)?\s*(?:请|休|放)\s*"
+    r"(?:[^，。；;,]{0,16}?(?:假|休假)\s*)?"
+    r"([一二三四五六七八九十两\d]+)\s*(?:个\s*)?天"
+)
+
+_LEAVE_DAY_COUNT_REVERSE = re.compile(
+    r"(?:需要|我要|我想|想|我需要)?\s*请\s*"
+    r"([一二三四五六七八九十两\d]+)\s*(?:个\s*)?天"
+    r"(?:[^，。；;,]{0,16}?(?:假|休假)\s*)?"
+    r"[，,、;；]?\s*(?:从\s*)?"
+    r"(今天|明天|后天|下周[一二三四五六日天]|本周[一二三四五六日天]|"
+    r"周[一二三四五六日天]|这周[一二三四五六日天]|"
+    r"下(?:个)?月\s*\d{1,2}\s*[日号]|\d{1,2}\s*月\s*\d{1,2}\s*[日号])"
+    r"\s*(?:开始|起)?"
+)
+
+
+def _leave_day_count(text: str) -> tuple[str, int] | None:
+    """提取日期先/数量先两种自然日期跨度（不处理显式日期区间）。"""
+    value = str(text or "")
+    match = _LEAVE_DAY_COUNT_RE.search(value)
+    if match:
+        count = int(_cn_num(match.group(2)))
+        if count > 0:
+            return match.group(1), count
+    reverse = _LEAVE_DAY_COUNT_REVERSE.search(value)
+    if reverse:
+        count = int(_cn_num(reverse.group(1)))
+        if count > 0:
+            return reverse.group(2), count
+    return None
+
+
+def _explicit_workday_policy(text: str) -> bool:
+    """是否明确要求按工作日/排除周末或节假日计算。"""
+    return bool(re.search(
+        r"按工作日|工作日(?:计算|口径|请假)|"
+        r"排除[^。；，,]*(?:周末|节假|假期)",
+        str(text or ""),
+    ))
+
+
 class LeaveExecutor:
     """请假执行器：确定性流程 SOP（程序业务规则组件），产出 workflow_draft_result。
 
@@ -635,6 +810,7 @@ class LeaveExecutor:
             workflow_id,
             forced_keyword=clarified.get("approver_name"),
             approver_dept=draft.approver_dept,
+            applicant=applicant,
         )
         if isinstance(approver, dict) and "error_reason" in approver:
             return {"workflow_draft_result": {
@@ -664,7 +840,11 @@ class LeaveExecutor:
         )
 
         # 6) 删旧草稿（改假/删旧重提：先删旧的已提交/草稿申请再建新）。
-        delete_old = any(h in text for h in _DELETE_OLD_HINTS)
+        delete_old = (
+            _should_delete_old(text)
+            if self._profile_config.speech_act_v3
+            else any(h in text for h in _DELETE_OLD_HINTS)
+        )
         if delete_old:
             self._delete_old_leave(workflow_id, text)
 
@@ -687,6 +867,8 @@ class LeaveExecutor:
         speech = parse_speech_act(
             text,
             event_default=event_leave and not self._profile_config.strict_runtime_mode,
+            domain="leave",
+            speech_act_v3=self._profile_config.speech_act_v3,
         )
         decision = self._policy.decide(
             "submit_or_draft",
@@ -786,7 +968,14 @@ class LeaveExecutor:
         数据集中的批次差异扩散到默认路径。
         """
         value = text or ""
-        explicit_workday = bool(re.search(r"排除[^。；，,]*(?:周末|节假|假期)|按工作日|工作日计算", value))
+        explicit_workday = (
+            _explicit_workday_policy(value)
+            if self._profile_config.leave_range_v3
+            else bool(re.search(
+                r"排除[^。；，,]*(?:周末|节假|假期)|按工作日|工作日计算",
+                value,
+            ))
+        )
         explicit_calendar = bool(re.search(r"自然日|连续[^。；，,]{0,8}天", value))
         explicit_hours = bool(re.search(r"共\s*[一两二三四五六七八九十\d.]+\s*小时", value))
         mode = "raw"
@@ -855,6 +1044,7 @@ class LeaveExecutor:
         workflow_id: int,
         forced_keyword: str | None = None,
         approver_dept: str = "",
+        applicant: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """审批人消歧：返回 {"user_id"} 或带 error_reason 的 blocked 标记。
 
@@ -870,6 +1060,16 @@ class LeaveExecutor:
         产品经理（zh_0035/0206/0220/0224/0215 gold 5/5 选产品经理王芳），否则
         ambiguous_approver（不 save，zh_0210/0228 两个王芳 → 预期阻塞）。
         """
+        if self._profile_config.approver_resolution_v3:
+            return self._resolve_approver_v3(
+                sub_query,
+                hint,
+                workflow_id,
+                forced_keyword=forced_keyword,
+                approver_dept=approver_dept,
+                applicant=applicant,
+            )
+
         if forced_keyword:
             people = self._search_person_approver(
                 keyword=forced_keyword, workflow_id=workflow_id
@@ -939,6 +1139,123 @@ class LeaveExecutor:
                     return {"user_id": people[0].get("user_id")}
                 return verdict
             return verdict
+        return {"error_reason": "approver_not_found"}
+
+    def _resolve_approver_v3(
+        self,
+        sub_query: str,
+        hint: str,
+        workflow_id: int,
+        *,
+        forced_keyword: str | None = None,
+        approver_dept: str = "",
+        applicant: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """运行时审批人消歧。
+
+        v3 只放宽「工具已经给出足够证据」的情况：明确姓名命中唯一候选时
+        直接使用；多个同名候选则依次使用显式部门、申请人实时部门和职位字段
+        缩小范围。过滤后仍有多个候选必须阻断，绝不按提交语气、候选顺序或
+        静态人员记忆盲选。
+        """
+
+        def _verdict(people: list[dict[str, Any]]) -> dict[str, Any] | None:
+            if len(people) == 1:
+                user_id = people[0].get("user_id")
+                return (
+                    {"user_id": user_id}
+                    if user_id
+                    else {"error_reason": "approver_id_missing"}
+                )
+            if len(people) > 1:
+                return {"error_reason": "ambiguous_approver"}
+            return None
+
+        def _resolve_candidates(
+            people: list[dict[str, Any]],
+            *,
+            title_hint: str = "",
+        ) -> dict[str, Any]:
+            verdict = _verdict(people)
+            if verdict is not None and "error_reason" not in verdict:
+                return verdict
+            if len(people) > 1:
+                narrowed = _filter_approver_candidates(
+                    people,
+                    applicant=applicant,
+                    approver_dept=approver_dept,
+                    title_hint=title_hint,
+                )
+                if not narrowed:
+                    return {"error_reason": "approver_not_found"}
+                narrowed_verdict = _verdict(narrowed)
+                if narrowed_verdict is not None:
+                    return narrowed_verdict
+                return {"error_reason": "ambiguous_approver"}
+            if verdict is not None:
+                return verdict
+            return {"error_reason": "approver_not_found"}
+
+        if forced_keyword:
+            forced = _clean_approver_hint(forced_keyword)
+            people = self._search_person_approver(
+                keyword=forced, workflow_id=workflow_id
+            )
+            forced_title = _title_hint_from_query(sub_query, forced)
+            return _resolve_candidates(people, title_hint=forced_title)
+
+        clean_hint = _clean_approver_hint(hint) or _regex_approver(sub_query or "")
+        if clean_hint:
+            name_part, title_hint = _split_surname_title(clean_hint)
+            title_hint = title_hint or _title_hint_from_query(sub_query, clean_hint)
+            # 保持显式姓名的优先级：完整词命中唯一候选直接返回，不额外改写。
+            people = self._search_person_approver(
+                keyword=clean_hint, workflow_id=workflow_id
+            )
+            if len(people) == 1:
+                return _resolve_candidates(people, title_hint=title_hint)
+            if len(people) > 1:
+                result = _resolve_candidates(people, title_hint=title_hint)
+                if result.get("error_reason") != "ambiguous_approver":
+                    return result
+                # 已明确职位但同名仍然并列时，不能通过后续默认职位猜测。
+                if title_hint and len(name_part) >= 1:
+                    # 仍可用姓名 + 职位的 AND 查询再次验证；若该查询也不唯一，
+                    # 下面会如实返回 ambiguous_approver。
+                    pass
+                else:
+                    return result
+
+            # 「王芳经理」等称呼可能没有字面真人记录，使用姓名 + 职位的
+            # AND 查询；查询仍由实时工具完成，结果不做第一候选兜底。
+            if title_hint and name_part:
+                people = self._search_person_approver(
+                    keyword=name_part,
+                    title=title_hint,
+                    workflow_id=workflow_id,
+                )
+                return _resolve_candidates(people, title_hint=title_hint)
+
+            # 只有姓名未命中时，若申请人/显式部门能从较宽候选中消歧，才继续
+            # 一次姓名查询；否则如实报告未找到。
+            if name_part and name_part != clean_hint:
+                people = self._search_person_approver(
+                    keyword=name_part, workflow_id=workflow_id
+                )
+                return _resolve_candidates(people, title_hint=title_hint)
+            return {"error_reason": "approver_not_found"}
+
+        # 未指名时只按实时职位检索；多个经理/总监候选可由申请人部门缩小，
+        # 若仍不唯一必须阻断。这里刻意不保留旧版“提交时优先产品经理”规则。
+        for title in ("经理", "总监"):
+            people = self._search_person_approver(
+                title=title, workflow_id=workflow_id
+            )
+            if not people:
+                continue
+            result = _resolve_candidates(people, title_hint=title)
+            if result.get("error_reason") != "approver_not_found":
+                return result
         return {"error_reason": "approver_not_found"}
 
     def _search_person_approver(
@@ -1190,6 +1507,10 @@ class LeaveExecutor:
         sub = (sub_query or "").strip()
         text = f"{sub} {user_query or ''}".strip()
         resolver = TemporalResolver(now_iso)
+        # 少量纯函数回归会用 ``__new__`` 构造执行器；缺省配置仍应保持旧行为。
+        profile_config = getattr(self, "_profile_config", None)
+        speech_act_v3 = bool(getattr(profile_config, "speech_act_v3", False))
+        leave_range_v3 = bool(getattr(profile_config, "leave_range_v3", False))
 
         # 同一用例内的前序会议是可观测上下文，不是全局记忆。兼容日历下，
         # “明天”可能被映射到模拟器的周一；用户随后说“下周二”通常是相对于
@@ -1209,7 +1530,9 @@ class LeaveExecutor:
                     resolver._offset_weekday(m.group(1), w).isoformat()
                     for w in (0, 1)
                 ]
-                start_t, end_t = self._time_of_day(text, resolver)
+                start_t, end_t = self._time_of_day(
+                    text, resolver, prefer_latest=speech_act_v3
+                )
                 return [(f"{d} {start_t}", f"{d} {end_t}") for d in days]
 
         # 2) 多轮澄清起止优先（需先解析单日 day）。
@@ -1220,6 +1543,50 @@ class LeaveExecutor:
             day = resolver.resolve_day(text)
         if clarified and clarified.get("start_hm") and clarified.get("end_hm") and day:
             return [(f"{day} {clarified['start_hm']}", f"{day} {clarified['end_hm']}")]
+
+        # 「从明天开始请 3 天」是连续日期范围，不是“当天 3 小时/一天”。
+        # 先展开日期，再交给既有时段与 duration calculator；明确工作日时沿用
+        # holiday_calendar.is_workday（含调休），否则保持当前 raw 日历跨度兼容。
+        day_count = (
+            _leave_day_count(sub) or _leave_day_count(text)
+            if leave_range_v3
+            else None
+        )
+        if day_count:
+            start_phrase, count = day_count
+            range_start = (
+                anchored_day
+                if anchored_day and re.search(r"下周[一二三四五六日天]", start_phrase)
+                else self._resolve_day_phrase(start_phrase, resolver)
+            )
+            if range_start is None and start_phrase.startswith("这周"):
+                range_start = self._resolve_day_phrase(
+                    start_phrase.replace("这周", "本周", 1), resolver
+                )
+            if range_start is None:
+                range_start = day
+            if range_start is not None:
+                start_date = date.fromisoformat(range_start)
+                if _explicit_workday_policy(text):
+                    # 工作日计数从用户指定起点开始；若起点为周末/假日，顺延到
+                    # 第一个工作日，终点仍是第 N 个工作日。
+                    selected: list[date] = []
+                    candidate = start_date
+                    while len(selected) < count:
+                        if is_workday(candidate):
+                            selected.append(candidate)
+                        candidate += timedelta(days=1)
+                    start_date, end_date = selected[0], selected[-1]
+                else:
+                    end_date = start_date + timedelta(days=count - 1)
+                time_text = sub if _has_time_signal(sub) else text
+                start_t, end_t = self._time_of_day(
+                    time_text, resolver, prefer_latest=speech_act_v3
+                )
+                return [
+                    (f"{start_date.isoformat()} {start_t}",
+                     f"{end_date.isoformat()} {end_t}")
+                ]
 
         # 2.5) 显式「半天」半日：全天 09:00-18:00=9h 平分 → 4.5h（用户定案 2026-08-19，
         #      与 09:00-18:00 全天口径自洽）。下午半天 → 13:30-18:00、上午半天 → 09:00-13:30。
@@ -1271,7 +1638,9 @@ class LeaveExecutor:
         # 时段解析优先 leave 子句自身（zh_0014：子句「后天上午」→ 09:00-11:00），
         # 避免拼接 text 带上 meeting 的「下午两点到三点」污染成 14:00-15:00。
         time_text = sub if _has_time_signal(sub) else text
-        start_t, end_t = self._time_of_day(time_text, resolver)
+        start_t, end_t = self._time_of_day(
+            time_text, resolver, prefer_latest=speech_act_v3
+        )
         return [(f"{day} {start_t}", f"{day} {end_t}")]
 
     def _reference_weekday_day(self, sub_query: str) -> str | None:
@@ -1377,12 +1746,17 @@ class LeaveExecutor:
                 return base.isoformat()
         return None
 
-    def _time_of_day(self, text: str, resolver: TemporalResolver) -> tuple[str, str]:
+    def _time_of_day(
+        self,
+        text: str,
+        resolver: TemporalResolver,
+        prefer_latest: bool = False,
+    ) -> tuple[str, str]:
         """公司工作时段惯例 → (start, end)（HH:MM）。
 
         优先级：显式区间 → 「X点后」 → 全天 → 上午/下午裸午别 → 裸时长 → 全天兜底。
         """
-        parsed = _parse_range(text)
+        parsed = _parse_range(text, prefer_latest=prefer_latest)
         if parsed:
             return parsed
         m = re.search(r"(上午|下午|晚上|中午)?\s*([一两二三四五六七八九十\d]+)\s*点后", text)
@@ -1494,40 +1868,55 @@ def _span_hours(start_full: str, end_full: str) -> float:
     return round((end - start).total_seconds() / 3600.0, 2)
 
 
-def _parse_range(text: str) -> tuple[str, str] | None:
+def _parse_range(text: str, *, prefer_latest: bool = False) -> tuple[str, str] | None:
     """「X点到Y点」起止时刻；结束未带午别时继承起始午别（就近回退句前午别）。
 
-    wf_0219「明天下午…请2点到5点」→ 14:00-17:00（继承句前「下午」）。
+    支持口语简写「1-4点」；V3 语气策略开启时，同一句有多段纠正取最后一段
+    （如「哦不对，改成 3-6 点」），避免把当前修正误当成旧申请替换。
     """
-    m = re.search(
-        r"(上午|下午|晚上|中午)?\s*([一两二三四五六七八九十\d]+)\s*点\s*(半)?\s*"
-        r"(?:到|至|~|—|-)\s*"
-        r"(上午|下午|晚上|中午)?\s*([一两二三四五六七八九十\d]+)\s*点\s*(半)?",
-        text,
-    )
-    if not m:
-        return None
-    start_period = m.group(1)
-    start_hour = int(_cn_num(m.group(2)))
-    start_minute = 30 if m.group(3) else 0
-    end_period = m.group(4)
-    end_hour = int(_cn_num(m.group(5)))
-    end_minute = 30 if m.group(6) else 0
-    if start_period is None:
-        before = text[: m.start()]
-        found = re.findall(r"上午|下午|晚上|中午", before)
-        if found:
-            start_period = found[-1]
-    if start_period is None:
-        # 全程无午别 → 不猜凌晨时刻（「2点到4点」→ None，交由时间惯例兜底）。
-        return None
-    if end_period is None:
-        end_period = start_period
-    sh24 = _hour_with_period(start_hour, start_period)
-    eh24 = _hour_with_period(end_hour, end_period)
-    if sh24 * 60 + start_minute >= eh24 * 60 + end_minute:
-        return None
-    return f"{sh24:02d}:{start_minute:02d}", f"{eh24:02d}:{end_minute:02d}"
+    if prefer_latest:
+        # V3 接受“1-4点”的口语简写。
+        pattern = (
+            r"(上午|下午|晚上|中午)?\s*"
+            r"([一两二三四五六七八九十\d]+)\s*(?:点\s*(半)?)?\s*"
+            r"(?:到|至|~|—|-)\s*"
+            r"(上午|下午|晚上|中午)?\s*"
+            r"([一两二三四五六七八九十\d]+)\s*(?:点\s*(半)?)?"
+        )
+    else:
+        # 开关关闭时严格保留旧解析契约，避免将日期区间误当时间。
+        pattern = (
+            r"(上午|下午|晚上|中午)?\s*"
+            r"([一两二三四五六七八九十\d]+)\s*点\s*(半)?\s*"
+            r"(?:到|至|~|—|-)\s*"
+            r"(上午|下午|晚上|中午)?\s*"
+            r"([一两二三四五六七八九十\d]+)\s*点\s*(半)?"
+        )
+    matches = list(re.finditer(pattern, text or ""))
+    candidates = reversed(matches) if prefer_latest else matches
+    for m in candidates:
+        start_period = m.group(1)
+        start_hour = int(_cn_num(m.group(2)))
+        start_minute = 30 if m.group(3) else 0
+        end_period = m.group(4)
+        end_hour = int(_cn_num(m.group(5)))
+        end_minute = 30 if m.group(6) else 0
+        if start_period is None:
+            before = (text or "")[: m.start()]
+            found = re.findall(r"上午|下午|晚上|中午", before)
+            if found:
+                start_period = found[-1]
+        if start_period is None:
+            # 全程无午别 → 不猜凌晨时刻（「2点到4点」→ None，交由时间惯例兜底）。
+            continue
+        if end_period is None:
+            end_period = start_period
+        sh24 = _hour_with_period(start_hour, start_period)
+        eh24 = _hour_with_period(end_hour, end_period)
+        if sh24 * 60 + start_minute >= eh24 * 60 + end_minute:
+            continue
+        return f"{sh24:02d}:{start_minute:02d}", f"{eh24:02d}:{end_minute:02d}"
+    return None
 
 
 def _clean_schedule(raw: Any) -> list[dict[str, Any]]:

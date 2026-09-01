@@ -21,6 +21,7 @@ import json
 import os
 import re
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,23 @@ def _compact(value: Any, limit: int = 600) -> Any:
         text = str(value)
     text = redact_text(text)
     return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _runtime_package_version() -> str:
+    """返回可由远程日志区分的包版本，不读取或记录认证字段。"""
+    env_version = str(os.environ.get("AGENT_PACKAGE_VERSION") or "").strip()
+    if env_version:
+        return env_version
+    try:
+        config = json.loads(
+            (Path(__file__).resolve().parent / "config.json").read_text(encoding="utf-8")
+        )
+        configured = str((config.get("runtime") or {}).get("package_version") or "").strip()
+        if configured:
+            return configured
+    except (OSError, TypeError, ValueError):
+        pass
+    return "v3-clustered"
 
 
 class _RecordingEnv:
@@ -109,13 +127,23 @@ class _RecordingEnv:
 
     def call_tool(self, name: str, args: Any) -> Any:
         logger = object.__getattribute__(self, "_logger")
+        # 先记录调用意图，再记录结果。之前成功调用只留下 TOOL_RESULT，远程
+        # telemetry 无法区分“准备调用了什么”与“工具返回了什么”；这会让超时、
+        # 参数校验和结果异常难以复盘。调用事件只保存经过 _compact 的参数，
+        # 不改变真实传给环境的对象。
+        call_event: dict[str, Any] = {
+            "event": "TOOL_CALL",
+            "task_id": object.__getattribute__(self, "_task_id"),
+            "tool": name,
+            "args": _compact(args),
+        }
+        self._trace.append(call_event)
         if logger is not None:
             logger.info(f"TOOL_CALL 工具调用: {name} args={_compact(args)}")
         try:
             result = self._inner.call_tool(name, args)
         except Exception as exc:  # noqa: BLE001 —— 记录后原样抛，行为不改变
-            self._trace.append({"event": "TOOL_CALL", "task_id": self._task_id,
-                                "tool": name, "args": _compact(args), "error": repr(exc)})
+            call_event["error"] = repr(exc)
             if logger is not None:
                 logger.warning(f"工具异常: {name} error={exc!r}")
             context = object.__getattribute__(self, "_context")
@@ -550,22 +578,39 @@ class MyAgent:
             def merge(dst: dict[str, Any], src: dict[str, Any]) -> None:
                 for key, value in src.items():
                     if isinstance(dst.get(key), dict) and isinstance(value, dict):
+                        # V3 允许多个同域 Task 顺序执行，但一个后续 blocked
+                        # 结果不能抹掉前一 Task 已经确认的成功事实。关闭开关时
+                        # 保持旧的字段覆盖行为，便于精确回放 legacy 轨迹。
+                        if (
+                            self._meeting_projection_v3_enabled()
+                            and key == "booking_result"
+                            and self._booking_status_rank(dst[key].get("status"))
+                            > self._booking_status_rank(value.get("status"))
+                        ):
+                            continue
+                        if (
+                            self._meeting_projection_v3_enabled()
+                            and key == "booking_result"
+                            and self._booking_status_rank(value.get("status"))
+                            > self._booking_status_rank(dst[key].get("status"))
+                            and str(dst[key].get("status", "")).lower()
+                            in {"blocked", "failed", "error"}
+                        ):
+                            # 后续成功结果可以继承 queried 的 room/day 等事实，
+                            # 但不能携带前一个 blocked 的原因/槽位。
+                            for stale in ("reason", "slot", "error"):
+                                dst[key].pop(stale, None)
                         merge(dst[key], value)
                     elif value is not None:
-                        dst[key] = value
+                        # 不让 final_answer 与某个 Task 的 output 共享可变嵌套
+                        # 对象；否则后续 Task 合并会反向改写已记录的 blocked 结果。
+                        dst[key] = deepcopy(value)
 
             merge(final_answer, part)
 
         def result_outcome(part: Any) -> NodeOutcome:
             """把 Skill 返回转换为 DAG 状态；空结果视为完成的安全 no-op。"""
-            if not isinstance(part, dict):
-                return NodeOutcome(NodeStatus.BLOCKED, error="invalid_skill_result")
-            for value in part.values():
-                if isinstance(value, dict) and str(value.get("status", "")).lower() in {
-                    "blocked", "failed", "error"
-                }:
-                    return NodeOutcome(NodeStatus.BLOCKED, output=part, error="domain_blocked")
-            return NodeOutcome(NodeStatus.SUCCEEDED, output=part)
+            return self._skill_result_outcome(part)
 
         try:
             self.logger.section(f"case={case_id}")
@@ -585,9 +630,10 @@ class MyAgent:
                 self.logger.warning("obs 缺少 user_query/now，返回空")
                 return final_answer
 
+            package_version = _runtime_package_version()
             trace_context = TraceContext(
                 case_id=case_id,
-                package_version=os.environ.get("AGENT_PACKAGE_VERSION", "v2"),
+                package_version=package_version,
                 profile=self.profile_config.profile_name,
                 prompt_versions={
                     "intent_graph": "intent-v2",
@@ -603,7 +649,7 @@ class MyAgent:
                 now_iso=now_iso,
                 mode=str(mode) if mode is not None else None,
                 run_id=run_id,
-                package_version=os.environ.get("AGENT_PACKAGE_VERSION", "v2"),
+                package_version=package_version,
             )
             self.logger.info(f"CASE_START run_id={run_id} case={case_id} now={now_iso} mode={mode} profile={self.profile_config.profile_name}")
             env.bind_context(case_context)
@@ -626,6 +672,19 @@ class MyAgent:
                 profile_config=self.profile_config,
             )
             ir, meeting_plan = meeting_skill.run(user_query, now_iso, mode, gateway, env)
+            # 识别器偶尔会把同一条会议 SOP 拆成“查询 / 取消 / 重订”多个
+            # meeting unit，或把“另外/顺手”的跨域任务标成硬依赖。V3 仅在
+            # 对应开关开启时做确定性规范化；关闭时保留原始识别结果，方便旧轨迹
+            # 回放。
+            normalized_units = self._normalize_meeting_units(
+                ir.task_units,
+                enabled=bool(
+                    getattr(self.profile_config, "dag_dependency_v3", False)
+                    or self.profile_config.meeting_reference_v3
+                ),
+            )
+            if normalized_units is not ir.task_units:
+                ir.task_units = normalized_units
             units_desc = [
                 {
                     "unit_type": u.unit_type,
@@ -669,7 +728,11 @@ class MyAgent:
                         if dep_id not in deps:
                             deps.append(dep_id)
                 requires = self._infer_task_requires(
-                    index, unit.sub_query, ir.task_units, full_query=user_query
+                    index,
+                    unit.sub_query,
+                    ir.task_units,
+                    full_query=user_query,
+                    meeting_reference_v3=self._meeting_reference_v3_enabled(),
                 )
                 dag_tasks.append(
                     DagTask(
@@ -724,11 +787,7 @@ class MyAgent:
                         }
                         for t in dag_tasks
                     },
-                    "features": {
-                        "contract_fixes_v2": self.profile_config.contract_fixes_v2,
-                        "context_workflow_v2": self.profile_config.context_workflow_v2,
-                        "meeting_search_v2": self.profile_config.meeting_search_v2,
-                    },
+                    "features": self.profile_config.feature_flags(),
                     "model_stats": {
                         "intent_graph": gateway.stats_summary(),
                         "meeting_plan": (
@@ -760,6 +819,7 @@ class MyAgent:
             budget_timings: dict[str, Any] = {}
             leave_llm2_stats: dict[str, Any] | None = None
             budget_llm2_stats: dict[str, Any] | None = None
+            projection_enabled = self._meeting_projection_v3_enabled()
 
             meeting_plans: dict[str, Any] = {}
             meeting_tasks = [task for task in dag_tasks if task.unit_type == UNIT_MEETING]
@@ -811,11 +871,22 @@ class MyAgent:
                             gateway,
                         )
                         plan = self._bind_meeting_reference_facts(
-                            plan, task.sub_query or user_query, context, task.requires
+                            plan,
+                            task.sub_query or user_query,
+                            context,
+                            task.requires,
+                            meeting_reference_v3=self._meeting_reference_v3_enabled(),
                         )
                         meeting_plans[task.task_id] = plan
                     if plan is None:
                         return NodeOutcome(NodeStatus.BLOCKED, error="meeting_plan_missing")
+                    if self._meeting_reference_v3_enabled():
+                        plan = self._bind_explicit_meeting_facts(
+                            plan,
+                            task.sub_query or user_query,
+                            context,
+                            task.task_id,
+                        )
                     # 跨 Task 的显式指代必须绑定到前序运行时事实。即使模型把
                     # ``刚订的会议/那天`` 解析成了可执行动作，也不能在事实缺失时
                     # 退回“找第一条会议”或按当前日期猜测；否则会破坏任务隔离和
@@ -836,7 +907,10 @@ class MyAgent:
                     )
                     missing_reference = (
                         self._missing_meeting_reference_fact(
-                            task.sub_query or user_query, context, task.requires
+                            task.sub_query or user_query,
+                            context,
+                            task.requires,
+                            meeting_reference_v3=self._meeting_reference_v3_enabled(),
                         )
                         if task.requires or prior_meeting
                         else None
@@ -863,8 +937,15 @@ class MyAgent:
                         )
                         return NodeOutcome(NodeStatus.BLOCKED, error="llm_plan_unavailable")
                     part = meeting_executor.execute_ops(plan)
+                    if projection_enabled:
+                        part = self._project_meeting_result(part, plan)
                     merge_answer(part)
-                    self._record_task_facts(context, task.task_id, part)
+                    self._record_task_facts(
+                        context,
+                        task.task_id,
+                        part,
+                        meeting_reference_v3=self._meeting_reference_v3_enabled(),
+                    )
                     executor_log.info(
                         f"DOMAIN_RESULT task={task.task_id} domain=meeting "
                         f"result={_compact(part, 12000)} "
@@ -887,7 +968,12 @@ class MyAgent:
                         context=context,
                     )
                     merge_answer(part)
-                    self._record_task_facts(context, task.task_id, part)
+                    self._record_task_facts(
+                        context,
+                        task.task_id,
+                        part,
+                        meeting_reference_v3=self._meeting_reference_v3_enabled(),
+                    )
                     executor_log.info(
                         f"DOMAIN_RESULT task={task.task_id} domain=leave "
                         f"result={_compact(part, 12000)} "
@@ -918,7 +1004,12 @@ class MyAgent:
                         context=context,
                     )
                     merge_answer(part)
-                    self._record_task_facts(context, task.task_id, part)
+                    self._record_task_facts(
+                        context,
+                        task.task_id,
+                        part,
+                        meeting_reference_v3=self._meeting_reference_v3_enabled(),
+                    )
                     executor_log.info(
                         f"DOMAIN_RESULT task={task.task_id} domain=budget "
                         f"result={_compact(part, 12000)} "
@@ -943,6 +1034,38 @@ class MyAgent:
                 task.handler = handle_task
             outcomes = dag.run(case_context)
             env.set_task(None)
+            # Handler 可能在执行前才发现引用事实缺失（例如“那天”没有唯一
+            # meeting.day），此时它会把结构化 blocked 结果放在 NodeOutcome.output。
+            # 运行时不能只保留此前 Task 的 queried/success 结果；把每个节点的
+            # 显式输出合并进最终投影，仍沿用领域结果的字段结构。
+            task_outputs: dict[str, dict[str, Any]] = {}
+            if projection_enabled:
+                for task_id, outcome in outcomes.items():
+                    output = deepcopy(outcome.output) if isinstance(outcome.output, dict) else {}
+                    # 一个 handler 可能在执行前因引用缺失而只返回 error；仍为该
+                    # Task 生成可审计的领域结果，避免“失败了但 Projection 看不见”。
+                    if outcome.status is NodeStatus.BLOCKED and not output:
+                        output = {
+                            "booking_result": {
+                                "status": "blocked",
+                                "reason": outcome.error or "task_blocked",
+                            }
+                        } if self._task_is_meeting(task_id, dag_tasks) else {
+                            "task_result": {
+                                "status": "blocked",
+                                "reason": outcome.error or "task_blocked",
+                            }
+                        }
+                    if output:
+                        task_outputs[task_id] = deepcopy(output)
+                        merge_answer(output)
+                # Projection 以 Task 为键保留每个领域结果；这同时保留前一个
+                # queried/success 与后一个 not_cancelled/blocked 的独立语义。
+                if task_outputs:
+                    final_answer["task_outcomes"] = task_outputs
+            # 若最终顶层 booking 已成功，blocked 的独立 Task 不能覆盖它；其
+            # blocked 输出已经按 task_id 保存在 task_outcomes 中，顶层仍只投影
+            # 可用的成功事实。
             executor_log.info(
                 "Task DAG 结果: " + json.dumps(
                     {
@@ -956,6 +1079,11 @@ class MyAgent:
             executor_log.info(
                 f"Submission Projection: {json.dumps(final_answer, ensure_ascii=False)}"
             )
+            # CaseContext 的事实和策略可能由 Skill 内部直接写入，未必经过
+            # _RecordingEnv.reply；在终局统一补齐结构化事件，确保 telemetry
+            # 能看到每个事实的来源、Task 和覆盖关系。已记录的回复事实按
+            # fact_id 去重，不改变业务结果。
+            self._append_context_events(trace, case_context, executor_log)
             self.logger.info(
                 f"PROJECTION run_id={case_context.run_id} fields={list(final_answer.keys())} "
                 f"facts={len(case_context.facts.all())}"
@@ -1005,21 +1133,31 @@ class MyAgent:
                         "task_count": len(dag_tasks),
                         "tool_event_count": len(trace),
                         "profile": self.profile_config.profile_name,
+                        "feature_flags": self.profile_config.feature_flags(),
                     },
                 },
             )
             final_sent = True
+            tool_call_count = sum(
+                1 for event in trace if event.get("event") == "TOOL_CALL"
+            )
             self.logger.info(
                 f"CASE_END run_id={case_context.run_id} case={case_id} status=completed "
-                f"tool_calls={len(trace)} elapsed={time.monotonic() - run_start:.2f}s"
+                f"tool_calls={tool_call_count} elapsed={time.monotonic() - run_start:.2f}s"
             )
             return final_answer
         except Exception as exc:  # noqa: BLE001 —— 顶层兜底：永不 raise
             self.logger.warning(f"run 异常，保留已有结果并兜底: {exc!r}")
+            current_context = locals().get("case_context")
+            if current_context is not None:
+                self._append_context_events(trace, current_context, self.logger.child("执行层"))
+            tool_call_count = sum(
+                1 for event in trace if event.get("event") == "TOOL_CALL"
+            )
             self.logger.info(
                 f"CASE_END run_id={getattr(locals().get('case_context'), 'run_id', '-') or '-'} "
                 f"case={case_id} status=exception error={type(exc).__name__} "
-                f"tool_calls={len(trace)} elapsed={time.monotonic() - run_start:.2f}s"
+                f"tool_calls={tool_call_count} elapsed={time.monotonic() - run_start:.2f}s"
             )
             if gateway is not None and not final_sent:
                 try:
@@ -1040,21 +1178,269 @@ class MyAgent:
             return final_answer
 
     @staticmethod
+    def _task_is_meeting(task_id: str, tasks: list[DagTask]) -> bool:
+        return any(task.task_id == task_id and task.unit_type == UNIT_MEETING for task in tasks)
+
+    @staticmethod
+    def _skill_result_outcome(part: Any) -> NodeOutcome:
+        """把领域投影转换成内部节点状态。
+
+        领域结果可以为了官方提交契约把安全 no-op 投影成
+        ``booking_result.status=not_cancelled``，但该状态仍不是成功事实。保留
+        这条转换在一个可测试的纯函数里，防止多个入口再各自解释一次结果。
+        """
+        if not isinstance(part, dict):
+            return NodeOutcome(NodeStatus.BLOCKED, error="invalid_skill_result")
+        for value in part.values():
+            if not isinstance(value, dict):
+                continue
+            status = str(value.get("status", "")).lower()
+            safe_noop = status == "not_cancelled" and str(
+                value.get("reason") or ""
+            ).lower() in {"ambiguous_booking", "ambiguous_reference", "no_result"}
+            if status in {"blocked", "failed", "error"} or safe_noop:
+                return NodeOutcome(NodeStatus.BLOCKED, output=part, error="domain_blocked")
+        return NodeOutcome(NodeStatus.SUCCEEDED, output=part)
+
+    def _meeting_projection_v3_enabled(self) -> bool:
+        """Projection V3 与旧 meeting_reference_v3 兼容共存。"""
+        return bool(
+            getattr(self.profile_config, "meeting_projection_v3", False)
+            or self.profile_config.meeting_reference_v3
+        )
+
+    def _meeting_reference_v3_enabled(self) -> bool:
+        """引用/依赖 V3；dag_dependency_v3 也需要启用引用事实晚绑定。"""
+        return bool(
+            self.profile_config.meeting_reference_v3
+            or getattr(self.profile_config, "dag_dependency_v3", False)
+        )
+
+    @staticmethod
+    def _project_meeting_result(part: Any, plan: Any) -> dict[str, Any]:
+        """为会议安全 no-op 补充稳定的 booking_result 投影。"""
+        result = deepcopy(part) if isinstance(part, dict) else {}
+        booking = result.get("booking_result")
+        actions = [str(getattr(op, "action", "")).lower() for op in getattr(plan, "ops", []) or []]
+        if isinstance(booking, dict):
+            reason = str(booking.get("reason") or "")
+            if "cancel" in actions and booking.get("status") == "blocked" and reason in {
+                "need_confirmation", "ambiguous_booking", "ambiguous_reference"
+            }:
+                result["booking_result"] = {
+                    **booking,
+                    "status": "not_cancelled",
+                    "reason": "ambiguous_booking",
+                }
+            return result
+        if "cancel" in actions:
+            result["booking_result"] = {
+                "status": "not_cancelled",
+                "reason": "no_result",
+            }
+        return result
+
+    @staticmethod
+    def _normalize_meeting_units(units: list[Any], *, enabled: bool) -> list[Any]:
+        """规范识别层的会议切分和跨域依赖。
+
+        同一个会议请求若被切成“查询、取消、重订”，必须作为一条 SOP 交给
+        MeetingSkill，否则后两个 Task 看不到前一个查询/取消产生的事实。相反，
+        “另外/顺手/另一个”连接的两个会议仍保持独立。TaskUnit 由识别层产出，
+        这里只复制并重映射下标依赖，不引入任何 case 或答案常量。
+        """
+        if not enabled or not isinstance(units, list) or len(units) < 2:
+            return units
+        copied = deepcopy(units)
+        groups: list[list[int]] = []
+        current: list[int] = []
+        for index, unit in enumerate(copied):
+            if not current:
+                current = [index]
+                continue
+            previous = copied[current[-1]]
+            if (
+                getattr(previous, "unit_type", None) == UNIT_MEETING
+                and getattr(unit, "unit_type", None) == UNIT_MEETING
+                and MyAgent._meeting_units_are_one_sop(
+                    str(getattr(previous, "sub_query", "")),
+                    str(getattr(unit, "sub_query", "")),
+                )
+            ):
+                current.append(index)
+            else:
+                groups.append(current)
+                current = [index]
+        if current:
+            groups.append(current)
+        if all(len(group) == 1 for group in groups):
+            return units
+
+        old_to_group = {
+            old_index: group_index
+            for group_index, group in enumerate(groups)
+            for old_index in group
+        }
+        normalized: list[Any] = []
+        for group in groups:
+            first = deepcopy(copied[group[0]])
+            if len(group) > 1:
+                first.sub_query = "；".join(
+                    str(getattr(copied[index], "sub_query", ""))
+                    for index in group
+                    if str(getattr(copied[index], "sub_query", ""))
+                )
+            dependencies: list[int] = []
+            for old_index in group:
+                for dependency in getattr(copied[old_index], "depends_on", []) or []:
+                    if not isinstance(dependency, int) or dependency in group:
+                        continue
+                    mapped = old_to_group.get(dependency)
+                    if mapped is not None and mapped != len(normalized) and mapped not in dependencies:
+                        dependencies.append(mapped)
+            first.depends_on = dependencies
+            normalized.append(first)
+        return normalized
+
+    @staticmethod
+    def _meeting_units_are_one_sop(previous: str, current: str) -> bool:
+        """判断相邻 meeting 子句是否属于同一查询→变更链。"""
+        combined = f"{previous}；{current}"
+        query_words = ("查询", "查一下", "看看", "日程", "空不空", "有哪些")
+        cancel_words = ("取消", "撤销", "退订", "删掉", "删除")
+        book_words = ("重订", "重新订", "再订", "换个", "预订", "订个", "订一")
+        has_query = any(word in combined for word in query_words)
+        has_cancel = any(word in combined for word in cancel_words)
+        has_book = any(word in combined for word in book_words)
+        independent = ("另外", "顺便", "另一个", "另一个会议", "再开一个", "第三个")
+        if any(word in current for word in independent):
+            return False
+        linkage = (
+            "这个会议", "原会议", "原来的", "之前的", "刚订", "刚才", "该会议",
+            "订单", "已订", "同一天", "那天",
+        )
+        linked = any(word in previous or word in current for word in linkage)
+        # 查询→取消、取消→重订都是同一 SOP 的相邻阶段；完整三段链自然
+        # 会连续合并到一个组。显式“另外/另一个”则优先视为独立请求。
+        if has_query and has_cancel:
+            return True
+        if has_cancel and has_book:
+            return linked
+        return has_query and has_cancel and has_book and linked
+
+    @staticmethod
+    def _extract_explicit_order_id(text: str) -> str | None:
+        value = str(text or "")
+        token = r"[A-Za-z0-9][A-Za-z0-9_.:-]*"
+        labelled = re.search(
+            rf"(?:订单号|预订号|booking_id|order_id)\s*(?:[:=：]\s*)?(?<![A-Za-z0-9])({token})",
+            value,
+            re.I,
+        )
+        if labelled and not labelled.group(1).isdigit():
+            return labelled.group(1).rstrip("，。；,;):：")
+        match = re.search(
+            rf"(?<![A-Za-z0-9])(?:SEED|BK|BOOKING|ORDER)[-_][A-Za-z0-9][A-Za-z0-9_.:-]*",
+            value,
+            re.I,
+        )
+        return match.group(0).rstrip("，。；,;):：") if match else None
+
+    @staticmethod
+    def _extract_explicit_room_id(text: str) -> str | None:
+        value = str(text or "")
+        room_pattern = r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+){1,3}"
+        match = re.search(
+            rf"(?:会议室|房间|room_id)\s*(?:是|为|[:=：])?\s*({room_pattern})",
+            value,
+            re.I,
+        )
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _extract_explicit_day(text: str) -> str | None:
+        value = str(text or "")
+        match = re.search(
+            r"(?:\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{4}年\d{1,2}月\d{1,2}[日号]?|"
+            r"\d{1,2}月\d{1,2}[日号]?|(?:周|星期|礼拜)\s*[一二三四五六日天1-7]|"
+            r"今天|明天|后天|大后天|昨天|前天)",
+            value,
+        )
+        return match.group(0) if match else None
+
+    @staticmethod
+    def _bind_explicit_meeting_facts(
+        plan: Any,
+        text: str,
+        context: CaseContext,
+        task_id: str,
+    ) -> Any:
+        """把用户明确给出的会议 ID/房间/日期写入当前 Task 事实账本。"""
+        value = str(text or "")
+        order_id = MyAgent._extract_explicit_order_id(value)
+        room_id = MyAgent._extract_explicit_room_id(value)
+        day = MyAgent._extract_explicit_day(value)
+        if order_id:
+            for key in ("meeting.order_id", "meeting.booking_id"):
+                context.upsert_fact(key, order_id, source="USER_EXPLICIT", task_id=task_id)
+        if room_id:
+            context.upsert_fact("meeting.room_id", room_id, source="USER_EXPLICIT", task_id=task_id)
+        if day:
+            context.upsert_fact("meeting.day", day, source="USER_EXPLICIT", task_id=task_id)
+        if plan is None:
+            return plan
+        for op in getattr(plan, "ops", []) or []:
+            target = dict(getattr(op, "target", {}) or {})
+            action = str(getattr(op, "action", "")).lower()
+            if order_id and action in {
+                "cancel", "extend", "participant_add", "participant_remove", "participant_list"
+            } and not target.get("order_id"):
+                target["order_id"] = order_id
+            if room_id and action in {"book", "query", "multi_day", "earliest"}:
+                if not target.get("room_id") and not target.get("rooms"):
+                    target["room_id"] = room_id
+                    target["rooms"] = [room_id]
+            op.target = target
+        return plan
+
+    @staticmethod
+    def _booking_status_rank(status: Any) -> int:
+        """会议结果合并优先级：成功事实高于决策/阻断，高于只读查询。"""
+        return {"success": 3, "active": 3, "cancelled": 3,
+                "rebooked": 3, "extended": 3,
+                "updated": 3, "participant_added": 3, "participants_added": 3,
+                "extended_and_participant_added": 3, "queried": 1}.get(
+                    str(status or "").lower(), 2
+                )
+
+    @staticmethod
+    def _has_successful_booking_result(answer: Any) -> bool:
+        if not isinstance(answer, dict):
+            return False
+        booking = answer.get("booking_result")
+        return isinstance(booking, dict) and MyAgent._booking_status_rank(
+            booking.get("status")
+        ) >= 3
+
+    @staticmethod
     def _infer_task_requires(
         index: int,
         sub_query: str,
         units: list[Any],
         *,
         full_query: str | None = None,
+        meeting_reference_v3: bool = True,
     ) -> list[str]:
         """只把可观察的跨任务指代转成 requires，其余模型依赖仅是顺序边。
 
         识别 Prompt 允许模型把“同项目”展开为已知项目短语以便当前 Task 自
-        包含，但这不应丢掉真正的数据依赖。这里同时查看原始 case 文本，在有
-        前序同域 Task 时恢复 requires；没有前序 Task 时不人为制造依赖。
+        包含，但这不应丢掉真正的数据依赖。这里只查看当前 Task 的 sub_query；
+        有前序同域 Task 时恢复 requires，没有前序 Task 时不人为制造依赖。
         """
+        # ``requires`` 是当前子任务的事实缺口，不是整句用户请求的关键词
+        # 命中。full_query 仍保留在签名中兼容旧调用方，但不能让同一请求中
+        # 其它子句的“原会议/那天”污染当前 Task。
         text = str(sub_query or "")
-        original = str(full_query or "")
         markers = {
             "project": ("同项目", "该项目", "这个项目", "上述项目"),
             "meeting": ("那天", "同一天", "刚订的会议", "这个会议", "刚才的会议", "原会议"),
@@ -1065,8 +1451,25 @@ class MyAgent:
         # “那天”时把 meeting Task 错绑到 project 依赖（反之亦然）。
         preferred = "project" if unit_type == UNIT_BUDGET else "meeting" if unit_type == UNIT_MEETING else None
         kinds = [preferred] if preferred else list(markers)
+        scan_text = text
+        if not meeting_reference_v3:
+            # 关闭 V3 时保留旧版兼容行为；真实执行链会显式传开关，单元测试
+            # 默认使用新逻辑以便直接验证纯函数契约。
+            scan_text = f"{text}\n{str(full_query or '')}"
         for kind in kinds:
-            if kind and (MyAgent._contains_reference(text, kind) or MyAgent._contains_reference(original, kind)):
+            if kind and MyAgent._contains_reference(scan_text, kind):
+                # 当前 Task 已经给出足够的定位槽位时，不需要前序事实来补同一
+                # 槽位。显式“订单号 + 原会议”可由当前 Task 自行定位订单；
+                # “同一天（周四）”中的星期也是显式日期语义。
+                if meeting_reference_v3 and kind == "meeting":
+                    has_booking_ref = MyAgent._contains_reference(text, "meeting_booking")
+                    has_day_ref = MyAgent._contains_reference(text, "meeting_day")
+                    if has_booking_ref and MyAgent._has_explicit_order_id(text):
+                        has_booking_ref = False
+                    if has_day_ref and MyAgent._has_explicit_meeting_date(text):
+                        has_day_ref = False
+                    if not (has_booking_ref or has_day_ref):
+                        continue
                 wanted = kind
                 break
         if wanted is None:
@@ -1113,6 +1516,8 @@ class MyAgent:
     def _bind_meeting_reference_facts(
         plan: Any, text: str, context: CaseContext,
         dependencies: list[str] | None = None,
+        *,
+        meeting_reference_v3: bool = True,
     ) -> Any:
         """把显式跨 Task 会议指代绑定到本 case 的唯一运行时事实。
 
@@ -1125,12 +1530,18 @@ class MyAgent:
         text = str(text or "")
         booking_ref = MyAgent._contains_reference(text, "meeting_booking")
         day_ref = MyAgent._contains_reference(text, "meeting_day")
+        explicit_day = MyAgent._has_explicit_meeting_date(text) if meeting_reference_v3 else False
+        if meeting_reference_v3:
+            if booking_ref and MyAgent._has_explicit_order_id(text):
+                booking_ref = False
+            if day_ref and explicit_day:
+                day_ref = False
         booking_id = MyAgent._fact_from_dependencies(
             context, "meeting.booking_id", dependencies
         ) if booking_ref else None
         day = MyAgent._fact_from_dependencies(
             context, "meeting.day", dependencies
-        ) if (booking_ref or day_ref) else None
+        ) if (booking_ref or day_ref) and not explicit_day else None
         room_id = MyAgent._fact_from_dependencies(
             context, "meeting.room_id", dependencies
         ) if booking_ref else None
@@ -1167,6 +1578,8 @@ class MyAgent:
         text: str,
         context: CaseContext,
         dependencies: list[str] | None = None,
+        *,
+        meeting_reference_v3: bool = True,
     ) -> str | None:
         """返回跨 Task 会议指代所缺的唯一事实槽位。
 
@@ -1178,6 +1591,13 @@ class MyAgent:
         text = str(text or "")
         booking_ref = MyAgent._contains_reference(text, "meeting_booking")
         day_ref = MyAgent._contains_reference(text, "meeting_day")
+        # 显式槽位优先：订单号不需要 meeting.booking_id；星期/日期（包括
+        # “同一天（周四）”）不需要 meeting.day。其它缺失槽位仍照常门控。
+        if meeting_reference_v3:
+            if booking_ref and MyAgent._has_explicit_order_id(text):
+                booking_ref = False
+            if day_ref and MyAgent._has_explicit_meeting_date(text):
+                day_ref = False
         if not (booking_ref or day_ref):
             return None
         if not dependencies:
@@ -1210,7 +1630,47 @@ class MyAgent:
         return False
 
     @staticmethod
-    def _record_task_facts(context: CaseContext, task_id: str, part: Any) -> None:
+    def _has_explicit_order_id(text: str) -> bool:
+        """识别用户原文给出的订单标识，而非模型猜测的 ID。"""
+        value = str(text or "")
+        token = r"[A-Za-z0-9][A-Za-z0-9_.:-]*"
+        # 标签后的任意合法非空标识均可接受，但纯数字不是可审计的订单 ID。
+        labelled = re.search(
+            rf"(?:订单号|预订号|booking_id|order_id)\s*(?:[:=：]\s*)?(?<![A-Za-z0-9])({token})",
+            value,
+            re.I,
+        )
+        if labelled and not labelled.group(1).isdigit():
+            return True
+        # 兼容历史请求里不带标签的常见订单前缀与 UUID；不把房间号/普通
+        # 数字当作订单号。
+        return bool(re.search(
+            rf"(?<![A-Za-z0-9])(?:SEED|BK|BOOKING|ORDER)[-_][A-Za-z0-9][A-Za-z0-9_.:-]*\b|"
+            rf"(?<![A-Za-z0-9])[0-9A-Fa-f]{{8}}-(?:[0-9A-Fa-f]{{4}}-){{3}}[0-9A-Fa-f]{{12}}(?![A-Za-z0-9])",
+            value,
+            re.I,
+        ))
+
+    @staticmethod
+    def _has_explicit_meeting_date(text: str) -> bool:
+        """识别足以确定日期的显式语义（绝对日、星期或相对日）。"""
+        value = str(text or "")
+        return bool(re.search(
+            r"(?:\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{4}年\d{1,2}月\d{1,2}[日号]?|"
+            r"\d{1,2}月\d{1,2}[日号]?|"
+            r"(?:周|星期|礼拜)\s*[一二三四五六日天1-7](?!程)|"
+            r"今天|明天|后天|大后天|昨天|前天)",
+            value,
+        ))
+
+    @staticmethod
+    def _record_task_facts(
+        context: CaseContext,
+        task_id: str,
+        part: Any,
+        *,
+        meeting_reference_v3: bool = True,
+    ) -> None:
         """从 DomainResult 的工具事实提取可跨 Task 共享的最小槽位。"""
         if not isinstance(part, dict):
             return
@@ -1236,6 +1696,53 @@ class MyAgent:
             ):
                 if value:
                     context.upsert_fact(key, value, source="TASK_OUTPUT", task_id=task_id)
+        # room.schedule 的 DomainResult 只需暴露查询范围；原始工具证据中若恰有
+        # 一个 booking，则可安全补齐其 day/order。多条 booking 不任选其一，避免
+        # 后续 Task 被错误绑定到任意订单。
+        if meeting_reference_v3 and isinstance(booking, dict) and booking.get("status") == "queried":
+            schedule_bookings: list[dict[str, Any]] = []
+            schedule_room: Any = booking.get("room_id")
+            schedule_rooms: set[str] = {str(schedule_room)} if schedule_room else set()
+            schedule_start = booking.get("start_date")
+            schedule_end = booking.get("end_date")
+            for record in context.ledger.for_task(task_id):
+                if record.kind != "tool_result" or record.source != "meetingroom.room.schedule":
+                    continue
+                payload = record.value if isinstance(record.value, dict) else {}
+                raw = payload.get("result") if isinstance(payload, dict) else None
+                args = payload.get("args") if isinstance(payload, dict) else None
+                if isinstance(args, dict):
+                    if args.get("room_id"):
+                        schedule_rooms.add(str(args["room_id"]))
+                    schedule_start = schedule_start or args.get("start_date")
+                    schedule_end = schedule_end or args.get("end_date")
+                if isinstance(raw, dict):
+                    rows = raw.get("bookings") or []
+                    if isinstance(rows, list):
+                        schedule_bookings.extend(row for row in rows if isinstance(row, dict))
+            # _RecordingEnv and MeetingroomExecutor both ledger the same tool result;
+            # dedupe identical rows before applying the uniqueness check.
+            unique_rows: list[dict[str, Any]] = []
+            seen_rows: set[str] = set()
+            for row in schedule_bookings:
+                marker = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+                if marker not in seen_rows:
+                    seen_rows.add(marker)
+                    unique_rows.append(row)
+            if len(schedule_rooms) == 1:
+                schedule_room = next(iter(schedule_rooms))
+                context.upsert_fact("meeting.room_id", schedule_room, source="TASK_OUTPUT", task_id=task_id)
+            if len(unique_rows) == 1:
+                row = unique_rows[0]
+                row_day = row.get("day")
+                if not row_day and schedule_start and schedule_start == schedule_end:
+                    row_day = schedule_start
+                order_id = row.get("booking_id") or row.get("order_id")
+                if row_day:
+                    context.upsert_fact("meeting.day", row_day, source="TASK_OUTPUT", task_id=task_id)
+                if order_id:
+                    context.upsert_fact("meeting.booking_id", order_id, source="TASK_OUTPUT", task_id=task_id)
+                    context.upsert_fact("meeting.order_id", order_id, source="TASK_OUTPUT", task_id=task_id)
         workflow = part.get("workflow_draft_result")
         if isinstance(workflow, dict) and workflow.get("status") in {"submitted", "draft_saved"}:
             for key, value in (
@@ -1245,6 +1752,71 @@ class MyAgent:
             ):
                 if value:
                     context.upsert_fact(key, value, source="TASK_OUTPUT", task_id=task_id)
+
+    @staticmethod
+    def _append_context_events(
+        trace: list[dict[str, Any]],
+        context: CaseContext | None,
+        logger: Any = None,
+    ) -> None:
+        """把 CaseContext 内部事实/策略补成可审计的 trace 事件。
+
+        ``_RecordingEnv`` 能直接看到工具和追问，但 Skill 内部的事实写入、
+        SpeechAct/兼容策略裁决不会穿过环境包装器。这里在 case 结束（或异常
+        兜底）时做一次幂等补偿：只追加 trace 中尚不存在的 fact_id/decision，
+        不把模型推断升级为可写事实，也不跨 case 保留对象。
+        """
+        if context is None:
+            return
+        seen_facts = {
+            str(event.get("fact_id"))
+            for event in trace
+            if event.get("event") == "FACT_UPSERT" and event.get("fact_id")
+        }
+        for fact in context.facts.all():
+            if fact.fact_id and fact.fact_id in seen_facts:
+                continue
+            event = {
+                "event": "FACT_UPSERT",
+                "task_id": fact.task_id,
+                "key": fact.key,
+                "fact_id": fact.fact_id,
+                "source": fact.source,
+                "value": _compact(fact.value),
+                "confidence": fact.confidence,
+                "shareable": fact.shareable,
+                "evidence_ids": list(fact.evidence_ids),
+                "supersedes": fact.supersedes,
+            }
+            trace.append(event)
+            seen_facts.add(fact.fact_id)
+            if logger is not None:
+                logger.info(
+                    f"FACT_UPSERT 事实写入: task={fact.task_id or '-'} "
+                    f"key={fact.key} source={fact.source} value={_compact(fact.value)} "
+                    f"supersedes={fact.supersedes or '-'}"
+                )
+
+        # 策略事件不带业务答案，只保留已经由程序做出的 policy decision；
+        # 用序列化值去重，避免同一条策略同时写入 ledger 和 trace。
+        seen_decisions = {
+            json.dumps(event.get("decision"), ensure_ascii=False, sort_keys=True, default=str)
+            for event in trace
+            if event.get("event") == "POLICY_DECISION"
+        }
+        for decision in context.policy_decisions:
+            safe_decision = redact_value(decision)
+            marker = json.dumps(safe_decision, ensure_ascii=False, sort_keys=True, default=str)
+            if marker in seen_decisions:
+                continue
+            trace.append({
+                "event": "POLICY_DECISION",
+                "task_id": context.ledger.active_task_id,
+                "decision": safe_decision,
+            })
+            seen_decisions.add(marker)
+            if logger is not None:
+                logger.info(f"POLICY_DECISION 策略裁决: {_compact(decision)}")
 
     @staticmethod
     def _apply_superset_projection(final_answer: dict[str, Any]) -> None:
